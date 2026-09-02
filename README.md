@@ -1,4 +1,4 @@
-# EhViewer-Apple
+# EhViewer Apple Native
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.0.0-brightgreen" alt="Version"/>
@@ -7,58 +7,51 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"/>
 </p>
 
-EhViewer-Apple 是一款适用于 iOS 和 macOS 的 [E-Hentai](https://e-hentai.org) / [ExHentai](https://exhentai.org) 画廊浏览客户端，使用 SwiftUI 原生构建。
+EhViewer Apple Native 是适用于 iPhone、iPad 和 Mac 的 [E-Hentai](https://e-hentai.org) / [ExHentai](https://exhentai.org) 原生客户端。项目以 SwiftUI 为主体，针对 Apple 平台重新设计导航、搜索、画廊详情、阅读器与下载体验。
 
-本仓库基于 [felixchaos/EhViewer-Apple](https://github.com/felixchaos/EhViewer-Apple) 持续开发，并保留原项目的 Apache License 2.0 授权与版权信息。
+本仓库由 [felixchaos/EhViewer-Apple](https://github.com/felixchaos/EhViewer-Apple) Fork 并持续开发，保留原项目的 Apache License 2.0 授权与版权信息。上游更新会先经过差异审查，再选择性适配到本项目，避免覆盖本 Fork 的跨平台界面和功能改造。
 
 > **致敬**: 本项目灵感来源于 Android 端的 [EhViewer](https://github.com/Ehviewer-Overhauled/Ehviewer) 和 [EhViewer_CN_SXJ](https://github.com/xiaojieonly/Ehviewer_CN_SXJ)，感谢原作者的出色工作。
 
 ---
 
-## 📢 v1.0.0 — 现代化与质量加固
+## 📢 v1.0.0
 
-基于全面代码审计（详见 [AUDIT_REPORT.md](AUDIT_REPORT.md)），完成以下加固：
+这是本 Fork 的首个发行准备版本，重点是原生化、跨平台一致性、阅读体验与稳定性。
 
-### 🔒 并发安全
-- **SpiderDen** — 静态可变状态用 `NSLock` 保护；`SimpleDiskCache` 所有 I/O 走 `queue.sync`
-- **DownloadManager.SpiderInfoUpdater** — 从 `@unchecked Sendable class` 迁移为 `actor`
-- **BackgroundDownloadManager** — `activeTasks` 字典加 `NSLock` 互斥
-- **GalleryDetailViewModel** — 标注 `@MainActor`，移除 `nonisolated(unsafe)` 和 8 处冗余 `MainActor.run`
-- **AppErrorHandling.ErrorHandler** — 标注 `@MainActor`，GCD → `Task { @MainActor in }`
-- **EhFilterManager / FavouriteStatusRouter** — 标注 `@MainActor`
+### 原生体验
 
-### 🧠 内存优化
-- **ReaderViewModel** — NSCache 容量根据 `ProcessInfo.physicalMemory` 自适应（80–400 MB）；下载完成后主动驱逐远距离页面
+- SwiftUI 响应式导航，自动适配 iPhone 单栏、iPad 分栏与 macOS 窗口
+- Liquid Glass 风格的悬浮搜索、工具栏、阅读控件与紧凑画廊页头
+- 列表和瀑布流两种浏览方式，支持标签、上传者、历史与保存的搜索
+- 简体中文、繁体中文（台湾）和英文（美国）本地化
+- App Shortcuts、macOS 菜单命令、系统分享与接力入口
 
-### 📐 响应式布局
-- 新增 `ResponsiveLayout` 工具（`EnvironmentKey`），`GalleryListView` 缩略图尺寸随屏幕自适应
+### 阅读与媒体
 
-### 🧹 观察模式
-- **AppSettings** — 15 个 UI 属性改用 `access / withMutation` 正确触发 `@Observable`
+- 横向翻页、从右到左、从左到右和纵向连续阅读
+- 单页／双页、首页单独显示、缩放、翻页动画、手势与键盘控制
+- 原图加载、保存、拷贝、图片文字识别与系统翻译
+- 动图显示、阅读进度、主题色进度条及图片氛围背景
+- 内存与有界磁盘缓存；已下载画廊使用本地文件快速读取
 
----
+### 资料管理
 
-## 核心功能
+- 云端／本地收藏、历史、稍后再看和标签屏蔽
+- 后台下载、暂停／继续、批量选择、文件大小与自定义下载位置
+- iPhone 和 iPad 下载 Live Activity，可暂停任务并跳转到下载页面
+- 搜索结果多层导航、连续分页和位置恢复
+- 评论发表、赞同／反对，以及评论中的画廊链接识别
 
-首个正式版本，包含以下核心功能与优化：
+### 稳定性与安全
 
-- **完整的画廊浏览体验** — 首页热门、最新、搜索、标签浏览
-- **高级搜索** — 分类筛选、关键词、标签、评分过滤、页码范围
-- **原生阅读器** — 横向翻页 / 纵向滚动，支持双指缩放，流畅手势翻页
-- **下载管理** — 后台下载、断点续传、标签分组、进度通知
-- **收藏同步** — 云端收藏夹 + 本地收藏，支持多文件夹管理
-- **多层缓存** — 内存 + 磁盘缓存，大幅提升二次加载速度
-- **多平台原生** — iPhone / iPad / Mac 全平台适配
+- Swift 6 并发隔离与主线程负载优化
+- 登录凭据由系统钥匙串保存，Cookie 容器仅保留会话副本
+- 图片请求合并、后台降采样、预览精灵图共享解码与内存压力响应
+- 阅读预取按设备、网络状态和阅读方向调整
+- 网络请求使用系统 TLS、代理与 VPN，并提供受控的连接回退
 
-## ✨ 功能特性
-
-- 🔍 **画廊浏览** — 支持热门、最新、收藏、排行榜等多种浏览方式
-- 🔎 **高级搜索** — 分类筛选、关键词、标签搜索、快速搜索收藏
-- 📖 **阅读器** — 横向翻页 / 纵向滚动，支持缩放、手势操作
-- ⬇️ **下载管理** — 后台下载、断点续传、通知提醒
-- ⭐ **收藏管理** — 多文件夹收藏同步
-- 🌐 **网络优化** — Domain Fronting 回退、DNS over HTTPS
-- 🖥️ **多平台** — iOS / iPadOS / macOS 原生体验
+更完整的变更记录请查看 [CHANGELOG.md](CHANGELOG.md)，发行前检查项目见 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
 
 ## 📦 项目结构
 
@@ -108,9 +101,9 @@ cd EhViewer-Apple-native
 open "ehviewer apple.xcodeproj"
 ```
 
-### 3. 构建运行 (Mac)
+### 3. 构建运行
 
-在 Xcode 中选择 **My Mac** 作为目标设备，按 `⌘R` 运行。
+在 Xcode 中选择 **My Mac**、模拟器或已连接的设备，然后按 `⌘R` 运行。
 
 > **注意**: Swift Package 依赖会在首次打开时自动解析，请确保网络畅通。
 
@@ -227,7 +220,19 @@ TODO: 添加 App 截图
 </p>
 -->
 
-*截图即将添加*
+欢迎通过 Issue 或 Pull Request 补充最新平台截图。
+
+## 🔄 同步上游
+
+如需在自己的克隆中检查上游更新：
+
+```bash
+git remote add upstream https://github.com/felixchaos/EhViewer-Apple.git
+git fetch upstream
+git log --oneline HEAD..upstream/main
+```
+
+由于本 Fork 已对导航、阅读器和数据流进行较大调整，建议逐项审查或选择性移植上游提交，不建议直接强制覆盖当前分支。
 
 ## 🤝 参与贡献
 
