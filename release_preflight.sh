@@ -49,30 +49,30 @@ plutil -lint "$SCRIPT_DIR/ehviewer apple Live Activity/Info.plist" >/dev/null
 [[ "$(plutil -extract 'com\.apple\.security\.app-sandbox' raw "$APP_DIR/ehviewer_apple.entitlements")" == "true" ]] \
     || fail "macOS 发行权限未启用 App Sandbox"
 
-marketing_versions="$(rg -o 'MARKETING_VERSION = [^;]+' "$PROJECT_FILE" | sed 's/.*= //' | sort -u)"
+marketing_versions="$(grep -Eo 'MARKETING_VERSION = [^;]+' "$PROJECT_FILE/project.pbxproj" | sed 's/.*= //' | sort -u)"
 [[ "$(print -r -- "$marketing_versions" | wc -l | tr -d ' ')" == "1" ]] \
     || fail "主 App、扩展或测试目标的 MARKETING_VERSION 不一致"
 release_version="$(print -r -- "$marketing_versions" | head -n 1)"
-rg -Fq "version-${release_version}-" "$SCRIPT_DIR/README.md" \
+grep -Fq "version-${release_version}-" "$SCRIPT_DIR/README.md" \
     || fail "README 版本徽章与工程版本 $release_version 不一致"
-rg -Fq "## [$release_version]" "$SCRIPT_DIR/CHANGELOG.md" \
+grep -Fq "## [$release_version]" "$SCRIPT_DIR/CHANGELOG.md" \
     || fail "CHANGELOG 缺少版本 $release_version 的发行记录"
-rg -Fq 'felixchaos/EhViewer-Apple' "$SCRIPT_DIR/README.md" \
+grep -Fq 'felixchaos/EhViewer-Apple' "$SCRIPT_DIR/README.md" \
     || fail "README 缺少上游项目署名"
 
-if rg -n 'Stellatrix|stellatrix\.icu|HWZEUNLCY6' \
+if grep -REn 'Stellatrix|stellatrix\.icu|HWZEUNLCY6' \
     "$SCRIPT_DIR/.github" "$SCRIPT_DIR/README.md" "$SCRIPT_DIR/distribute_mac.sh" >/dev/null; then
     fail "公开发行文件中仍包含旧的私人部署标识"
 fi
 
-if rg -n 'NSAllowsArbitraryLoads' "$APP_DIR/Info.plist" >/dev/null; then
+if grep -En 'NSAllowsArbitraryLoads' "$APP_DIR/Info.plist" >/dev/null; then
     fail "发行版不应启用全局 ATS 例外"
 fi
 
-rg -q 'INFOPLIST_KEY_NSSupportsLiveActivities = YES' "$PROJECT_FILE" \
+grep -q 'INFOPLIST_KEY_NSSupportsLiveActivities = YES' "$PROJECT_FILE/project.pbxproj" \
     || fail "主 App 未声明 Live Activities 支持"
 
-if rg -n '<<<<<<<|=======|>>>>>>>' "$APP_DIR" "$SCRIPT_DIR/Packages" >/dev/null; then
+if grep -REn '<<<<<<<|=======|>>>>>>>' "$APP_DIR" "$SCRIPT_DIR/Packages" >/dev/null; then
     fail "源码中仍有 Git 冲突标记"
 fi
 
