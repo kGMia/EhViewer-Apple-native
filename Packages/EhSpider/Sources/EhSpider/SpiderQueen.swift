@@ -43,6 +43,15 @@ public actor SpiderQueen {
         let timeout = TimeInterval(AppSettings.shared.downloadTimeout)
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = timeout * 4
+        // 一个长寿命会话复用 HTTP/2/TLS 连接；每台主机的连接上限
+        // 与全局图片限流器一致，避免 URLSession 内再排一层无界队列。
+        config.httpMaximumConnectionsPerHost = 5
+        config.httpShouldUsePipelining = true
+        config.waitsForConnectivity = true
+        // 原图会立即落盘到 SpiderDen，不再存一份 URLCache 副本，
+        // 可显著降低连续下载时的磁盘写入与缓存污染。
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: config)
     }()
 
@@ -316,7 +325,7 @@ public actor SpiderQueen {
 
         // 使用带 cookies 的 session 下载图片
         var request = URLRequest(url: url)
-        request.timeoutInterval = 30
+        request.timeoutInterval = TimeInterval(AppSettings.shared.downloadTimeout)
         let (data, response) = try await rateLimitedData(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
@@ -398,7 +407,7 @@ public actor SpiderQueen {
         request.httpMethod = "GET"
         request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
-        request.timeoutInterval = 15
+        request.timeoutInterval = TimeInterval(AppSettings.shared.downloadTimeout)
 
         let (data, _) = try await rateLimitedData(for: request)
         let html = String(data: data, encoding: .utf8) ?? ""
@@ -436,7 +445,7 @@ public actor SpiderQueen {
         request.httpMethod = "GET"
         request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
         request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 15
+        request.timeoutInterval = TimeInterval(AppSettings.shared.downloadTimeout)
 
         let (data, response) = try await rateLimitedData(for: request)
 
@@ -481,7 +490,7 @@ public actor SpiderQueen {
         request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
         request.setValue(EhURL.origin(for: site), forHTTPHeaderField: "Origin")
         request.httpBody = jsonData
-        request.timeoutInterval = 15
+        request.timeoutInterval = TimeInterval(AppSettings.shared.downloadTimeout)
 
         let (data, response) = try await rateLimitedData(for: request)
 
@@ -542,7 +551,7 @@ public enum SpiderError: LocalizedError, Sendable {
         case .invalidResponseData: return "Invalid response data"
         case .notImplemented: return "Not implemented"
         case .storageFailed: return "Failed to save image to disk"
-        case .diskFull: return "磁盘空间不足，无法保存图片"
+        case .diskFull: return AppLocalization.localized("磁盘空间不足，无法保存图片")
         }
     }
 }

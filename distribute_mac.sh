@@ -6,7 +6,7 @@
 #   ./distribute_mac.sh
 #
 # 前置条件:
-#   1. 已安装 Xcode 16+ 并登录 Apple Developer 账号
+#   1. 已安装 Xcode 26.2+ 并登录 Apple Developer 账号
 #   2. Keychain 中已导入 "Developer ID Application" 证书
 #   3. 配置环境变量（直接 export 或写入 .env 文件）:
 #        APPLE_ID           — Apple 开发者账号邮箱
@@ -38,7 +38,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 PROJECT_FILE="$PROJECT_DIR/ehviewer apple.xcodeproj"
 SCHEME="ehviewer apple"
 APP_NAME="ehviewer apple"
-BUNDLE_ID="Stellatrix.ehviewer-apple"
+BUNDLE_ID="kgmia.ehviewer-apple"
 
 BUILD_DIR="$PROJECT_DIR/build"
 ARCHIVE_PATH="$BUILD_DIR/${APP_NAME}.xcarchive"

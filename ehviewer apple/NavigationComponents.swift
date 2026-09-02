@@ -14,6 +14,115 @@ import SwiftUI
 import UIKit
 #endif
 
+/// Content-column route back action. Wide layouts replace the feed in-place
+/// instead of pushing onto a NavigationStack, so the search chrome needs an
+/// explicit way to pop that route.
+struct ContentRouteBackAction {
+    let perform: () -> Void
+}
+
+private struct ContentRouteBackActionKey: EnvironmentKey {
+    static let defaultValue: ContentRouteBackAction? = nil
+}
+
+extension EnvironmentValues {
+    var contentRouteBackAction: ContentRouteBackAction? {
+        get { self[ContentRouteBackActionKey.self] }
+        set { self[ContentRouteBackActionKey.self] = newValue }
+    }
+}
+
+/// Content-column search chrome for macOS. Keeping search in the content view
+/// avoids SwiftUI promoting `.searchable` into the window's trailing toolbar.
+/// Native Material supplies the translucent scroll-edge treatment.
+struct ContentColumnSearchBar<Actions: View>: View {
+    @Binding var text: String
+    let prompt: String
+    var isFloating = false
+    @ViewBuilder let actions: () -> Actions
+
+    @ViewBuilder
+    var body: some View {
+        if isFloating {
+            HStack(spacing: 8) {
+                searchField
+                    .frame(height: 40)
+                    .frame(maxWidth: .infinity)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+
+                actions()
+            }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+        } else {
+            HStack(spacing: 8) {
+                searchField
+                    .frame(height: 40)
+                    .frame(maxWidth: .infinity)
+                    .background(.regularMaterial, in: Capsule())
+
+                actions()
+            }
+                .padding(.horizontal, 12)
+                .frame(height: 48)
+                .background(.ultraThinMaterial)
+                .overlay(alignment: .bottom) { Divider() }
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+
+            TextField(prompt, text: $text)
+                .textFieldStyle(.plain)
+
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("清除搜索")
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+}
+
+/// 独立的 Liquid Glass 筛选胶囊。收藏夹和下载标签共用这一实现。
+/// 外层横向 ScrollView 负责关闭裁剪并预留投影绘制空间；这里保留系统
+/// 原生的玻璃、光照和交互反馈，不再尝试裁掉投影本身。
+struct LiquidGlassFilterChip<Label: View>: View {
+    let isSelected: Bool
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+
+    var body: some View {
+        Button(action: action) {
+            label()
+                .font(.subheadline)
+                .fontWeight(isSelected ? .semibold : .regular)
+                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                .padding(.horizontal, 13)
+                .frame(height: 30)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .glassEffect(
+            (isSelected ? Glass.regular.tint(Color.accentColor) : Glass.regular)
+                .interactive(),
+            in: .capsule
+        )
+    }
+}
+
 // MARK: - 1. 统一返回按钮 (对齐 Android Toolbar NavigationIcon)
 
 /// 全局统一返回按钮 — 所有二级及深层页面使用同一样式
@@ -43,108 +152,37 @@ struct AppBackButton: View {
             Image(systemName: "chevron.left")
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(style == .dark ? .white : Color.primary)
-                .padding(8)
-                .background(
-                    style == .dark
-                        ? AnyShapeStyle(.black.opacity(0.5))
-                        : AnyShapeStyle(.ultraThinMaterial)
-                )
-                .clipShape(Circle())
+                .frame(width: 36, height: 36)
+                .contentShape(Circle())
         }
+        .buttonStyle(.plain)
+        .glassEffect(
+            (style == .dark ? Glass.regular.tint(.black.opacity(0.28)) : Glass.regular)
+                .interactive(),
+            in: .circle
+        )
         .accessibilityLabel("返回")
     }
 }
 
-// MARK: - 2. 边缘滑动返回手势修复
-
-/// 修复 SwiftUI 隐藏原生返回按钮后边缘滑动返回手势失效的问题
-///
-/// 原理: 在 UINavigationController 上重新启用 interactivePopGestureRecognizer
-/// 并将其 delegate 替换为自定义实现，确保在任何自定义导航栏下都能滑动返回
-///
-/// 使用方式:
-/// ```swift
-/// NavigationStack {
-///     content
-/// }
-/// .enableEdgeSwipeBack()
-/// ```
-#if os(iOS)
-struct EdgeSwipeBackModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .background(EdgeSwipeBackHelper())
-    }
-}
-
-/// UIKit 辅助视图 — 查找最近的 UINavigationController 并启用滑动返回
-private struct EdgeSwipeBackHelper: UIViewControllerRepresentable {
-    func makeUIViewController(context: Context) -> UIViewController {
-        EdgeSwipeBackViewController()
-    }
-    
-    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
-}
-
-private class EdgeSwipeBackViewController: UIViewController {
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        enableInteractivePopGesture()
-    }
-    
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        enableInteractivePopGesture()
-    }
-    
-    private func enableInteractivePopGesture() {
-        guard let nav = navigationController else { return }
-        // 仅在有多个视图控制器时启用 (栈顶不需要)
-        guard nav.viewControllers.count > 1 else { return }
-        // 如果 delegate 已被清除或是系统默认的，替换为允许手势的 delegate
-        if nav.interactivePopGestureRecognizer?.isEnabled == false {
-            nav.interactivePopGestureRecognizer?.isEnabled = true
-        }
-        // 确保手势识别器的 delegate 不会阻止手势
-        if nav.interactivePopGestureRecognizer?.delegate !== nav {
-            nav.interactivePopGestureRecognizer?.delegate = nav
-        }
-    }
-}
-
-// MARK: - UINavigationController + InteractivePopGesture
-
-/// 让 UINavigationController 自身作为滑动返回手势的 delegate
-/// 这样即使隐藏了原生返回按钮，边缘滑动返回依然有效
-extension UINavigationController: @retroactive UIGestureRecognizerDelegate {
-    public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        // 导航栈只有一个 VC 时禁止滑动 (没有上一页可返回)
-        viewControllers.count > 1
-    }
-    
-    public func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        // 允许与其他手势同时识别，避免冲突
-        false
-    }
-}
-#endif
-
-// MARK: - 3. View 扩展
+// MARK: - 2. View 扩展
 
 extension View {
-    /// 启用边缘滑动返回手势 (修复隐藏原生返回按钮后手势失效)
+    /// Apply system searchable chrome only in compact navigation. Wide layouts
+    /// render search inside their content column instead of the window toolbar.
     @ViewBuilder
-    func enableEdgeSwipeBack() -> some View {
-        #if os(iOS)
-        self.modifier(EdgeSwipeBackModifier())
-        #else
-        self
-        #endif
+    func searchableWhen(
+        _ enabled: Bool,
+        text: Binding<String>,
+        prompt: String
+    ) -> some View {
+        if enabled {
+            self.searchable(text: text, prompt: prompt)
+        } else {
+            self
+        }
     }
-    
+
     /// 紧凑导航栏修饰符 — 强制 inline 标题 + 隐藏大标题空间
     @ViewBuilder
     func compactNavigationBar() -> some View {

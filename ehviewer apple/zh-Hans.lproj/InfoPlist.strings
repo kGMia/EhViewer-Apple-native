@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "EhViewer";
+"CFBundleName" = "EhViewer";
+"NSPhotoLibraryAddUsageDescription" = "用于将画廊原图保存到您的照片图库。";

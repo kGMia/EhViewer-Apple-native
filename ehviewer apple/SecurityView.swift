@@ -190,7 +190,7 @@ struct SecurityView: View {
     private var biometricName: String {
         switch biometricType {
         case .none:
-            return "密码"
+            return AppLocalization.localized("密码")
         case .faceID:
             return "Face ID"
         case .touchID:
@@ -198,7 +198,7 @@ struct SecurityView: View {
         case .opticID:
             return "Optic ID"
         @unknown default:
-            return "生物识别"
+            return AppLocalization.localized("生物识别")
         }
     }
     
@@ -247,7 +247,7 @@ struct SecurityView: View {
         authError = nil
         
         let context = LAContext()
-        context.localizedCancelTitle = "取消"
+        context.localizedCancelTitle = AppLocalization.localized("取消")
         // 不显示系统的 "输入密码" 回退按钮, 由我们自己的按钮处理
         context.localizedFallbackTitle = ""
         
@@ -276,7 +276,7 @@ struct SecurityView: View {
         authError = nil
         
         let context = LAContext()
-        context.localizedCancelTitle = "取消"
+        context.localizedCancelTitle = AppLocalization.localized("取消")
         
         context.evaluatePolicy(
             .deviceOwnerAuthentication,
@@ -293,7 +293,7 @@ struct SecurityView: View {
                     onAuthenticated()
                 } else {
                     if let laError = authenticationError as? LAError, laError.code == .userCancel {
-                        authError = "认证已取消"
+                        authError = AppLocalization.localized("认证已取消")
                     } else {
                         authError = authenticationError?.localizedDescription ?? "密码认证失败"
                     }
@@ -316,24 +316,24 @@ struct SecurityView: View {
         case .userCancel:
             // 用户取消不算重试
             retryCount -= 1
-            authError = "认证已取消，请点击按钮重试"
+            authError = AppLocalization.localized("认证已取消，请点击按钮重试")
         case .userFallback:
             // 用户选择使用密码
             retryCount -= 1
             authenticateWithPasscode()
         case .biometryNotAvailable:
-            authError = "生物识别不可用，请使用密码解锁"
+            authError = AppLocalization.localized("生物识别不可用，请使用密码解锁")
         case .biometryNotEnrolled:
-            authError = "未设置生物识别，请使用密码解锁"
+            authError = AppLocalization.localized("未设置生物识别，请使用密码解锁")
         case .biometryLockout:
             // Fix F1-2: 生物识别被系统锁定 — 引导使用密码
-            authError = "生物识别已锁定，请使用下方密码解锁"
+            authError = AppLocalization.localized("生物识别已锁定，请使用下方密码解锁")
             startLockout()
         case .authenticationFailed:
             if retryCount >= maxRetries {
                 startLockout()
             } else {
-                authError = "认证失败，请重试"
+                authError = AppLocalization.localized("认证失败，请重试")
             }
         default:
             authError = laError.localizedDescription
@@ -346,7 +346,10 @@ struct SecurityView: View {
     private func startLockout() {
         isLockedOut = true
         lockoutRemaining = lockoutDuration
-        authError = "生物识别重试次数过多，请使用密码解锁或等待 \(lockoutDuration) 秒"
+        authError = AppLocalization.format(
+            "生物识别重试次数过多，请使用密码解锁或等待 %lld 秒",
+            lockoutDuration
+        )
         
         lockoutTimer?.invalidate()
         lockoutTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in

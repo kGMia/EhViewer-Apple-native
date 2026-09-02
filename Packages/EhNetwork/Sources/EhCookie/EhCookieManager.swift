@@ -7,6 +7,14 @@ public final class EhCookieManager: @unchecked Sendable {
     public static let shared = EhCookieManager()
 
     private let storage: HTTPCookieStorage
+    /// HTTPCookieStorage 内部会同步到 Foundation 的 Default QoS 工作线程。
+    /// 外层若使用 userInitiated 会触发 Thread Performance Checker 的优先级
+    /// 反转告警；使用相同的 Default QoS，同时由 continuation 挂起调用方，
+    /// 不占用用户交互线程等待，也不会让多个写操作交错。
+    private let mutationQueue = DispatchQueue(
+        label: "Stellatrix.EhViewer.CookieMutation",
+        qos: .default
+    )
 
     // MARK: - Cookie 名称常量
 
@@ -30,8 +38,6 @@ public final class EhCookieManager: @unchecked Sendable {
 
     private init() {
         storage = HTTPCookieStorage.shared
-        // 在初始化时确保 nw=1 已注入
-        injectNWCookie()
     }
 
     // MARK: - 登录状态检查
@@ -91,7 +97,7 @@ public final class EhCookieManager: @unchecked Sendable {
     // MARK: - 写入 Cookie
 
     /// 设置单个 Cookie
-    public func setCookie(name: String, value: String, domain: String, path: String = "/") {
+    public func setCookie(name: String, value: String, domain: String, path: String = "/") async {
         let properties: [HTTPCookiePropertyKey: Any] = [
             .name: name,
             .value: value,
@@ -101,28 +107,40 @@ public final class EhCookieManager: @unchecked Sendable {
             .expires: Date.distantFuture,
         ]
         if let cookie = HTTPCookie(properties: properties) {
-            storage.setCookie(cookie)
+            await performMutation { [storage] in
+                storage.setCookie(cookie)
+            }
+        }
+    }
+
+    /// 将 WebKit 等外部 Cookie Store 的 Cookie 原样同步到 URLSession。
+    public func storeCookies(_ cookies: [HTTPCookie]) async {
+        guard !cookies.isEmpty else { return }
+        await performMutation { [storage] in
+            for cookie in cookies {
+                storage.setCookie(cookie)
+            }
         }
     }
 
     /// 登录后同步 Cookie 到 ExHentai 域名
     /// 对应 Android 代码: 登录后将 memberId/passHash 复制到 ExHentai 域名
-    public func syncLoginCookies() {
+    public func syncLoginCookies() async {
         guard let memberId = memberId, let passHash = passHash else { return }
 
         // 同步到 exhentai
-        setCookie(name: Self.keyIPBMemberId, value: memberId, domain: Self.domainExhentai)
-        setCookie(name: Self.keyIPBPassHash, value: passHash, domain: Self.domainExhentai)
+        await setCookie(name: Self.keyIPBMemberId, value: memberId, domain: Self.domainExhentai)
+        await setCookie(name: Self.keyIPBPassHash, value: passHash, domain: Self.domainExhentai)
 
         // nw=1 跳过内容警告页面 (Android 硬编码注入)
-        injectNWCookie()
+        await injectNWCookie()
     }
 
     /// 注入 nw=1 Cookie (对应 Android EhCookieStore 中的硬编码 nw=1)
     /// 跳过画廊的内容警告页面
-    public func injectNWCookie() {
-        setCookie(name: Self.keyNW, value: "1", domain: Self.domainEhentai)
-        setCookie(name: Self.keyNW, value: "1", domain: Self.domainExhentai)
+    public func injectNWCookie() async {
+        await setCookie(name: Self.keyNW, value: "1", domain: Self.domainEhentai)
+        await setCookie(name: Self.keyNW, value: "1", domain: Self.domainExhentai)
     }
 
     // MARK: - Cookie 请求拦截 (对应 Android EhCookieStore.loadForRequest)
@@ -133,7 +151,7 @@ public final class EhCookieManager: @unchecked Sendable {
     /// 严格对齐 Android EhCookieStore.loadForRequest:
     ///   - 仅对 e-hentai.org 做 nw=1 注入 + uconfig 过滤
     ///   - ExHentai 不做任何过滤 (Android L87: checkTips = domainMatch(url, DOMAIN_E))
-    public func sanitizeCookiesForRequest(url: URL) {
+    public func sanitizeCookiesForRequest(url: URL) async {
         guard let host = url.host else { return }
 
         // Android: checkTips = domainMatch(url, DOMAIN_E)  —— 仅 E 站
@@ -145,42 +163,52 @@ public final class EhCookieManager: @unchecked Sendable {
         // 确保 nw=1 存在 (对应 Android 每次请求注入 sTipsCookie)
         let hasNW = cookies.contains { $0.name == Self.keyNW && $0.value == "1" }
         if !hasNW {
-            setCookie(name: Self.keyNW, value: "1", domain: Self.domainEhentai)
+            await setCookie(name: Self.keyNW, value: "1", domain: Self.domainEhentai)
         }
 
         // 移除 uconfig cookie (对应 Android EhCookieStore L97: if KEY_UCONFIG.equals(name) continue)
-        for cookie in cookies where cookie.name == Self.keyUConfig {
-            storage.deleteCookie(cookie)
+        let cookiesToDelete = cookies.filter { $0.name == Self.keyUConfig }
+        if !cookiesToDelete.isEmpty {
+            await performMutation { [storage] in
+                for cookie in cookiesToDelete {
+                    storage.deleteCookie(cookie)
+                }
+            }
         }
     }
 
     // MARK: - 清除 Cookie
 
     /// 登出: 清除所有 EH/EX Cookie
-    public func signOut() {
-        clearCookies(for: Self.domainEhentai)
-        clearCookies(for: Self.domainExhentai)
-        clearCookies(for: Self.domainForums)
+    public func signOut() async {
+        await clearCookies(for: Self.domainEhentai)
+        await clearCookies(for: Self.domainExhentai)
+        await clearCookies(for: Self.domainForums)
     }
 
     /// 清除 igneous Cookie — Sad Panda 检测后自动调用 (V-15)
     /// 清除后 hasExhentaiAccess 将返回 false，提示用户重新登录
-    public func clearIgneous() {
+    public func clearIgneous() async {
         guard let url = URL(string: "https://exhentai.org") else { return }
         let cookies = storage.cookies(for: url) ?? []
-        for cookie in cookies where cookie.name == Self.keyIgneous {
-            storage.deleteCookie(cookie)
+        let cookiesToDelete = cookies.filter { $0.name == Self.keyIgneous }
+        await performMutation { [storage] in
+            for cookie in cookiesToDelete {
+                storage.deleteCookie(cookie)
+            }
         }
     }
 
     /// 清除指定域名的所有 Cookie
-    public func clearCookies(for domain: String) {
+    public func clearCookies(for domain: String) async {
         guard let url = URL(string: "https://\(domain.trimmingCharacters(in: .init(charactersIn: ".")))") else {
             return
         }
         let cookies = storage.cookies(for: url) ?? []
-        for cookie in cookies {
-            storage.deleteCookie(cookie)
+        await performMutation { [storage] in
+            for cookie in cookies {
+                storage.deleteCookie(cookie)
+            }
         }
     }
 
@@ -208,9 +236,26 @@ public final class EhCookieManager: @unchecked Sendable {
     }
 
     /// 导入 Cookie
-    public func importCookies(_ cookies: [CookieData]) {
-        for data in cookies {
-            setCookie(name: data.name, value: data.value, domain: data.domain, path: data.path)
+    public func importCookies(_ cookies: [CookieData]) async {
+        let values = cookies.compactMap { data in
+            HTTPCookie(properties: [
+                .name: data.name,
+                .value: data.value,
+                .domain: data.domain,
+                .path: data.path,
+                .secure: "TRUE",
+                .expires: Date.distantFuture,
+            ])
+        }
+        await storeCookies(values)
+    }
+
+    private func performMutation(_ operation: @escaping @Sendable () -> Void) async {
+        await withCheckedContinuation { continuation in
+            mutationQueue.async {
+                operation()
+                continuation.resume()
+            }
         }
     }
 }

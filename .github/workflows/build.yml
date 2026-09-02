@@ -1,4 +1,4 @@
-name: Build
+name: Release Preflight
 
 on:
   push:
@@ -7,31 +7,16 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
-    runs-on: macos-15
+  preflight:
+    runs-on: macos-26
+    timeout-minutes: 45
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-    - name: Select Xcode
-      run: sudo xcode-select -s /Applications/Xcode_16.app
+    - name: Select Xcode 26
+      run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
 
-    - name: Build for iOS
-      run: |
-        xcodebuild build \
-          -project "ehviewer apple.xcodeproj" \
-          -scheme "ehviewer apple" \
-          -destination "generic/platform=iOS" \
-          CODE_SIGN_IDENTITY="" \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGNING_ALLOWED=NO
-
-    - name: Build for macOS
-      run: |
-        xcodebuild build \
-          -project "ehviewer apple.xcodeproj" \
-          -scheme "ehviewer apple" \
-          -destination "platform=macOS" \
-          CODE_SIGN_IDENTITY="" \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGNING_ALLOWED=NO
+    - name: Validate metadata and analyze release builds
+      run: ./release_preflight.sh

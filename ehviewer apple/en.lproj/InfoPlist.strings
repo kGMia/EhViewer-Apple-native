@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "EhViewer";
+"CFBundleName" = "EhViewer";
+"NSPhotoLibraryAddUsageDescription" = "Allows saving original gallery images to your photo library.";

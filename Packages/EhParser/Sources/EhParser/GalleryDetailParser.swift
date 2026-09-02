@@ -239,7 +239,7 @@ public enum GalleryDetailParser {
                     detail.favoriteCount = 1
                 default:
                     let num = value.components(separatedBy: " ").first ?? ""
-                    detail.favoriteCount = Int(num) ?? 0
+                    detail.favoriteCount = ParserUtils.parseInt(num)
                 }
             } else if label.contains("Language") {
                 detail.language = value
@@ -264,7 +264,7 @@ public enum GalleryDetailParser {
 
         if let ratingCount = try doc.select("td#rating_count").first() {
             let text = try ratingCount.text()
-            detail.ratingCount = Int(text) ?? 0
+            detail.ratingCount = ParserUtils.parseInt(text)
         }
 
         // isFavorited + favoriteName (对应 Android #gdf 解析)
@@ -329,14 +329,70 @@ public enum GalleryDetailParser {
     // MARK: - 解析标签
 
     private static func parseTags(_ doc: Document) throws -> [GalleryTagGroup] {
+        try parseTagRows(doc.select("div#taglist > table > tbody > tr"))
+    }
+
+    /// Parse the JSON returned by the EH `taggallery` API. The server returns
+    /// the refreshed tag table as an HTML fragment in `tagpane`.
+    public static func parseVoteTagResponse(_ data: Data) throws -> [GalleryTagGroup] {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EhParseError.parseFailure("Invalid taggallery JSON")
+        }
+        if let error = json["error"] as? String, !error.isEmpty {
+            throw EhParseError.parseFailure(error)
+        }
+        guard let tagPane = json["tagpane"] as? String else {
+            throw EhParseError.parseFailure("Missing tagpane in taggallery response")
+        }
+
+        let fragment = try SwiftSoup.parseBodyFragment(tagPane)
+        return try parseTagRows(fragment.select("tr"))
+    }
+
+    private static func parseTagRows(_ tagRows: Elements) throws -> [GalleryTagGroup] {
         var tagGroups: [GalleryTagGroup] = []
 
-        let tagRows = try doc.select("div#taglist > table > tbody > tr")
         for row in tagRows {
             let namespace = try row.select("td.tc").text().trimmingCharacters(in: .init(charactersIn: ":"))
-            let tags = try row.select("td > div > a").eachText()
+            var tags: [String] = []
+            var metadata: [String: GalleryTagMetadata] = [:]
+
+            for anchor in try row.select("td > div > a") {
+                let rawText = try anchor.text()
+                let tag = rawText
+                    .split(separator: "|", maxSplits: 1)
+                    .first
+                    .map(String.init)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !tag.isEmpty else { continue }
+
+                let power: GalleryTagPowerStatus
+                if anchor.hasClass("gtw") {
+                    power = .weak
+                } else if anchor.hasClass("gt") {
+                    power = .solid
+                } else {
+                    power = .active
+                }
+
+                let vote: GalleryTagVoteStatus
+                if try anchor.select(".tup").first() != nil {
+                    vote = .up
+                } else if try anchor.select(".tdn").first() != nil {
+                    vote = .down
+                } else {
+                    vote = .none
+                }
+
+                tags.append(tag)
+                metadata[tag] = GalleryTagMetadata(power: power, vote: vote)
+            }
             if !namespace.isEmpty {
-                tagGroups.append(GalleryTagGroup(groupName: namespace, tags: tags))
+                tagGroups.append(GalleryTagGroup(
+                    groupName: namespace,
+                    tags: tags,
+                    metadata: metadata
+                ))
             }
         }
 
@@ -349,6 +405,7 @@ public enum GalleryDetailParser {
     private static let commentDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "dd MMMM yyyy, HH:mm"
         return formatter
     }()

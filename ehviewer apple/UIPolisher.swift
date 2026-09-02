@@ -27,6 +27,28 @@ enum Haptics {
     private static let notification = UINotificationFeedbackGenerator()
     #endif
 
+    /// Allocate feedback engines and the images used by native context menus
+    /// while the app is idle, instead of during the first long press.
+    @MainActor
+    static func prepareForInteraction() {
+        #if os(iOS)
+        light.prepare()
+        medium.prepare()
+        heavy.prepare()
+        soft.prepare()
+        rigid.prepare()
+        selection.prepare()
+        notification.prepare()
+        for name in [
+            "bookmark", "bookmark.slash", "heart", "heart.slash",
+            "arrow.down.circle", "arrow.down.to.line", "doc.on.doc",
+            "square.and.arrow.up"
+        ] {
+            _ = UIImage(systemName: name)
+        }
+        #endif
+    }
+
     /// 轻触反馈 — 页面切换、选项选中
     static func tap() {
         #if os(iOS)

@@ -72,7 +72,7 @@ public struct GalleryInfo: Identifiable, Sendable, Codable, Hashable {
 
     /// 获取最佳显示标题 (优先日文 - 默认行为)
     public var bestTitle: String {
-        titleJpn ?? title ?? "Untitled"
+        titleJpn ?? title ?? "未命名画廊"
     }
 
     /// 根据设置获取适合的标题 (对齐 Android EhUtils.getSuitableTitle)
@@ -82,11 +82,26 @@ public struct GalleryInfo: Identifiable, Sendable, Codable, Hashable {
         if preferJpn {
             // 优先日文/中文标题，如果为空则显示英文
             let jpn = titleJpn ?? ""
-            return jpn.isEmpty ? (title ?? "Untitled") : jpn
+            return jpn.isEmpty ? (title ?? "未命名画廊") : jpn
         } else {
             // 优先英文标题，如果为空则显示日文/中文
             let eng = title ?? ""
-            return eng.isEmpty ? (titleJpn ?? "Untitled") : eng
+            return eng.isEmpty ? (titleJpn ?? "未命名画廊") : eng
+        }
+    }
+
+    /// 信息流可直接展示的作者标签。保持服务端顺序并去重，不把上传者与
+    /// `artist:` 标签混为一谈，因为二者在 EH 中代表不同身份。
+    public var authorNames: [String] {
+        var seen: Set<String> = []
+        return (simpleTags ?? []).compactMap { rawTag in
+            let parts = rawTag.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2,
+                  parts[0].localizedCaseInsensitiveCompare("artist") == .orderedSame
+            else { return nil }
+            let name = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, seen.insert(name.lowercased()).inserted else { return nil }
+            return name
         }
     }
 

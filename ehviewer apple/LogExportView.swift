@@ -7,10 +7,11 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+import EhSettings
 
 struct LogExportView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var logContent: String = "加载中..."
+    @State private var logContent: String = AppLocalization.localized("加载中...")
     @State private var logSize: String = ""
     @State private var logFiles: [URL] = []
     @State private var showShareSheet = false
@@ -84,7 +85,7 @@ struct LogExportView: View {
         logSize = formatter.string(fromByteCount: size)
 
         if logFiles.isEmpty {
-            logContent = "(暂无日志)"
+            logContent = AppLocalization.localized("(暂无日志)")
             return
         }
 
@@ -93,13 +94,13 @@ struct LogExportView: View {
            let content = try? String(contentsOf: latest, encoding: .utf8) {
             let lines = content.components(separatedBy: "\n")
             if lines.count > 200 {
-                logContent = "… (共 \(lines.count) 行, 显示最新 200 行)\n\n"
+                logContent = AppLocalization.format("… (共 %lld 行, 显示最新 200 行)\n\n", lines.count)
                     + lines.suffix(200).joined(separator: "\n")
             } else {
                 logContent = content
             }
         } else {
-            logContent = "(无法读取日志)"
+            logContent = AppLocalization.localized("(无法读取日志)")
         }
     }
 
@@ -113,7 +114,7 @@ struct LogExportView: View {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.plainText]
         panel.nameFieldStringValue = url.lastPathComponent
-        panel.title = "导出诊断日志"
+        panel.title = AppLocalization.localized("导出诊断日志")
         if panel.runModal() == .OK, let dest = panel.url {
             try? FileManager.default.copyItem(at: url, to: dest)
         }

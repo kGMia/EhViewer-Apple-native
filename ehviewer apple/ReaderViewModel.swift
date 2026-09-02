@@ -12,6 +12,7 @@ import EhSpider
 import EhSettings
 import EhDownload
 import CoreImage
+import Network
 
 #if canImport(UIKit)
 import UIKit
@@ -29,9 +30,9 @@ enum ReadingDirection: Int, CaseIterable {
 
     var label: String {
         switch self {
-        case .leftToRight: return "从左到右"
-        case .rightToLeft: return "从右到左"
-        case .topToBottom: return "从上到下"
+        case .leftToRight: return AppLocalization.localized("从左到右")
+        case .rightToLeft: return AppLocalization.localized("从右到左")
+        case .topToBottom: return AppLocalization.localized("从上到下")
         }
     }
 
@@ -40,6 +41,18 @@ enum ReadingDirection: Int, CaseIterable {
         case .leftToRight: return "arrow.right"
         case .rightToLeft: return "arrow.left"
         case .topToBottom: return "arrow.down"
+        }
+    }
+}
+
+enum ReaderPageDisplayMode: Int, CaseIterable {
+    case single = 0
+    case double = 1
+
+    var label: String {
+        switch self {
+        case .single: return AppLocalization.localized("单页")
+        case .double: return AppLocalization.localized("双页")
         }
     }
 }
@@ -55,11 +68,11 @@ enum ScaleMode: Int, CaseIterable {
 
     var label: String {
         switch self {
-        case .origin: return "原始大小"
-        case .fitWidth: return "适应宽度"
-        case .fitHeight: return "适应高度"
-        case .fit: return "适应屏幕"
-        case .fixed: return "固定缩放"
+        case .origin: return AppLocalization.localized("原始大小")
+        case .fitWidth: return AppLocalization.localized("适应宽度")
+        case .fitHeight: return AppLocalization.localized("适应高度")
+        case .fit: return AppLocalization.localized("适应屏幕")
+        case .fixed: return AppLocalization.localized("固定缩放")
         }
     }
 }
@@ -75,11 +88,11 @@ enum StartPosition: Int, CaseIterable {
 
     var label: String {
         switch self {
-        case .topLeft: return "左上"
-        case .topRight: return "右上"
-        case .bottomLeft: return "左下"
-        case .bottomRight: return "右下"
-        case .center: return "居中"
+        case .topLeft: return AppLocalization.localized("左上")
+        case .topRight: return AppLocalization.localized("右上")
+        case .bottomLeft: return AppLocalization.localized("左下")
+        case .bottomRight: return AppLocalization.localized("右下")
+        case .center: return AppLocalization.localized("居中")
         }
     }
 }
@@ -97,6 +110,54 @@ struct PageSpread: Identifiable, Equatable {
     }
 
     var isSingle: Bool { secondaryPage == nil }
+}
+
+/// 生成稳定、有界且按距离排序的预取计划。当前页由前台加载，不会再次
+/// 出现在计划中；较近的后一页和前一页优先于更远页面。
+enum ReaderPrefetchPlanner {
+    static func pages(
+        around currentPage: Int,
+        totalPages: Int,
+        ahead: Int,
+        behind: Int = 1
+    ) -> [Int] {
+        guard totalPages > 0, currentPage >= 0, currentPage < totalPages else { return [] }
+        let forwardCount = max(0, ahead)
+        let backwardCount = max(0, behind)
+        let maxDistance = max(forwardCount, backwardCount)
+        guard maxDistance > 0 else { return [] }
+
+        var result: [Int] = []
+        result.reserveCapacity(forwardCount + backwardCount)
+        for distance in 1...maxDistance {
+            let next = currentPage + distance
+            if distance <= forwardCount, next < totalPages {
+                result.append(next)
+            }
+            let previous = currentPage - distance
+            if distance <= backwardCount, previous >= 0 {
+                result.append(previous)
+            }
+        }
+        return result
+    }
+
+    static func retainedPages(
+        around currentPage: Int,
+        totalPages: Int,
+        radius: Int
+    ) -> Set<Int> {
+        guard totalPages > 0, currentPage >= 0, currentPage < totalPages else { return [] }
+        let distance = max(0, radius)
+        let lowerBound = max(0, currentPage - distance)
+        let upperBound = min(totalPages - 1, currentPage + distance)
+        return Set(lowerBound...upperBound)
+    }
+}
+
+private struct SpreadImageCacheKey: Hashable {
+    let spreadID: Int
+    let direction: Int
 }
 
 // MARK: - ReaderViewModel
@@ -121,6 +182,8 @@ class ReaderViewModel {
 
     /// 是否启用双页模式 (screenWidth > 600pt)
     var isDoublePageEnabled: Bool = false
+    /// 双页模式下是否让封面（第 1 页）独占一个跨页，默认开启。
+    var firstPageStandalone: Bool = true
     /// 页面展页列表 (单页模式下每个 spread 只有一页)
     var spreads: [PageSpread] = []
     /// 当前展页索引 (Perf P0-1: Optional for scrollPosition binding)
@@ -129,6 +192,8 @@ class ReaderViewModel {
     // MARK: - Image Loading
 
     var imageURLs: [Int: String] = [:]
+    var originalImageURLs: [Int: String] = [:]
+    var pagesUsingOriginalImage: Set<Int> = []
     /// 已解码的图片 (Observable 层，触发 SwiftUI 刷新)
     var cachedImages: [Int: PlatformImage] = [:]
     var errorPages: Set<Int> = []
@@ -141,14 +206,90 @@ class ReaderViewModel {
 
     /// 每页的主色调 (用于模糊背景填充)
     var dominantColors: [Int: Color] = [:]
+    /// 预览图只用于首帧的快速估色；完整页解码后会覆盖它。
+    private var previewSeededDominantPages: Set<Int> = []
+    private var fullColorPagesInFlight: Set<Int> = []
+    /// 双页合成图只在源图片发生变化时生成一次，避免 SwiftUI body 刷新时
+    /// 在主线程反复执行大图拼接。
+    private var spreadImageCache: [SpreadImageCacheKey: PlatformImage] = [:]
 
     // MARK: - Private
 
     private var pTokens: [Int: String] = [:]
     private var showKeys: [Int: String] = [:]
     private var loadingPages: Set<Int> = []
-    private var downloadingImages: Set<Int> = []
     private var downloadDir: URL?
+    private var imageLoadTasks: [Int: InFlightImageLoad] = [:]
+    private var prefetchTask: Task<Void, Never>?
+    private var lastPrefetchPage: Int?
+    private var prefetchDirection = 1
+    private let networkMonitor = NWPathMonitor()
+    private var networkIsExpensive = false
+    private var networkIsConstrained = false
+    #if os(iOS)
+    /// NotificationCenter invokes the handler on the main queue; unsafe
+    /// nonisolated storage is limited to deinit so Swift 6 can unregister it.
+    @ObservationIgnored
+    nonisolated(unsafe) private var memoryWarningObserver: NSObjectProtocol?
+    #endif
+    #if os(macOS)
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    #endif
+
+    private struct InFlightImageLoad {
+        let id: UUID
+        let task: Task<ImageLoadOutcome, Never>
+    }
+
+    private enum ImageLoadOutcome: @unchecked Sendable {
+        case image(PlatformImage)
+        case invalidData
+        case cancelled
+        case failure(String)
+    }
+
+    init() {
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor [weak self] in
+                self?.networkIsExpensive = path.isExpensive
+                self?.networkIsConstrained = path.isConstrained
+            }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "Reader.NetworkPath", qos: .utility))
+
+        #if os(iOS)
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.handleMemoryPressure() }
+        }
+        #endif
+
+        #if os(macOS)
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleMemoryPressure()
+            }
+        }
+        source.resume()
+        memoryPressureSource = source
+        #endif
+    }
+
+    deinit {
+        networkMonitor.cancel()
+        #if os(iOS)
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
+        #endif
+    }
 
     /// NSCache composite key: "gid:pageIndex" — 防止切换画廊时命中旧画廊的图片缓存
     private func cacheKey(for page: Int) -> NSString {
@@ -199,13 +340,33 @@ class ReaderViewModel {
         return cache
     }()
 
+    /// 供设置页统一释放阅读器解码缓存。当前阅读页持有的可见图片仍会正常显示，
+    /// 后续页面会按需重新从磁盘或网络加载。
+    static func clearDecodedImageCache() {
+        imageCache.removeAllObjects()
+    }
+
     /// 降采样解码: 用 ImageIO 在解码阶段限制像素尺寸，而非先全量解码再缩放
     /// 一张 15000×20000 JPEG 全量解码 = 1.2GB; 降采样到 4096px 宽 ≈ 40MB
-    nonisolated private static func downsampledImage(data: Data) -> PlatformImage? {
+    nonisolated private static func downsampledImage(
+        data: Data,
+        maxPixelSize: CGFloat
+    ) -> PlatformImage? {
         let options: [CFString: Any] = [
             kCGImageSourceShouldCache: false  // 不缓存原始数据
         ]
         guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else { return nil }
+
+        if CGImageSourceGetCount(source) > 1,
+           let animated = decodeAnimatedPlatformImage(
+               data: data,
+               source: source,
+               requestedMaxPixelSize: min(maxPixelSize, 1_200),
+               maximumFrames: 48,
+               pixelBudget: 16_000_000
+           ) {
+            return animated
+        }
 
         // 获取原图尺寸
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -218,7 +379,7 @@ class ReaderViewModel {
         let maxDimension = max(pixelWidth, pixelHeight)
 
         // 如果图片在安全范围内，直接解码
-        if maxDimension <= maxDecodePixelSize {
+        if maxDimension <= maxPixelSize {
             let thumbOpts: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
@@ -239,7 +400,7 @@ class ReaderViewModel {
         let thumbOpts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxDecodePixelSize,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceShouldCacheImmediately: true
         ]
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
@@ -255,12 +416,22 @@ class ReaderViewModel {
     /// 计算解码后图片的实际像素内存占用 (bytes)
     nonisolated private static func decodedCost(of image: PlatformImage) -> Int {
         #if os(iOS)
+        if let frames = image.images, !frames.isEmpty {
+            return frames.reduce(into: 0) { cost, frame in
+                if let cgImage = frame.cgImage {
+                    cost += cgImage.bytesPerRow * cgImage.height
+                }
+            }
+        }
         guard let cg = image.cgImage else { return 1024 * 1024 } // 1MB fallback
         return cg.bytesPerRow * cg.height
         #else
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff) else { return 1024 * 1024 }
-        return rep.bytesPerRow * rep.pixelsHigh
+        // tiffRepresentation 会重新编码整张图片，并可能在主线程造成明显停顿。
+        // 下载管线生成的 NSImage 已由 CGImage 支撑，直接读取像素布局即可。
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return 1024 * 1024
+        }
+        return cg.bytesPerRow * cg.height
         #endif
     }
 
@@ -289,6 +460,11 @@ class ReaderViewModel {
         pattern: #"var showkey\s*=\s*"([^"]+)""#
     )
 
+    private static let originalImagePattern = try! NSRegularExpression(
+        pattern: #"<a[^>]+href="([^"]+)"[^>]*>\s*Download original"#,
+        options: .caseInsensitive
+    )
+
     // MARK: - Double Page Logic
 
     /// 根据屏幕尺寸更新双页模式 — 仅横屏 + 宽度 > 700pt 时启用
@@ -296,14 +472,19 @@ class ReaderViewModel {
     func updateLayout(screenWidth: CGFloat, screenHeight: CGFloat) {
         let shouldDouble = screenWidth > screenHeight && screenWidth > 700
         guard shouldDouble != isDoublePageEnabled else { return }
+        let anchoredPage = currentPage
         isDoublePageEnabled = shouldDouble
         computeSpreads()
-        syncSpreadIndex()
+        // 旋转会在单页 ID 与 spread ID 之间切换；用逻辑页一次性校准
+        // 所有原生 scrollPosition，防止旧 spread 索引越界或反写首页。
+        synchronizePagePosition(anchoredPage)
     }
 
-    /// 计算 spreads 数组 — 封面(page 0)单独显示，后续两两配对
+    /// 计算 spreads 数组。可让封面(page 0)独占，或从第一页开始两两配对。
     func computeSpreads() {
         guard totalPages > 0 else { spreads = []; return }
+
+        spreadImageCache.removeAll(keepingCapacity: true)
 
         if !isDoublePageEnabled {
             spreads = (0..<totalPages).map {
@@ -313,10 +494,13 @@ class ReaderViewModel {
         }
 
         var result: [PageSpread] = []
-        // 封面始终独占
-        result.append(PageSpread(id: 0, primaryPage: 0, secondaryPage: nil))
-        var i = 1
-        var spreadIdx = 1
+        var i = 0
+        var spreadIdx = 0
+        if firstPageStandalone {
+            result.append(PageSpread(id: spreadIdx, primaryPage: 0, secondaryPage: nil))
+            i = 1
+            spreadIdx += 1
+        }
         while i < totalPages {
             if i + 1 < totalPages {
                 result.append(PageSpread(id: spreadIdx, primaryPage: i, secondaryPage: i + 1))
@@ -333,6 +517,17 @@ class ReaderViewModel {
     /// 根据 currentPage 同步 currentSpreadIndex
     func syncSpreadIndex() {
         currentSpreadIndex = spreadIndex(for: currentPage)
+    }
+
+    /// 同步阅读器的逻辑页码与三个原生滚动位置。
+    /// `ScrollView.scrollPosition` 若仍停留在 0，会在首帧布局时把首页
+    /// 反写到 currentPage，造成进度正确而画面显示首页。
+    func synchronizePagePosition(_ page: Int) {
+        let target = min(max(0, page), max(0, totalPages - 1))
+        currentPage = target
+        lazyCurrentPage = target
+        verticalScrollPage = target
+        currentSpreadIndex = spreadIndex(for: target)
     }
 
     /// 查找某页所在的 spread 索引
@@ -359,6 +554,23 @@ class ReaderViewModel {
             return primary
         }
 
+        let key = SpreadImageCacheKey(spreadID: spread.id, direction: direction.rawValue)
+        _ = secondary // 两页均已就绪后才允许命中合成缓存。
+        return spreadImageCache[key]
+    }
+
+    /// 在后台生成双页合成图。AppKit/UIKit 图片只在 MainActor 上提取 CGImage，
+    /// 实际像素绘制由 Core Graphics 在 detached task 中完成。
+    func prepareSpreadImage(at index: Int, direction: ReadingDirection) async {
+        guard index >= 0 && index < spreads.count else { return }
+        let spread = spreads[index]
+        guard let secondaryPage = spread.secondaryPage,
+              let primary = cachedImages[spread.primaryPage],
+              let secondary = cachedImages[secondaryPage] else { return }
+
+        let key = SpreadImageCacheKey(spreadID: spread.id, direction: direction.rawValue)
+        guard spreadImageCache[key] == nil else { return }
+
         // RTL: 高页码在左 (漫画翻书序)
         let (left, right): (PlatformImage, PlatformImage)
         if direction == .rightToLeft {
@@ -368,19 +580,47 @@ class ReaderViewModel {
             left = primary
             right = secondary
         }
-        return compositeImages(left: left, right: right)
+
+        #if os(iOS)
+        // `UIImage.animatedImage` itself does not always expose `cgImage`.
+        // Spreads are intentionally composited from the first frame: animating two
+        // independent pages inside one bitmap would multiply both memory and CPU use.
+        guard let leftCG = (left.images?.first ?? left).cgImage,
+              let rightCG = (right.images?.first ?? right).cgImage else { return }
+        #else
+        guard let leftCG = left.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let rightCG = right.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        #endif
+
+        let maxDimension = Self.maxDecodePixelSize
+        let compositedCG = await Task.detached(priority: .userInitiated) {
+            Self.compositeCGImages(left: leftCG, right: rightCG, maxDimension: maxDimension)
+        }.value
+        guard let compositedCG else { return }
+
+        #if os(iOS)
+        spreadImageCache[key] = UIImage(cgImage: compositedCG)
+        #else
+        spreadImageCache[key] = NSImage(
+            cgImage: compositedCG,
+            size: NSSize(width: compositedCG.width, height: compositedCG.height)
+        )
+        #endif
     }
 
-    /// 双页合成: 将两张图片水平拼合
-    /// 安全限制: 合成结果不超过 maxDecodePixelSize，防止双大图合成导致 OOM
-    private func compositeImages(left: PlatformImage, right: PlatformImage) -> PlatformImage {
-        var maxH = max(left.size.height, right.size.height)
-        var totalW = left.size.width + right.size.width
+    /// 双页合成只处理不可变 CGImage，可安全地在后台线程运行。
+    nonisolated private static func compositeCGImages(
+        left: CGImage,
+        right: CGImage,
+        maxDimension: CGFloat
+    ) -> CGImage? {
+        var maxH = CGFloat(max(left.height, right.height))
+        var totalW = CGFloat(left.width + right.width)
 
         // 安全阀: 如果合成尺寸过大，按比例缩小
-        let maxDimension = max(totalW, maxH)
-        let scale: CGFloat = maxDimension > Self.maxDecodePixelSize
-            ? Self.maxDecodePixelSize / maxDimension
+        let sourceMaxDimension = max(totalW, maxH)
+        let scale: CGFloat = sourceMaxDimension > maxDimension
+            ? maxDimension / sourceMaxDimension
             : 1.0
 
         if scale < 1.0 {
@@ -388,61 +628,149 @@ class ReaderViewModel {
             maxH *= scale
         }
 
-        #if os(iOS)
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: totalW, height: maxH))
-        return renderer.image { _ in
-            let lw = left.size.width * scale
-            let lh = left.size.height * scale
-            let rw = right.size.width * scale
-            let rh = right.size.height * scale
-            let leftY = (maxH - lh) / 2
-            left.draw(in: CGRect(x: 0, y: leftY, width: lw, height: lh))
-            let rightY = (maxH - rh) / 2
-            right.draw(in: CGRect(x: lw, y: rightY, width: rw, height: rh))
-        }
-        #else
-        let composited = NSImage(size: NSSize(width: totalW, height: maxH))
-        composited.lockFocus()
-        let lw = left.size.width * scale
-        let lh = left.size.height * scale
-        let rw = right.size.width * scale
-        let rh = right.size.height * scale
+        let outputWidth = max(1, Int(totalW.rounded(.up)))
+        let outputHeight = max(1, Int(maxH.rounded(.up)))
+        guard let context = CGContext(
+            data: nil,
+            width: outputWidth,
+            height: outputHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
+        context.interpolationQuality = .high
+        let lw = CGFloat(left.width) * scale
+        let lh = CGFloat(left.height) * scale
+        let rw = CGFloat(right.width) * scale
+        let rh = CGFloat(right.height) * scale
         let leftY = (maxH - lh) / 2
-        left.draw(in: NSRect(x: 0, y: leftY, width: lw, height: lh),
-                  from: .zero, operation: .copy, fraction: 1.0)
         let rightY = (maxH - rh) / 2
-        right.draw(in: NSRect(x: lw, y: rightY, width: rw, height: rh),
-                   from: .zero, operation: .copy, fraction: 1.0)
-        composited.unlockFocus()
-        return composited
-        #endif
+        context.draw(left, in: CGRect(x: 0, y: leftY, width: lw, height: lh))
+        context.draw(right, in: CGRect(x: lw, y: rightY, width: rw, height: rh))
+        return context.makeImage()
     }
 
     // MARK: - Dominant Color (模糊背景主色调提取)
 
+    /// 使用详情页已经解码/缓存的预览图提前点亮阅读背景。
+    /// 这里只读缓存，不会为氛围色额外发起网络请求。
+    func seedDominantColor(from previewSet: PreviewSet, for page: Int) {
+        guard dominantColors[page] == nil else { return }
+
+        let descriptor: (url: URL, crop: CGRect?)?
+        switch previewSet {
+        case .normal(let previews):
+            guard let preview = previews.first(where: { $0.position == page }),
+                  let url = URL(string: preview.imageUrl) else { return }
+            let crop: CGRect? = preview.clipWidth > 0 && preview.clipHeight > 0
+                ? CGRect(
+                    x: preview.offsetX,
+                    y: preview.offsetY,
+                    width: preview.clipWidth,
+                    height: preview.clipHeight
+                )
+                : nil
+            descriptor = (url, crop)
+        case .large(let previews):
+            guard let preview = previews.first(where: { $0.position == page }),
+                  let url = URL(string: preview.imageUrl) else { return }
+            descriptor = (url, nil)
+        }
+
+        guard let descriptor else { return }
+
+        if let image = ThumbnailMemoryCache.shared.get(descriptor.url),
+           let cgImage = Self.cgImage(from: image) {
+            seedDominantColor(from: cgImage, crop: descriptor.crop, page: page)
+            return
+        }
+
+        var request = URLRequest(url: descriptor.url, cachePolicy: .returnCacheDataDontLoad)
+        request.setValue(
+            AppSettings.shared.gallerySite == .exHentai
+                ? "https://exhentai.org/"
+                : "https://e-hentai.org/",
+            forHTTPHeaderField: "Referer"
+        )
+        guard let data = URLCache.shared.cachedResponse(for: request)?.data else { return }
+        let crop = descriptor.crop
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil),
+                  let color = Self.computeDominantColor(
+                    from: Self.croppedPreviewImage(cgImage, crop: crop)
+                  ) else { return }
+            await self?.applyPreviewDominantColor(color, page: page)
+        }
+    }
+
+    private func seedDominantColor(from cgImage: CGImage, crop: CGRect?, page: Int) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let color = Self.computeDominantColor(
+                from: Self.croppedPreviewImage(cgImage, crop: crop)
+            ) else { return }
+            await self?.applyPreviewDominantColor(color, page: page)
+        }
+    }
+
+    private func applyPreviewDominantColor(_ color: Color, page: Int) {
+        guard dominantColors[page] == nil else { return }
+        dominantColors[page] = color
+        previewSeededDominantPages.insert(page)
+    }
+
+    nonisolated private static func croppedPreviewImage(_ image: CGImage, crop: CGRect?) -> CGImage {
+        guard let crop else { return image }
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        let integralCrop = crop.integral.intersection(bounds)
+        guard !integralCrop.isEmpty, let cropped = image.cropping(to: integralCrop) else {
+            return image
+        }
+        return cropped
+    }
+
+    nonisolated private static func cgImage(from image: PlatformImage) -> CGImage? {
+        #if os(iOS)
+        (image.images?.first ?? image).cgImage
+        #else
+        image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        #endif
+    }
+
     /// 提取图片平均色用于模糊氛围背景 — CIFilter 在后台线程执行
     func extractDominantColor(for page: Int) {
-        guard dominantColors[page] == nil, let image = cachedImages[page] else { return }
+        guard (dominantColors[page] == nil || previewSeededDominantPages.contains(page)),
+              !fullColorPagesInFlight.contains(page),
+              let image = cachedImages[page] else { return }
 
-        Task.detached(priority: .utility) {
-            let color = Self.computeDominantColor(from: image)
-            if let color = color {
-                await MainActor.run { [weak self] in
-                    self?.dominantColors[page] = color
-                }
-            }
+        #if os(iOS)
+        guard let cgImage = (image.images?.first ?? image).cgImage else { return }
+        #else
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        #endif
+
+        fullColorPagesInFlight.insert(page)
+        Task.detached(priority: .utility) { [weak self] in
+            let color = Self.computeDominantColor(from: cgImage)
+            await self?.applyFullDominantColor(color, page: page)
+        }
+    }
+
+    private func applyFullDominantColor(_ color: Color?, page: Int) {
+        fullColorPagesInFlight.remove(page)
+        if let color {
+            dominantColors[page] = color
+            previewSeededDominantPages.remove(page)
         }
     }
 
     /// 纯计算: CIFilter 提取平均色 (nonisolated, 可在任意线程运行)
-    nonisolated private static func computeDominantColor(from image: PlatformImage) -> Color? {
-        #if os(iOS)
-        guard let cgImage = image.cgImage else { return nil }
+    nonisolated private static func computeDominantColor(from cgImage: CGImage) -> Color? {
         let ciImage = CIImage(cgImage: cgImage)
-        #else
-        guard let tiffData = image.tiffRepresentation,
-              let ciImage = CIImage(data: tiffData) else { return nil }
-        #endif
 
         guard let filter = CIFilter(name: "CIAreaAverage", parameters: [
             kCIInputImageKey: ciImage,
@@ -467,18 +795,63 @@ class ReaderViewModel {
 
     /// 主动释放距当前页过远的图片，防止 OOM
     func evictDistantPages(from page: Int) {
-        // 保留当前页前后各 5 页 (双页模式下约 2.5 个 spread)
-        let lo = max(0, page - 5)
-        let hi = min(max(0, totalPages - 1), page + 5)
-        let keepRange = lo...hi
+        let retentionRadius = min(6, max(2, AppSettings.shared.preloadImage))
+        let pagesToKeep = ReaderPrefetchPlanner.retainedPages(
+            around: page,
+            totalPages: totalPages,
+            radius: retentionRadius
+        )
 
         var toEvict: [Int] = []
-        for (p, _) in cachedImages where !keepRange.contains(p) {
+        for (p, _) in cachedImages where !pagesToKeep.contains(p) {
             toEvict.append(p)
         }
         for p in toEvict {
             cachedImages.removeValue(forKey: p)
             // NSCache 保留自身引用，这里只释放 Observable 层
+        }
+        if !toEvict.isEmpty {
+            spreadImageCache = spreadImageCache.filter { key, _ in
+                guard let spread = spreads.first(where: { $0.id == key.spreadID }) else { return false }
+                return spread.pages.allSatisfy(pagesToKeep.contains)
+            }
+        }
+    }
+
+    /// 系统发出内存压力时只保留当前可见 spread，并取消其他尚未完成的
+    /// 网络/解码工作。NSCache 清空不会影响 cachedImages 中正在显示的图片。
+    func handleMemoryPressure() {
+        var visiblePages: Set<Int> = [currentPage]
+        if isDoublePageEnabled,
+           let spreadIndex = currentSpreadIndex,
+           spreads.indices.contains(spreadIndex) {
+            visiblePages.formUnion(spreads[spreadIndex].pages)
+        }
+
+        cancelImageLoads(outside: visiblePages)
+        cachedImages = cachedImages.filter { visiblePages.contains($0.key) }
+        spreadImageCache = spreadImageCache.filter { key, _ in
+            guard let spread = spreads.first(where: { $0.id == key.spreadID }) else { return false }
+            return spread.pages.allSatisfy(visiblePages.contains)
+        }
+        dominantColors = dominantColors.filter { visiblePages.contains($0.key) }
+        Self.imageCache.removeAllObjects()
+        PerformanceDiagnostics.event("ReaderMemoryPressure")
+    }
+
+    func cancelBackgroundWork() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        for entry in imageLoadTasks.values {
+            entry.task.cancel()
+        }
+        imageLoadTasks.removeAll()
+    }
+
+    private func cancelImageLoads(outside pagesToKeep: Set<Int>) {
+        let pagesToCancel = imageLoadTasks.keys.filter { !pagesToKeep.contains($0) }
+        for page in pagesToCancel {
+            imageLoadTasks.removeValue(forKey: page)?.task.cancel()
         }
     }
 
@@ -521,7 +894,10 @@ class ReaderViewModel {
 
         // 图片数据
         imageURLs.removeAll()
+        originalImageURLs.removeAll()
+        pagesUsingOriginalImage.removeAll()
         cachedImages.removeAll()
+        spreadImageCache.removeAll()
         errorPages.removeAll()
         errorMessages.removeAll()
         retryingPages.removeAll()
@@ -533,12 +909,14 @@ class ReaderViewModel {
 
         // 视觉
         dominantColors.removeAll()
+        previewSeededDominantPages.removeAll()
+        fullColorPagesInFlight.removeAll()
 
         // 私有状态
         pTokens.removeAll()
         showKeys.removeAll()
         loadingPages.removeAll()
-        downloadingImages.removeAll()
+        cancelBackgroundWork()
         downloadDir = nil
     }
 
@@ -614,12 +992,22 @@ class ReaderViewModel {
     // MARK: - Page Loading
 
     func loadCurrentPage() async {
+        cancelImageLoads(outside: pagesRetainedForLoading(around: currentPage))
         await loadPage(currentPage)
         await downloadImageData(currentPage)
-        await preload(around: currentPage)
+        // 初次进入也必须触发氛围色，不再需要等用户翻页。
+        extractDominantColor(for: currentPage)
+        schedulePrefetch(around: currentPage)
     }
 
     func onPageChange(_ page: Int) async {
+        guard page >= 0, page < totalPages else { return }
+        if let lastPrefetchPage, page != lastPrefetchPage {
+            prefetchDirection = page > lastPrefetchPage ? 1 : -1
+        }
+        lastPrefetchPage = page
+        cancelImageLoads(outside: pagesRetainedForLoading(around: page, direction: prefetchDirection))
+
         // 更新 spread 索引
         let spreadIdx = spreadIndex(for: page)
         if spreadIdx != currentSpreadIndex {
@@ -638,7 +1026,7 @@ class ReaderViewModel {
             }
         }
 
-        await preload(around: page)
+        schedulePrefetch(around: page)
 
         // 提取主色调 (内部已在后台线程执行)
         extractDominantColor(for: page)
@@ -648,7 +1036,10 @@ class ReaderViewModel {
     }
 
     /// 下载图片数据到 NSCache，带进度追踪
-    func downloadImageData(_ index: Int) async {
+    func downloadImageData(
+        _ index: Int,
+        priority: TaskPriority = .userInitiated
+    ) async {
         // 已缓存 → 直接提升到 Observable 层 (使用 gid:page 复合 key)
         let key = cacheKey(for: index)
         if let cached = Self.imageCache.object(forKey: key) {
@@ -660,65 +1051,196 @@ class ReaderViewModel {
             return
         }
         guard let urlString = imageURLs[index], let url = URL(string: urlString) else { return }
-        guard !downloadingImages.contains(index) else { return }
-        downloadingImages.insert(index)
-        defer { downloadingImages.remove(index) }
+        let performanceInterval = PerformanceDiagnostics.begin("ReaderImageLoadDecode")
+        defer { performanceInterval.end() }
 
-        for attempt in 0..<3 {
-            do {
-                var request = URLRequest(url: url)
-                request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                                 forHTTPHeaderField: "User-Agent")
-                request.setValue(GalleryActionService.siteBaseURL, forHTTPHeaderField: "Referer")
-                request.timeoutInterval = 60
+        let entry: InFlightImageLoad
+        if let existing = imageLoadTasks[index] {
+            entry = existing
+        } else {
+            var request = URLRequest(url: url)
+            request.setValue(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                forHTTPHeaderField: "User-Agent"
+            )
+            request.setValue(GalleryActionService.siteBaseURL, forHTTPHeaderField: "Referer")
+            request.timeoutInterval = 60
 
-                // Perf: 使用 data(for:) 一次性下载替代 byte-by-byte 迭代
-                // byte-by-byte 的 async overhead 极高，导致翻页卡顿
-                let (data, _) = try await Self.session.data(for: request)
-
-                // 图片解码移到后台线程，避免阻塞 MainActor
-                let img = await Task.detached(priority: .userInitiated) {
-                    Self.downsampledImage(data: data)
-                }.value
-
-                if let img = img {
-                    let cost = Self.decodedCost(of: img)
-                    let cacheKey = self.cacheKey(for: index)
-                    Self.imageCache.setObject(img, forKey: cacheKey, cost: cost)
-                    await MainActor.run {
-                        self.cachedImages[index] = img
-                        self.downloadProgress.removeValue(forKey: index)
-                        // 审计修复 M-2: 每次新图片加入后立即淘汰远处页面
-                        self.evictDistantPages(from: self.currentPage)
+            let session = Self.session
+            let maxPixelSize = Self.maxDecodePixelSize
+            let id = UUID()
+            let task = Task.detached(priority: priority) {
+                for attempt in 0..<3 {
+                    guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
+                    do {
+                        let (data, response) = try await session.data(for: request)
+                        if let response = response as? HTTPURLResponse,
+                           !(200...299).contains(response.statusCode) {
+                            throw URLError(.badServerResponse)
+                        }
+                        guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
+                        guard let image = Self.downsampledImage(
+                            data: data,
+                            maxPixelSize: maxPixelSize
+                        ) else {
+                            return ImageLoadOutcome.invalidData
+                        }
+                        return ImageLoadOutcome.image(image)
+                    } catch is CancellationError {
+                        return ImageLoadOutcome.cancelled
+                    } catch let error as URLError where error.code == .cancelled {
+                        return ImageLoadOutcome.cancelled
+                    } catch {
+                        guard attempt < 2 else {
+                            return ImageLoadOutcome.failure(error.localizedDescription)
+                        }
+                        do {
+                            try await Task.sleep(for: .seconds(1 << attempt))
+                        } catch {
+                            return ImageLoadOutcome.cancelled
+                        }
                     }
-                    return
-                } else {
-                    await MainActor.run {
-                        self.errorPages.insert(index)
-                        self.errorMessages[index] = "图片数据无效"
-                        self.downloadProgress.removeValue(forKey: index)
-                    }
-                    return
                 }
-            } catch is CancellationError {
-                return
-            } catch let urlError as URLError where urlError.code == .cancelled {
-                return
-            } catch {
-                if Task.isCancelled { return }
-                debugLog("[Reader] Image download error page \(index) attempt \(attempt + 1): \(error.localizedDescription)")
-                if attempt < 2 {
-                    try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt))) * 1_000_000_000)
-                    if Task.isCancelled { return }
-                    continue
-                }
-                await MainActor.run {
-                    self.errorPages.insert(index)
-                    self.errorMessages[index] = "下载失败: \(error.localizedDescription)"
-                    self.downloadProgress.removeValue(forKey: index)
-                }
+                return ImageLoadOutcome.failure("未知错误")
             }
+            entry = InFlightImageLoad(id: id, task: task)
+            imageLoadTasks[index] = entry
         }
+
+        let outcome = await entry.task.value
+        if imageLoadTasks[index]?.id == entry.id {
+            imageLoadTasks.removeValue(forKey: index)
+        }
+
+        switch outcome {
+        case .image(let image):
+            let cost = Self.decodedCost(of: image)
+            Self.imageCache.setObject(image, forKey: cacheKey(for: index), cost: cost)
+            if pagesRetainedForLoading(around: currentPage).contains(index) {
+                cachedImages[index] = image
+            }
+            downloadProgress.removeValue(forKey: index)
+            errorPages.remove(index)
+            errorMessages.removeValue(forKey: index)
+            evictDistantPages(from: currentPage)
+        case .invalidData:
+            errorPages.insert(index)
+            errorMessages[index] = AppLocalization.localized("图片数据无效")
+            downloadProgress.removeValue(forKey: index)
+        case .failure(let message):
+            guard !Task.isCancelled else { return }
+            debugLog("[Reader] Image download failed page \(index): \(message)")
+            errorPages.insert(index)
+            errorMessages[index] = AppLocalization.format("下载失败: %@", message)
+            downloadProgress.removeValue(forKey: index)
+        case .cancelled:
+            return
+        }
+    }
+
+    /// Re-resolves the page and replaces the displayed source with the site's
+    /// "Download original" URL. The decoded cache must be cleared because its
+    /// key intentionally identifies a page rather than a particular source URL.
+    func loadOriginalImage(_ index: Int) async {
+        guard index >= 0, index < totalPages else { return }
+
+        let originalURL: URL
+        do {
+            originalURL = try await resolveOriginalImageURL(for: index)
+        } catch {
+            debugLog("[Reader] Original image lookup failed page \(index): \(error.localizedDescription)")
+            return
+        }
+        Self.imageCache.removeObject(forKey: cacheKey(for: index))
+        cachedImages.removeValue(forKey: index)
+        spreadImageCache.removeAll(keepingCapacity: true)
+        imageURLs[index] = originalURL.absoluteString
+        pagesUsingOriginalImage.insert(index)
+        errorPages.remove(index)
+        await downloadImageData(index)
+    }
+
+    /// 预览菜单直接保存/拷贝原图时使用。只获取原始字节，不创建大尺寸
+    /// 解码图或污染阅读器当前页缓存，避免一次菜单操作带来额外内存峰值。
+    func originalSourceImageData(for index: Int) async throws -> Data {
+        guard index >= 0, index < totalPages else { throw URLError(.badURL) }
+        let url = try await resolveOriginalImageURL(for: index)
+        return try await sourceImageData(from: url)
+    }
+
+    /// Returns the exact bytes behind the current page URL. Unlike the image
+    /// used for display, this data has not been downsampled by the reader.
+    func sourceImageData(for index: Int) async throws -> Data {
+        guard let source = imageURLs[index], let url = URL(string: source) else {
+            throw URLError(.badURL)
+        }
+        return try await sourceImageData(from: url)
+    }
+
+    private func sourceImageData(from url: URL) async throws -> Data {
+        if url.isFileURL {
+            return try Data(contentsOf: url, options: .mappedIfSafe)
+        }
+        var request = URLRequest(url: url)
+        request.setValue(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue(GalleryActionService.siteBaseURL, forHTTPHeaderField: "Referer")
+        request.timeoutInterval = 90
+        let (data, response) = try await Self.session.data(for: request)
+        if let response = response as? HTTPURLResponse,
+           !(200...299).contains(response.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    private func resolveOriginalImageURL(for index: Int) async throws -> URL {
+        if let cached = originalImageURLs[index], let url = URL(string: cached) {
+            return url
+        }
+
+        let pToken: String
+        if let cachedToken = pTokens[index] {
+            pToken = cachedToken
+        } else {
+            pToken = try await fetchPToken(page: index)
+            pTokens[index] = pToken
+        }
+
+        let site = GalleryActionService.siteBaseURL
+        guard let pageURL = URL(string: "\(site)s/\(pToken)/\(gid)-\(index + 1)") else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: pageURL)
+        request.setValue(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.timeoutInterval = 20
+        let (data, response) = try await Self.session.data(for: request)
+        if let response = response as? HTTPURLResponse,
+           !(200...299).contains(response.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        cacheOriginalImageURL(
+            from: String(data: data, encoding: .utf8) ?? "",
+            for: index
+        )
+        guard let resolved = originalImageURLs[index], let url = URL(string: resolved) else {
+            throw URLError(.cannotParseResponse)
+        }
+        return url
+    }
+
+    private func cacheOriginalImageURL(from html: String, for index: Int) {
+        guard let match = Self.originalImagePattern.firstMatch(
+            in: html,
+            range: NSRange(html.startIndex..., in: html)
+        ), let range = Range(match.range(at: 1), in: html) else { return }
+        originalImageURLs[index] = String(html[range])
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 
     /// 带重试的页面 URL 获取 (最多 5 次)
@@ -740,7 +1262,7 @@ class ReaderViewModel {
         guard !Task.isCancelled else { return }
         await MainActor.run {
             self.errorPages.insert(index)
-            self.errorMessages[index] = "加载超时，请点击重试"
+            self.errorMessages[index] = AppLocalization.localized("加载超时，请点击重试")
             self.retryingPages.removeValue(forKey: index)
         }
     }
@@ -748,7 +1270,19 @@ class ReaderViewModel {
     func loadPage(_ index: Int) async {
         guard index >= 0, index < totalPages else { return }
         guard imageURLs[index] == nil else { return }
-        guard !loadingPages.contains(index) else { return }
+        if loadingPages.contains(index) {
+            // 可见页与预取命中同一 HTML 请求时等待该请求，而不是直接返回。
+            // 若原预取被取消，集合会在 defer 中释放，当前调用随后接管重试。
+            while loadingPages.contains(index) {
+                do {
+                    try await Task.sleep(for: .milliseconds(20))
+                } catch {
+                    return
+                }
+            }
+            guard imageURLs[index] == nil else { return }
+            guard !Task.isCancelled else { return }
+        }
 
         // 优先本地 (Fix D-1: 通过 DownloadManager 统一路径，本地找不到时回退网络)
         if isDownloaded, let dir = downloadDir {
@@ -795,6 +1329,7 @@ class ReaderViewModel {
 
             let (data, _) = try await Self.session.data(for: request)
             let html = String(data: data, encoding: .utf8) ?? ""
+            cacheOriginalImageURL(from: html, for: index)
 
             if let m = Self.imgSrcPattern.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
                let r = Range(m.range(at: 1), in: html) {
@@ -829,6 +1364,7 @@ class ReaderViewModel {
         await MainActor.run {
             self.imageURLs[index] = nil
             self.cachedImages.removeValue(forKey: index)
+            self.spreadImageCache.removeAll(keepingCapacity: true)
             self.errorPages.remove(index)
             self.errorMessages.removeValue(forKey: index)
             self.retryingPages.removeValue(forKey: index)
@@ -843,26 +1379,75 @@ class ReaderViewModel {
         await downloadImageData(index)
     }
 
-    /// 预加载 — 前 1 页 + 后 preloadImage 页 (并行)
-    func preload(around page: Int) async {
-        let preloadNum = AppSettings.shared.preloadImage
-        let lo = max(0, page - 1)
-        let hi = min(totalPages - 1, page + preloadNum)
-        guard lo <= hi else { return }
-
-        var pagesToLoad: [Int] = []
-        for i in lo...hi where imageURLs[i] == nil && !loadingPages.contains(i) {
-            pagesToLoad.append(i)
+    private func schedulePrefetch(around page: Int) {
+        prefetchTask?.cancel()
+        let direction = prefetchDirection
+        prefetchTask = Task { [weak self] in
+            await self?.preload(around: page, direction: direction)
         }
+    }
 
+    /// 方向感知预加载：快速反向翻页会取消旧计划；低数据模式和昂贵网络
+    /// 会主动缩小窗口，避免无用请求占用带宽与图片解码内存。
+    func preload(around page: Int, direction: Int = 1) async {
+        let configured = AppSettings.shared.preloadImage
+        let preloadNum: Int
+        if networkIsConstrained {
+            preloadNum = 1
+        } else if networkIsExpensive {
+            preloadNum = min(2, configured)
+        } else {
+            preloadNum = configured
+        }
+        let ahead = direction >= 0 ? preloadNum : 1
+        let behind = direction >= 0 ? 1 : preloadNum
+        let pagesToLoad = ReaderPrefetchPlanner.pages(
+            around: page,
+            totalPages: totalPages,
+            ahead: ahead,
+            behind: behind
+        )
+        guard !pagesToLoad.isEmpty else { return }
+
+        // 同时最多处理 3 页，避免高分辨率图片并发解码造成瞬时内存峰值。
         await withTaskGroup(of: Void.self) { group in
-            for p in pagesToLoad {
-                group.addTask {
-                    await self.loadPage(p)
-                    await self.downloadImageData(p)
+            var iterator = pagesToLoad.makeIterator()
+            for _ in 0..<min(3, pagesToLoad.count) {
+                guard let page = iterator.next() else { break }
+                group.addTask(priority: .utility) {
+                    await self.loadPage(page)
+                    await self.downloadImageData(page, priority: .utility)
+                }
+            }
+
+            while await group.next() != nil {
+                guard !Task.isCancelled, let page = iterator.next() else { continue }
+                group.addTask(priority: .utility) {
+                    await self.loadPage(page)
+                    await self.downloadImageData(page, priority: .utility)
                 }
             }
         }
+    }
+
+    private func pagesRetainedForLoading(around page: Int, direction: Int = 1) -> Set<Int> {
+        let radius = min(6, max(2, AppSettings.shared.preloadImage))
+        let ahead = direction >= 0 ? radius : 1
+        let behind = direction >= 0 ? 1 : radius
+        var pages = Set(ReaderPrefetchPlanner.pages(
+            around: page,
+            totalPages: totalPages,
+            ahead: ahead,
+            behind: behind
+        ))
+        pages.insert(page)
+        if isDoublePageEnabled {
+            let spreadIndex = spreadIndex(for: page)
+            if spreads.indices.contains(spreadIndex) {
+                pages.formUnion(spreads[spreadIndex].pages)
+            }
+        }
+        return pages
     }
 
     private func fetchPToken(page: Int) async throws -> String {

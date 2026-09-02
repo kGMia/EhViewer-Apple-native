@@ -27,9 +27,21 @@ struct ZoomableImageView: UIViewRepresentable {
     var onSingleTap: ((CGPoint, CGSize) -> Void)?
     /// 缩放状态变化回调 — 通知外层当前是否处于放大状态
     var onZoomChanged: ((Bool) -> Void)?
+    /// 松手后是否动画吸附至目标页。
+    var pageSwipeAnimationEnabled: Bool = true
+    /// iPad/iPhone 使用独立的页滑动识别器，避免嵌套 UIScrollView
+    /// 抢占 SwiftUI 分页容器的横向手势。
+    var onSwipeLeft: (() -> Void)?
+    var onSwipeRight: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onSingleTap: onSingleTap, onZoomChanged: onZoomChanged)
+        Coordinator(
+            onSingleTap: onSingleTap,
+            onZoomChanged: onZoomChanged,
+            pageSwipeAnimationEnabled: pageSwipeAnimationEnabled,
+            onSwipeLeft: onSwipeLeft,
+            onSwipeRight: onSwipeRight
+        )
     }
 
     func makeUIView(context: Context) -> ZoomableScrollView {
@@ -46,15 +58,18 @@ struct ZoomableImageView: UIViewRepresentable {
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.scaleMode = scaleMode
         scrollView.startPosition = startPosition
+        scrollView.allowsHorizontalScrollAtMinZoom = allowsHorizontalScrollAtMinZoom
 
         let imageView = UIImageView(image: image)
         imageView.contentMode = .scaleToFill  // 手动设置 frame，不依赖 contentMode
         imageView.clipsToBounds = false
         imageView.tag = 1001
+        imageView.startAnimating()
         scrollView.addSubview(imageView)
         context.coordinator.imageView = imageView
         context.coordinator.scrollView = scrollView
         context.coordinator.allowsHorizontalScrollAtMinZoom = allowsHorizontalScrollAtMinZoom
+        scrollView.allowsHorizontalScrollAtMinZoom = allowsHorizontalScrollAtMinZoom
 
         // 双击缩放手势 (对齐 Android GalleryView 双击缩放)
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
@@ -66,6 +81,16 @@ struct ZoomableImageView: UIViewRepresentable {
         singleTap.numberOfTapsRequired = 1
         singleTap.require(toFail: doubleTap)  // 双击优先: 必须等双击失败后才触发单击
         scrollView.addGestureRecognizer(singleTap)
+
+        let pagePan = UIPanGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handlePagePan(_:))
+        )
+        pagePan.maximumNumberOfTouches = 1
+        pagePan.cancelsTouchesInView = false
+        pagePan.delegate = context.coordinator
+        context.coordinator.pagePanGesture = pagePan
+        scrollView.addGestureRecognizer(pagePan)
 
         return scrollView
     }
@@ -79,6 +104,7 @@ struct ZoomableImageView: UIViewRepresentable {
 
         if imageChanged {
             imageView.image = image
+            imageView.startAnimating()
             scrollView.zoomScale = scrollView.minimumZoomScale
             scrollView.needsStartPositionApply = true
         }
@@ -100,6 +126,10 @@ struct ZoomableImageView: UIViewRepresentable {
         context.coordinator.allowsHorizontalScrollAtMinZoom = allowsHorizontalScrollAtMinZoom
         context.coordinator.onSingleTap = onSingleTap
         context.coordinator.onZoomChanged = onZoomChanged
+        context.coordinator.pageSwipeAnimationEnabled = pageSwipeAnimationEnabled
+        context.coordinator.onSwipeLeft = onSwipeLeft
+        context.coordinator.onSwipeRight = onSwipeRight
+        scrollView.allowsHorizontalScrollAtMinZoom = allowsHorizontalScrollAtMinZoom
 
         // 仅在需要重新布局时才调用 setNeedsLayout，避免不必要的重绘
         if imageChanged || scaleModeChanged || startPositionChanged {
@@ -109,17 +139,33 @@ struct ZoomableImageView: UIViewRepresentable {
 
     // MARK: - Coordinator
 
-    class Coordinator: NSObject, UIScrollViewDelegate {
+    class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         weak var imageView: UIImageView?
         weak var scrollView: ZoomableScrollView?
+        weak var pagePanGesture: UIPanGestureRecognizer?
         var onSingleTap: ((CGPoint, CGSize) -> Void)?
         var onZoomChanged: ((Bool) -> Void)?
+        var pageSwipeAnimationEnabled: Bool
+        var onSwipeLeft: (() -> Void)?
+        var onSwipeRight: (() -> Void)?
         var allowsHorizontalScrollAtMinZoom: Bool = false
         private var lastIsZoomed: Bool = false
+        private weak var activePagingScrollView: UIScrollView?
+        private var pagingStartOffset: CGPoint?
+        private var pagingPanWasEnabled = true
 
-        init(onSingleTap: ((CGPoint, CGSize) -> Void)?, onZoomChanged: ((Bool) -> Void)?) {
+        init(
+            onSingleTap: ((CGPoint, CGSize) -> Void)?,
+            onZoomChanged: ((Bool) -> Void)?,
+            pageSwipeAnimationEnabled: Bool,
+            onSwipeLeft: (() -> Void)?,
+            onSwipeRight: (() -> Void)?
+        ) {
             self.onSingleTap = onSingleTap
             self.onZoomChanged = onZoomChanged
+            self.pageSwipeAnimationEnabled = pageSwipeAnimationEnabled
+            self.onSwipeLeft = onSwipeLeft
+            self.onSwipeRight = onSwipeRight
         }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
@@ -170,12 +216,11 @@ struct ZoomableImageView: UIViewRepresentable {
                 zoomScrollView.clampHorizontalOffset()
 
                 let isZoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
-                let contentOverflows = scrollView.contentSize.width > boundsSize.width + 1 ||
-                                        scrollView.contentSize.height > boundsSize.height + 1
-
-                // 放大时: 启用滚动 + 禁止弹跳 (防止手势泄漏到 TabView 导致意外翻页)
-                // 1x 时: 根据内容是否溢出决定是否启用滚动
-                zoomScrollView.isScrollEnabled = isZoomed || contentOverflows || allowsHorizontalScrollAtMinZoom
+                // Keep the UIScrollView enabled at minimum zoom as well: the
+                // dedicated page-pan recognizer lives on this view. Direction
+                // and edge arbitration below decide whether its own pan or
+                // page turning should handle a drag.
+                zoomScrollView.isScrollEnabled = true
                 zoomScrollView.bounces = !isZoomed
 
                 // 通知外层缩放状态变化
@@ -189,9 +234,7 @@ struct ZoomableImageView: UIViewRepresentable {
         func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
             let isZoomed = scale > scrollView.minimumZoomScale + 0.01
             if let zoomScrollView = scrollView as? ZoomableScrollView {
-                let contentOverflows = scrollView.contentSize.width > scrollView.bounds.width + 1 ||
-                                        scrollView.contentSize.height > scrollView.bounds.height + 1
-                zoomScrollView.isScrollEnabled = isZoomed || contentOverflows || allowsHorizontalScrollAtMinZoom
+                zoomScrollView.isScrollEnabled = true
                 zoomScrollView.bounces = !isZoomed
 
                 if isZoomed != lastIsZoomed {
@@ -232,11 +275,151 @@ struct ZoomableImageView: UIViewRepresentable {
             onSingleTap?(location, size)
         }
 
+        @objc func handlePagePan(_ gesture: UIPanGestureRecognizer) {
+            switch gesture.state {
+            case .began:
+                guard let pager = ancestorScrollView(from: gesture.view) else { return }
+                activePagingScrollView = pager
+                pagingStartOffset = pager.contentOffset
+
+                // The dedicated recognizer drives the outer native pager.
+                // Cancel its own pan recognizer so Simulator and real devices
+                // cannot apply the same finger translation twice.
+                pagingPanWasEnabled = pager.panGestureRecognizer.isEnabled
+                pager.panGestureRecognizer.isEnabled = false
+
+            case .changed:
+                guard let pager = activePagingScrollView,
+                      let startOffset = pagingStartOffset else { return }
+                let translation = gesture.translation(in: pager).x
+                var offset = startOffset
+                offset.x = clampedOffsetX(startOffset.x - translation, in: pager)
+                pager.setContentOffset(offset, animated: false)
+
+            case .ended:
+                if let pager = activePagingScrollView,
+                   let startOffset = pagingStartOffset {
+                    finishPagingGesture(gesture, pager: pager, startOffset: startOffset)
+                } else {
+                    performFallbackPageTurn(gesture)
+                }
+                clearPagingGestureState()
+
+            case .cancelled, .failed:
+                if let pager = activePagingScrollView,
+                   let startOffset = pagingStartOffset {
+                    pager.panGestureRecognizer.isEnabled = pagingPanWasEnabled
+                    pager.setContentOffset(startOffset, animated: pageSwipeAnimationEnabled)
+                }
+                clearPagingGestureState()
+
+            default:
+                break
+            }
+        }
+
+        private func finishPagingGesture(
+            _ gesture: UIPanGestureRecognizer,
+            pager: UIScrollView,
+            startOffset: CGPoint
+        ) {
+            let translation = gesture.translation(in: pager).x
+            let velocity = gesture.velocity(in: pager).x
+            let pageWidth = max(1, pager.bounds.width)
+            let shouldTurn = abs(translation) >= pageWidth * 0.18 || abs(velocity) >= 360
+
+            pager.panGestureRecognizer.isEnabled = pagingPanWasEnabled
+            guard shouldTurn else {
+                pager.setContentOffset(startOffset, animated: pageSwipeAnimationEnabled)
+                return
+            }
+
+            // 不再同时手动改 contentOffset 并等 SwiftUI 猜测落点。
+            // 那会产生两个独立的页码真值，快速翻页/旋转时偶发
+            // “画面一页、进度另一页”。现在手势只提交一次逻辑翻页，
+            // 外层 scrollPosition 是唯一状态源，并从手指当前的部分位移继续吸附。
+            let direction = abs(translation) > 8 ? translation : velocity
+            if direction < 0 {
+                onSwipeLeft?()
+            } else {
+                onSwipeRight?()
+            }
+        }
+
+        private func performFallbackPageTurn(_ gesture: UIPanGestureRecognizer) {
+            let translation = gesture.translation(in: gesture.view).x
+            let velocity = gesture.velocity(in: gesture.view).x
+            guard abs(translation) >= 44 || abs(velocity) >= 420 else { return }
+
+            if translation < 0 || (translation == 0 && velocity < 0) {
+                onSwipeLeft?()
+            } else {
+                onSwipeRight?()
+            }
+        }
+
+        private func clampedOffsetX(_ proposedX: CGFloat, in scrollView: UIScrollView) -> CGFloat {
+            let minimumX = -scrollView.adjustedContentInset.left
+            let maximumX = max(
+                minimumX,
+                scrollView.contentSize.width - scrollView.bounds.width
+                    + scrollView.adjustedContentInset.right
+            )
+            return min(maximumX, max(minimumX, proposedX))
+        }
+
+        private func clearPagingGestureState() {
+            activePagingScrollView = nil
+            pagingStartOffset = nil
+            pagingPanWasEnabled = true
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard gestureRecognizer === pagePanGesture,
+                  let pan = gestureRecognizer as? UIPanGestureRecognizer,
+                  let scrollView
+            else { return true }
+
+            let velocity = pan.velocity(in: scrollView)
+            guard abs(velocity.x) > abs(velocity.y) * 1.15 else { return false }
+
+            // Preserve NavigationStack's native edge-swipe-to-go-back.
+            if let window = scrollView.window {
+                let location = pan.location(in: window)
+                if location.x < 24, velocity.x > 0 { return false }
+            }
+
+            let maxOffsetX = max(0, scrollView.contentSize.width - scrollView.bounds.width)
+            if maxOffsetX <= 1 { return true }
+
+            let atLeftEdge = scrollView.contentOffset.x <= 1
+            let atRightEdge = scrollView.contentOffset.x >= maxOffsetX - 1
+            return (atLeftEdge && velocity.x > 0) || (atRightEdge && velocity.x < 0)
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            gestureRecognizer === pagePanGesture || otherGestureRecognizer === pagePanGesture
+        }
+
+        private func ancestorScrollView(from view: UIView?) -> UIScrollView? {
+            var candidate = view?.superview
+            while let current = candidate {
+                if let scrollView = current as? UIScrollView {
+                    return scrollView
+                }
+                candidate = current.superview
+            }
+            return nil
+        }
+
     }
 }
 
 /// 自定义 UIScrollView — 实现完整的 ScaleMode 布局逻辑 (对齐 Android ImageView.setScaleOffset)
-/// 在 fit/fitWidth 模式的 1x 缩放时不拦截水平手势，让父 TabView 正常翻页
+/// 未放大且无需横向平移时不拦截水平手势，让父级分页滚动正常翻页
 class ZoomableScrollView: UIScrollView {
     /// 用于检测 bounds 是否变化，避免冗余布局
     var lastLayoutBoundsSize: CGSize = .zero
@@ -244,6 +427,9 @@ class ZoomableScrollView: UIScrollView {
     var scaleMode: ScaleMode = .fit
     /// 起始位置 (对齐 Android ImageView.START_POSITION_*)
     var startPosition: StartPosition = .center
+    /// Mirrors the representable option so gesture arbitration can happen in
+    /// this UIScrollView subclass before its pan recognizer begins.
+    var allowsHorizontalScrollAtMinZoom = false
     /// 是否需要在下次布局时应用起始位置
     var needsStartPositionApply = true
 
@@ -366,10 +552,26 @@ class ZoomableScrollView: UIScrollView {
                     }
                 }
 
-                // 只在 fit/fitWidth 模式下拦截水平手势 (这些模式下图片宽度 ≤ 屏幕宽度，无需水平滚动)
-                // 拦截后 → 手势传给 TabView → 实现翻页
-                if abs(velocity.x) > abs(velocity.y) && (scaleMode == .fit || scaleMode == .fitWidth) {
-                    return false
+                let isHorizontalPan = abs(velocity.x) > abs(velocity.y)
+                if isHorizontalPan && !allowsHorizontalScrollAtMinZoom {
+                    let maxOffsetX = max(0, contentSize.width - bounds.width)
+
+                    // A fitted image has no horizontal work for its inner
+                    // scroll view, so let the outer SwiftUI pager own the drag.
+                    if maxOffsetX <= 1 {
+                        return false
+                    }
+
+                    // For fit-height/original-size images, preserve panning in
+                    // the middle but hand an outward drag to the pager once the
+                    // corresponding image edge has been reached.
+                    let atLeftEdge = contentOffset.x <= 1
+                    let atRightEdge = contentOffset.x >= maxOffsetX - 1
+                    let draggingRight = velocity.x > 0
+                    let draggingLeft = velocity.x < 0
+                    if (atLeftEdge && draggingRight) || (atRightEdge && draggingLeft) {
+                        return false
+                    }
                 }
             } else {
                 // 放大时: 图片已到达边缘且继续向外拖动 → 不拦截，让 TabView 翻页
@@ -403,6 +605,11 @@ struct ZoomableImageView: NSViewRepresentable {
     var allowsHorizontalScrollAtMinZoom: Bool = false
     var onSingleTap: ((CGPoint, CGSize) -> Void)?
     var onZoomChanged: ((Bool) -> Void)?
+    var pageSwipeAnimationEnabled: Bool = true
+    // Kept for a shared cross-platform call site. AppKit uses its existing
+    // scroll-wheel/swipe navigator instead of these UIKit callbacks.
+    var onSwipeLeft: (() -> Void)?
+    var onSwipeRight: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onSingleTap: onSingleTap, onZoomChanged: onZoomChanged)
@@ -418,7 +625,10 @@ struct ZoomableImageView: NSViewRepresentable {
         scrollView.backgroundColor = .black
 
         let imageView = NSImageView(image: image)
-        imageView.imageScaling = .scaleNone  // 手动控制尺寸，不依赖 AppKit 自动缩放
+        // The frame below is the target display size. `.scaleNone` keeps
+        // drawing the bitmap at its original size and makes "Fit" overflow.
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.animates = true
         scrollView.documentView = imageView
         context.coordinator.imageView = imageView
         context.coordinator.scrollView = scrollView
@@ -460,6 +670,7 @@ struct ZoomableImageView: NSViewRepresentable {
         let needsLayout = imageView.image !== image || context.coordinator.scaleMode != scaleMode
         if imageView.image !== image {
             imageView.image = image
+            imageView.animates = true
             scrollView.magnification = 1.0
         }
         context.coordinator.scaleMode = scaleMode
@@ -467,7 +678,7 @@ struct ZoomableImageView: NSViewRepresentable {
         context.coordinator.onZoomChanged = onZoomChanged
         if needsLayout {
             Self.layoutImageStatic(in: scrollView, imageView: imageView, scaleMode: scaleMode)
-            context.coordinator.lastViewSize = scrollView.bounds.size
+            context.coordinator.lastViewSize = scrollView.contentView.bounds.size
         }
     }
 
@@ -475,7 +686,10 @@ struct ZoomableImageView: NSViewRepresentable {
     static func layoutImageStatic(in scrollView: NSScrollView, imageView: NSImageView, scaleMode: ScaleMode) {
         guard let image = imageView.image else { return }
         let imgSize = image.size
-        let viewSize = scrollView.bounds.size
+        // Use the clip view rather than the outer scroll-view bounds. The
+        // latter includes scroller/chrome space and can leave a fitted image a
+        // few points larger than the actual visible viewport.
+        let viewSize = scrollView.contentView.bounds.size
         guard imgSize.width > 0, imgSize.height > 0, viewSize.width > 0, viewSize.height > 0 else { return }
 
         let wScale = viewSize.width / imgSize.width
@@ -493,10 +707,15 @@ struct ZoomableImageView: NSViewRepresentable {
         let scaledW = imgSize.width * fitScale
         let scaledH = imgSize.height * fitScale
 
-        // 居中 (对齐 Android adjustPosition: 小于视口时居中)
-        let x = max(0, (viewSize.width - scaledW) / 2)
-        let y = max(0, (viewSize.height - scaledH) / 2)
-        imageView.frame = CGRect(x: x, y: y, width: scaledW, height: scaledH)
+        // Keep the document at least as large as the viewport. NSImageView
+        // centres the proportional image when either fitted axis is smaller.
+        imageView.frame = CGRect(
+            origin: .zero,
+            size: CGSize(
+                width: max(viewSize.width, scaledW),
+                height: max(viewSize.height, scaledH)
+            )
+        )
     }
 
     class Coordinator: NSObject {
@@ -519,7 +738,7 @@ struct ZoomableImageView: NSViewRepresentable {
         /// 窗口尺寸变化时重新布局图片
         @objc func frameDidChange(_ notification: Notification) {
             guard let scrollView, let imageView else { return }
-            let newSize = scrollView.bounds.size
+            let newSize = scrollView.contentView.bounds.size
             guard newSize != lastViewSize, newSize.width > 0, newSize.height > 0 else { return }
             lastViewSize = newSize
             // 重新布局 (reset magnification 以适应新窗口尺寸)

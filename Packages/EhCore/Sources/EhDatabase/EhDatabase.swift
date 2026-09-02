@@ -221,6 +221,58 @@ public final class EhDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v3-watch-later") { db in
+            // 稍后再看完全保存在本机。独立于收藏，避免同步、登录状态或
+            // 收藏夹变更影响用户临时保存的阅读队列。
+            try db.create(table: "watchLater") { t in
+                t.primaryKey("gid", .integer)
+                t.column("token", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("titleJpn", .text)
+                t.column("thumb", .text)
+                t.column("category", .integer).notNull().defaults(to: 0)
+                t.column("posted", .text)
+                t.column("uploader", .text)
+                t.column("rating", .real).defaults(to: 0)
+                t.column("simpleLanguage", .text)
+                t.column("pages", .integer).defaults(to: 0)
+                t.column("date", .integer).notNull()
+            }
+        }
+
+        migrator.registerMigration("v4-favorite-metadata-index") { db in
+            try db.create(table: "favoriteMetadataIndex") { t in
+                t.column("site", .integer).notNull()
+                t.column("gid", .integer).notNull()
+                t.column("token", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("titleJpn", .text)
+                t.column("thumb", .text)
+                t.column("category", .integer).notNull().defaults(to: 0)
+                t.column("posted", .text)
+                t.column("uploader", .text)
+                t.column("rating", .real).notNull().defaults(to: 0)
+                t.column("simpleLanguage", .text)
+                t.column("pages", .integer).notNull().defaults(to: 0)
+                t.column("tagsJSON", .text)
+                t.column("favoriteSlot", .integer).notNull().defaults(to: -1)
+                t.column("serverOrder", .integer).notNull()
+                t.column("syncID", .text).notNull()
+                t.column("syncedAt", .datetime).notNull()
+                t.primaryKey(["site", "gid"])
+            }
+            try db.create(
+                index: "favoriteMetadataIndex_site_slot_order",
+                on: "favoriteMetadataIndex",
+                columns: ["site", "favoriteSlot", "serverOrder"]
+            )
+            try db.create(
+                index: "favoriteMetadataIndex_site_rating",
+                on: "favoriteMetadataIndex",
+                columns: ["site", "rating"]
+            )
+        }
+
         return migrator
     }
 
@@ -323,11 +375,99 @@ public final class EhDatabase: Sendable {
         }
     }
 
+    // MARK: - 云收藏元数据索引
+
+    public func saveFavoriteMetadataPage(_ records: [FavoriteMetadataRecord]) throws {
+        guard !records.isEmpty else { return }
+        try dbQueue.write { db in
+            for record in records { try record.save(db) }
+        }
+    }
+
+    public func finishFavoriteMetadataSync(site: Int, syncID: String) throws {
+        try dbQueue.write { db in
+            try FavoriteMetadataRecord
+                .filter(Column("site") == site && Column("syncID") != syncID)
+                .deleteAll(db)
+        }
+    }
+
+    public func favoriteMetadataCount(site: Int) throws -> Int {
+        try dbQueue.read { db in
+            try FavoriteMetadataRecord.filter(Column("site") == site).fetchCount(db)
+        }
+    }
+
+    public func fetchFavoriteMetadata(
+        site: Int,
+        slot: Int? = nil,
+        query: String = "",
+        sort: FavoriteMetadataSort = .serverOrder
+    ) throws -> [FavoriteMetadataRecord] {
+        try dbQueue.read { db in
+            var request = FavoriteMetadataRecord.filter(Column("site") == site)
+            if let slot, slot >= 0 {
+                request = request.filter(Column("favoriteSlot") == slot)
+            }
+            let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalizedQuery.isEmpty {
+                let pattern = "%\(normalizedQuery)%"
+                request = request.filter(
+                    Column("title").like(pattern)
+                        || Column("titleJpn").like(pattern)
+                        || Column("uploader").like(pattern)
+                        || Column("tagsJSON").like(pattern)
+                )
+            }
+            switch sort {
+            case .serverOrder, .addedAt:
+                request = request.order(Column("serverOrder").asc)
+            case .uploadedAt:
+                request = request.order(Column("posted").desc, Column("serverOrder").asc)
+            case .rating:
+                request = request.order(Column("rating").desc, Column("serverOrder").asc)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    // MARK: - 稍后再看
+
+    public func saveToWatchLater(_ record: WatchLaterRecord) throws {
+        try dbQueue.write { db in
+            try record.save(db)
+        }
+    }
+
+    public func getAllWatchLater() throws -> [WatchLaterRecord] {
+        try dbQueue.read { db in
+            try WatchLaterRecord.order(Column("date").desc).fetchAll(db)
+        }
+    }
+
+    public func containsWatchLater(gid: Int64) throws -> Bool {
+        try dbQueue.read { db in
+            try WatchLaterRecord.fetchOne(db, key: gid) != nil
+        }
+    }
+
+    public func deleteWatchLater(gid: Int64) throws {
+        try dbQueue.write { db in
+            _ = try WatchLaterRecord.deleteOne(db, key: gid)
+        }
+    }
+
+    public func clearWatchLater() throws {
+        try dbQueue.write { db in
+            _ = try WatchLaterRecord.deleteAll(db)
+        }
+    }
+
     // MARK: - 快速搜索操作
 
     public func getAllQuickSearches() throws -> [QuickSearchRecord] {
         try dbQueue.read { db in
-            try QuickSearchRecord.order(Column("date").asc).fetchAll(db)
+            try QuickSearchRecord.order(Column("date").desc).fetchAll(db)
         }
     }
 
@@ -757,6 +897,113 @@ public struct LocalFavoriteRecord: Codable, FetchableRecord, PersistableRecord, 
                 pages: Int = 0, date: Date = .init()) {
         self.gid = gid; self.token = token; self.title = title
         self.category = category; self.pages = pages; self.date = date; self.rating = 0
+    }
+}
+
+public enum FavoriteMetadataSort: String, Codable, Sendable, CaseIterable {
+    case serverOrder
+    case uploadedAt
+    case addedAt
+    case rating
+}
+
+/// Complete local metadata mirror of cloud favorites. `syncID` makes page-wise
+/// background updates crash-safe: old rows are removed only after every cursor
+/// page has been stored successfully.
+public struct FavoriteMetadataRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    public static let databaseTableName = "favoriteMetadataIndex"
+
+    public var site: Int
+    public var gid: Int64
+    public var token: String
+    public var title: String
+    public var titleJpn: String?
+    public var thumb: String?
+    public var category: Int
+    public var posted: String?
+    public var uploader: String?
+    public var rating: Float
+    public var simpleLanguage: String?
+    public var pages: Int
+    public var tagsJSON: String?
+    public var favoriteSlot: Int
+    public var serverOrder: Int
+    public var syncID: String
+    public var syncedAt: Date
+
+    public init(
+        site: Int,
+        gid: Int64,
+        token: String,
+        title: String,
+        titleJpn: String? = nil,
+        thumb: String? = nil,
+        category: Int = 0,
+        posted: String? = nil,
+        uploader: String? = nil,
+        rating: Float = 0,
+        simpleLanguage: String? = nil,
+        pages: Int = 0,
+        tagsJSON: String? = nil,
+        favoriteSlot: Int = -1,
+        serverOrder: Int,
+        syncID: String,
+        syncedAt: Date = Date()
+    ) {
+        self.site = site
+        self.gid = gid
+        self.token = token
+        self.title = title
+        self.titleJpn = titleJpn
+        self.thumb = thumb
+        self.category = category
+        self.posted = posted
+        self.uploader = uploader
+        self.rating = rating
+        self.simpleLanguage = simpleLanguage
+        self.pages = pages
+        self.tagsJSON = tagsJSON
+        self.favoriteSlot = favoriteSlot
+        self.serverOrder = serverOrder
+        self.syncID = syncID
+        self.syncedAt = syncedAt
+    }
+}
+
+public struct WatchLaterRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    public static let databaseTableName = "watchLater"
+
+    public var gid: Int64
+    public var token: String
+    public var title: String
+    public var titleJpn: String?
+    public var thumb: String?
+    public var category: Int
+    public var posted: String?
+    public var uploader: String?
+    public var rating: Float
+    public var simpleLanguage: String?
+    public var pages: Int
+    public var date: Date
+
+    public init(
+        gid: Int64, token: String, title: String, titleJpn: String? = nil,
+        thumb: String? = nil, category: Int = 0, posted: String? = nil,
+        uploader: String? = nil, rating: Float = 0, simpleLanguage: String? = nil,
+        pages: Int = 0, date: Date = .init()
+    ) {
+        self.gid = gid
+        self.token = token
+        self.title = title
+        self.titleJpn = titleJpn
+        self.thumb = thumb
+        self.category = category
+        self.posted = posted
+        self.uploader = uploader
+        self.rating = rating
+        self.simpleLanguage = simpleLanguage
+        self.pages = pages
+        self.date = date
     }
 }
 

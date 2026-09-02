@@ -7,6 +7,7 @@
 
 import SwiftUI
 import EhDatabase
+import EhSettings
 
 struct FilterView: View {
     @State private var vm = FilterViewModel()
@@ -131,13 +132,13 @@ struct FilterRow: View {
 
     private var filterModeText: String {
         switch filter.mode {
-        case 0: return "标题过滤"
-        case 1: return "上传者过滤"
-        case 2: return "标签过滤"
-        case 3: return "标签命名空间过滤"
-        case 4: return "上传者标签过滤"
-        case 5: return "语言过滤"
-        default: return "未知类型"
+        case 0: return AppLocalization.localized("标题过滤")
+        case 1: return AppLocalization.localized("上传者过滤")
+        case 2: return AppLocalization.localized("标签过滤")
+        case 3: return AppLocalization.localized("标签命名空间过滤")
+        case 4: return AppLocalization.localized("上传者标签过滤")
+        case 5: return AppLocalization.localized("语言过滤")
+        default: return AppLocalization.localized("未知类型")
         }
     }
 }
@@ -168,7 +169,7 @@ struct AddFilterSheet: View {
 
                     Picker("过滤类型", selection: $filterMode) {
                         ForEach(filterModes, id: \.0) { mode, name in
-                            Text(name).tag(mode)
+                            Text(LocalizedStringKey(name)).tag(mode)
                         }
                     }
                 }
@@ -200,12 +201,12 @@ struct AddFilterSheet: View {
 
     private var filterDescription: String {
         switch filterMode {
-        case 0: return "含有此文本的标题将被过滤"
-        case 1: return "此上传者的画廊将被过滤"
-        case 2: return "含有此标签的画廊将被过滤 (格式: namespace:tag)"
-        case 3: return "含有此命名空间下任何标签的画廊将被过滤"
-        case 4: return "含有此上传者标签的画廊将被过滤"
-        case 5: return "此语言的画廊将被过滤"
+        case 0: return AppLocalization.localized("含有此文本的标题将被过滤")
+        case 1: return AppLocalization.localized("此上传者的画廊将被过滤")
+        case 2: return AppLocalization.localized("含有此标签的画廊将被过滤 (格式: namespace:tag)")
+        case 3: return AppLocalization.localized("含有此命名空间下任何标签的画廊将被过滤")
+        case 4: return AppLocalization.localized("含有此上传者标签的画廊将被过滤")
+        case 5: return AppLocalization.localized("此语言的画廊将被过滤")
         default: return ""
         }
     }

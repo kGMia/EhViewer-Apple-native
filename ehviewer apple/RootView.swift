@@ -2,13 +2,15 @@
 //  RootView.swift
 //  ehviewer apple
 //
-//  Root navigation: Warning → Security → SiteSelection → Login → Main app
+//  Root navigation: Warning → SiteSelection → Login → Main app
 //
 
 import SwiftUI
 import EhSettings
 import EhAPI
 import EhCookie
+import EhDownload
+import EhModels
 
 #if os(iOS)
 import UIKit
@@ -17,13 +19,11 @@ import AppKit
 #endif
 
 /// 根视图: 引导流程控制器
-/// 流程: 18+警告 → 安全认证 → 站点选择 → 登录检查 → 主界面
+/// 流程: 18+警告 → 站点选择 → 登录检查 → 主界面
 struct RootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var appState: AppState   // 仅在 init() 中初始化，避免创建多余实例
     @State private var flowStep: OnboardingStep
-    
-    /// 后台进入时间戳，用于判断是否需要重新认证
-    @State private var backgroundTime: Date?
     
     /// 剪贴板画廊检测 (对齐 Android MainActivity.onResume 检测 EH 链接)
     @State private var clipboardGallery: (gid: Int64, token: String)?
@@ -33,9 +33,6 @@ struct RootView: View {
     /// ExHentai 切换提示
     @State private var showExHAlert = false
 
-    /// 缓存深色模式偏好 — 打破 body 对 AppSettings.shared.theme 的直接 observation 链
-    @State private var cachedColorScheme: ColorScheme?
-
     /// Sad Panda / igneous 失效警告 (V-15)
     @State private var showSadPandaAlert = false
     /// 磁盘空间不足警告
@@ -44,7 +41,6 @@ struct RootView: View {
         case checking      // 检查状态中
         case warning       // 18+ 警告
         case rejected      // 拒绝 18+ 警告 (iOS 不能 exit, 显示永久阻断页)
-        case security      // 安全认证
         case selectSite    // 站点选择
         case login         // 登录页
         case main          // 主界面
@@ -53,11 +49,12 @@ struct RootView: View {
     // MARK: - 同步计算初始页面 (消除白屏)
     init() {
         let settings = AppSettings.shared
+        let bypassOnboardingForUITests = ProcessInfo.processInfo.environment["EH_UI_TEST_BYPASS_ONBOARDING"] == "1"
         let step: OnboardingStep
-        if settings.showWarning {
+        if bypassOnboardingForUITests {
+            step = .main
+        } else if settings.showWarning {
             step = .warning
-        } else if settings.enableSecurity {
-            step = .security
         } else if !settings.hasSelectedSite {
             step = .selectSite
         } else if settings.skipSignIn {
@@ -70,12 +67,16 @@ struct RootView: View {
             step = hasAuth ? .main : .login
         }
         _flowStep = State(initialValue: step)
+        // 应用锁已移除。清理旧版留下的开关，避免降级/再升级时意外进入旧锁定流程。
+        if settings.enableSecurity {
+            settings.enableSecurity = false
+        }
         // 同步初始化 appState 登录状态，避免首帧后异步 mutation 导致重渲染
         let initState = AppState()
         if step == .main {
             initState.checkLoginStatus()
             if !initState.isSignedIn {
-                initState.isSignedIn = settings.skipSignIn
+                initState.isSignedIn = settings.skipSignIn || bypassOnboardingForUITests
             }
         }
         _appState = State(initialValue: initState)
@@ -86,10 +87,6 @@ struct RootView: View {
         //   - flowStep == .main/.checking → 直接显示主界面
         //   - 其他 → 显示对应引导/登录页面
         //   不使用 ZStack/opacity，消除不必要的 MainTabView 提前渲染
-        #if DEBUG
-        let _ = Self._printChanges()  // ★ 诊断: 精确显示哪个属性触发了 body 重新求值
-        #endif
-        let _ = NSLog("[RENDER] RootView body, flowStep=%@", String(describing: flowStep))
         Group {
             if flowStep == .main || flowStep == .checking {
                 MainTabView()
@@ -101,8 +98,7 @@ struct RootView: View {
         .withGlobalErrorBoundary()
         // 已登录用户: 启动时异步获取资料 + ExH 检测 (不 mutate isSignedIn，不触发重渲染)
         .task {
-            // 在 .task 中初始化 cachedColorScheme，打破 body 对 AppSettings.shared.theme 的直接观察
-            cachedColorScheme = Self.computeColorScheme()
+            await ApplicationBootstrap.shared.start()
             if appState.isSignedIn && !AppSettings.shared.skipSignIn {
                 await postLoginActions()
             }
@@ -150,28 +146,26 @@ struct RootView: View {
             Text("igneous Cookie 已失效 (Sad Panda)，已自动清除。\n请重新登录以恢复 ExHentai 访问权限，或切换到 E-Hentai。")
         }
         // 对齐 Android: 深色模式支持 (Settings.KEY_THEME)
-        // 0=跟随系统, 1=浅色, 2=深色  (使用 cachedColorScheme 避免 body 直接读 AppSettings)
-        .preferredColorScheme(cachedColorScheme)
-        #if os(iOS)
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            // 记录进入后台的时间
-            backgroundTime = Date()
+        // 0=跟随系统, 1=浅色, 2=深色。theme 已接入 Observation，修改后
+        // 直接更新现有窗口，不再要求重新启动应用。
+        .preferredColorScheme(Self.computeColorScheme())
+        .onOpenURL(perform: handleDeepLink)
+        .onContinueUserActivity(SystemGalleryIntegration.activityType) { activity in
+            guard let gallery = SystemGalleryIntegration.gallery(from: activity) else { return }
+            openGallery(gallery)
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
-            // 检查是否需要重新认证
-            checkSecurityOnResume()
-            // 检查剪贴板中的画廊链接 (对齐 Android MainActivity.onResume)
-            checkClipboardForGalleryUrl()
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                checkClipboardForGalleryUrl()
+            case .inactive, .background:
+                if phase == .background {
+                    ApplicationBootstrap.shared.scheduleDatabaseMaintenance()
+                }
+            @unknown default:
+                break
+            }
         }
-        #elseif os(macOS)
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in
-            backgroundTime = Date()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            checkSecurityOnResume()
-            checkClipboardForGalleryUrl()
-        }
-        #endif
         .alert("检测到画廊链接", isPresented: $showClipboardAlert) {
             Button("打开") {
                 if let gallery = clipboardGallery {
@@ -222,11 +216,6 @@ struct RootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.background)
-
-        case .security:
-            SecurityView(onAuthenticated: {
-                determineNextStep()
-            })
 
         case .selectSite:
             SelectSiteView(onComplete: {
@@ -288,7 +277,7 @@ struct RootView: View {
     }
 
     /// 深色模式偏好 (对齐 Android: Settings.KEY_THEME)
-    /// 静态方法: 用于 .task 中初始化 cachedColorScheme，不在 body 中直接调用
+    /// 直接读取可观察设置，让已打开的场景即时跟随主题变化。
     private static func computeColorScheme() -> ColorScheme? {
         switch AppSettings.shared.theme {
         case 1: return .light
@@ -306,22 +295,13 @@ struct RootView: View {
             return
         }
         
-        // 2. 检查安全认证 (仅在启用时)
-        if settings.enableSecurity && flowStep != .security {
-            // 首次进入或从后台恢复需要认证
-            if flowStep == .checking {
-                flowStep = .security
-                return
-            }
-        }
-        
-        // 3. 检查站点选择
+        // 2. 检查站点选择
         if !settings.hasSelectedSite {
             flowStep = .selectSite
             return
         }
         
-        // 4. 检查登录状态
+        // 3. 检查登录状态
         appState.checkLoginStatus()
         
         // 如果设置了跳过登录 (游客模式)，直接进入主界面
@@ -335,21 +315,42 @@ struct RootView: View {
         }
     }
     
-    private func checkSecurityOnResume() {
-        guard AppSettings.shared.enableSecurity else { return }
-        guard flowStep == .main || flowStep == .login else { return }
-        
-        // 检查是否超过安全延迟时间
-        if let bgTime = backgroundTime {
-            let delaySeconds = AppSettings.shared.securityDelay
-            let elapsed = Date().timeIntervalSince(bgTime)
-            
-            if elapsed > Double(delaySeconds) {
-                flowStep = .security
+    /// Live Activity 与系统深链接的单一入口。先完成操作，再导航到下载页，
+    /// 避免冷启动时页面已显示但队列状态还没刷新。
+    private func handleDeepLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "ehviewer" else { return }
+
+        switch url.host?.lowercased() {
+        case "gallery":
+            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  let rawGID = components.queryItems?.first(where: { $0.name == "gid" })?.value,
+                  let gid = Int64(rawGID),
+                  let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
+                  !token.isEmpty
+            else { return }
+            openGallery(GalleryInfo(gid: gid, token: token))
+        case "downloads":
+            AppNavigationRequest.send(.downloads)
+        case "pause-download":
+            guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  let rawGID = components.queryItems?.first(where: { $0.name == "gid" })?.value,
+                  let gid = Int64(rawGID)
+            else { return }
+            Task {
+                await DownloadManager.shared.pauseDownload(gid: gid)
+                AppNavigationRequest.send(.downloads)
             }
+        default:
+            break
         }
-        
-        backgroundTime = nil
+    }
+
+    private func openGallery(_ gallery: GalleryInfo) {
+        NotificationCenter.default.post(
+            name: .openGalleryFromClipboard,
+            object: nil,
+            userInfo: ["gid": gallery.gid, "token": gallery.token]
+        )
     }
 
     /// 检查剪贴板中的画廊链接 (对齐 Android MainActivity.checkClipboardUrl)
@@ -430,11 +431,10 @@ final class AppState {
             isSignedIn = newValue  // ★ 仅在值变化时写入，避免 withMutation 触发无效重渲染
         }
 
-        // Fix F1-3: 未登录或无有效 igneous Cookie 时，强制降级到 E-Hentai
+        // 未登录时不能访问 ExHentai。已登录时保留用户显式选择，
+        // 由实际请求/Sad Panda 响应判断权限，避免 igneous 尚未写入时静默切回。
         if !isSignedIn && AppSettings.shared.gallerySite == .exHentai {
             AppSettings.shared.gallerySite = .eHentai
-        } else if isSignedIn && AppSettings.shared.gallerySite == .exHentai {
-            validateExHentaiAccess()
         }
     }
 

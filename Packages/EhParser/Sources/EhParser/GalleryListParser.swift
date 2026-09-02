@@ -74,6 +74,10 @@ public enum GalleryListParser {
                 result.pages = -1
                 result.nextPage = -1
 
+                if let first = try searchNav.select("#ufirst").first() {
+                    result.firstHref = try first.attr("href")
+                    if result.firstHref?.isEmpty == true { result.firstHref = nil }
+                }
                 if let prev = try searchNav.select("#uprev").first() {
                     result.prevHref = try prev.attr("href")
                     if result.prevHref?.isEmpty == true { result.prevHref = nil }
@@ -81,6 +85,10 @@ public enum GalleryListParser {
                 if let next = try searchNav.select("#unext").first() {
                     result.nextHref = try next.attr("href")
                     if result.nextHref?.isEmpty == true { result.nextHref = nil }
+                }
+                if let last = try searchNav.select("#ulast").first() {
+                    result.lastHref = try last.attr("href")
+                    if result.lastHref?.isEmpty == true { result.lastHref = nil }
                 }
 
                 // 结果数
@@ -296,17 +304,17 @@ public enum GalleryListParser {
                     info.thumbHeight = Int(sizeMatch.1) ?? 0
                     info.thumbWidth = Int(sizeMatch.2) ?? 0
                 }
-                let src = try img.attr("src")
-                if !src.isEmpty { info.thumb = src }
+                if let source = try preferredThumbnailSource(from: img) {
+                    info.thumb = source
+                }
             }
         }
 
         // 最后回退: 任意 img 元素
         if info.thumb == nil, let img = try row.select("img").first() {
-            let dataSrc = try img.attr("data-src")
-            let src = try img.attr("src")
-            let url = dataSrc.isEmpty ? src : dataSrc
-            if !url.isEmpty { info.thumb = url }
+            if let source = try preferredThumbnailSource(from: img) {
+                info.thumb = source
+            }
         }
 
         // 样式中的缩略图 (内联 url())
@@ -359,7 +367,36 @@ public enum GalleryListParser {
             if !tags.isEmpty { info.simpleTags = tags }
         }
 
+        info.generateSLang()
+
         return info
+    }
+
+    /// EH 的旧列表模板和部分镜像节点会把真正封面放在 data-src、
+    /// data-original 或 srcset，src 只保留透明占位图。优先选择真实网络
+    /// 地址，避免把 data:image 占位图永久写入画廊模型。
+    private static func preferredThumbnailSource(from image: Element) throws -> String? {
+        let srcset = try image.attr("srcset")
+        let firstSrcsetURL = srcset
+            .split(separator: ",", maxSplits: 1)
+            .first?
+            .split(whereSeparator: \.isWhitespace)
+            .first
+            .map(String.init)
+
+        let candidates = [
+            try image.attr("data-src"),
+            try image.attr("data-original"),
+            firstSrcsetURL ?? "",
+            try image.attr("src")
+        ]
+
+        return candidates.first { value in
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !normalized.isEmpty
+                && !normalized.lowercased().hasPrefix("data:")
+                && normalized.lowercased() != "about:blank"
+        }
     }
 
     // MARK: - 缩略图模式解析

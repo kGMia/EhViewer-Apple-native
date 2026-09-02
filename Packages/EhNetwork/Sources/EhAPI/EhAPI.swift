@@ -49,6 +49,9 @@ public actor EhAPI {
         config.timeoutIntervalForResource = 30
         config.httpCookieStorage = .shared
         config.urlCache = sharedCache
+        config.httpMaximumConnectionsPerHost = 6
+        config.httpShouldUsePipelining = true
+        config.requestCachePolicy = .useProtocolCachePolicy
         config.allowsCellularAccess = true
         // 不使用 waitsForConnectivity — 立即尝试，快速失败后交由域名前置回退
         session = URLSession(configuration: config)
@@ -59,6 +62,9 @@ public actor EhAPI {
         imgConfig.timeoutIntervalForResource = 20
         imgConfig.httpCookieStorage = .shared
         imgConfig.urlCache = sharedCache
+        imgConfig.httpMaximumConnectionsPerHost = 6
+        imgConfig.httpShouldUsePipelining = true
+        imgConfig.requestCachePolicy = .useProtocolCachePolicy
         imgConfig.allowsCellularAccess = true
         imageSession = URLSession(configuration: imgConfig, delegate: RedirectBlockDelegate(), delegateQueue: nil)
 
@@ -70,6 +76,8 @@ public actor EhAPI {
         directConfig.timeoutIntervalForResource = 20
         directConfig.httpCookieStorage = .shared
         directConfig.urlCache = sharedCache
+        directConfig.httpMaximumConnectionsPerHost = 4
+        directConfig.httpShouldUsePipelining = true
         directConfig.allowsCellularAccess = true
         directConfig.connectionProxyDictionary = [:]  // 绕过 HTTP 代理设置
         directSession = URLSession(
@@ -83,6 +91,8 @@ public actor EhAPI {
         directImgConfig.timeoutIntervalForResource = 30
         directImgConfig.httpCookieStorage = .shared
         directImgConfig.urlCache = sharedCache
+        directImgConfig.httpMaximumConnectionsPerHost = 4
+        directImgConfig.httpShouldUsePipelining = true
         directImgConfig.allowsCellularAccess = true
         directImgConfig.connectionProxyDictionary = [:]  // 绕过 HTTP 代理设置
         directImageSession = URLSession(
@@ -99,7 +109,7 @@ public actor EhAPI {
     /// 对应 Android: OkHttp 默认使用内置 DNS，iOS 需手动实现回退逻辑
     private func sanitizedData(for request: URLRequest) async throws -> (Data, URLResponse) {
         if let url = request.url {
-            EhCookieManager.shared.sanitizeCookiesForRequest(url: url)
+            await EhCookieManager.shared.sanitizeCookiesForRequest(url: url)
         }
 
         // 全局 API 速率限制 — 防止 IP 封禁 (V-08)
@@ -132,7 +142,7 @@ public actor EhAPI {
     /// 不跟随重定向的请求 (对应 Android OkHttpClient followRedirects=false)
     private func noRedirectData(for request: URLRequest) async throws -> (Data, URLResponse) {
         if let url = request.url {
-            EhCookieManager.shared.sanitizeCookiesForRequest(url: url)
+            await EhCookieManager.shared.sanitizeCookiesForRequest(url: url)
         }
 
         // 全局 API 速率限制 — 防止 IP 封禁 (V-08)
@@ -334,7 +344,16 @@ public actor EhAPI {
         try checkResponse(response, data: data)
 
         let body = String(data: data, encoding: .utf8) ?? ""
-        return try GalleryDetailParser.parse(body)
+        do {
+            return try GalleryDetailParser.parse(body)
+        } catch let error as GalleryDetailParser.DetailParseError {
+            switch error {
+            case .offensive: throw EhError.offensive
+            case .pining: throw EhError.pining
+            case .galleryUnavailable: throw EhError.galleryUnavailable
+            case .serverMessage(let message): throw EhError.serverError(message)
+            }
+        }
     }
 
     /// 批量补全画廊信息 (对应 Android fillGalleryListByApi, JSON API: gdata)
@@ -606,12 +625,64 @@ public actor EhAPI {
         try checkResponse(response, data: data)
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let voteScore = json["comment_score"] as? Int,
-              let voteState = json["comment_vote"] as? Int
+              let voteScore = Self.jsonInteger(json["comment_score"]),
+              let voteState = Self.jsonInteger(json["comment_vote"])
         else {
             throw EhError.parseError("Failed to parse votecomment response")
         }
         return VoteCommentResult(score: voteScore, vote: voteState)
+    }
+
+    /// Add or vote on gallery tags (`taggallery`). Submitting the same vote
+    /// direction toggles comment votes, while gallery tag vote withdrawal is
+    /// performed by submitting the opposite direction, matching EH's web UI.
+    public func voteTag(
+        apiUid: Int64,
+        apiKey: String,
+        gid: Int64,
+        token: String,
+        tags: String,
+        vote: Int
+    ) async throws -> [GalleryTagGroup] {
+        let site = AppSettings.shared.gallerySite
+        guard let url = URL(string: EhURL.apiUrl(for: site)) else {
+            throw EhError.invalidUrl
+        }
+
+        let normalizedTags = tags.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTags.isEmpty, vote == 1 || vote == -1 else {
+            throw EhError.parseError("Invalid tag vote request")
+        }
+
+        let jsonBody: [String: Any] = [
+            "method": "taggallery",
+            "apiuid": apiUid,
+            "apikey": apiKey,
+            "gid": gid,
+            "token": token,
+            "tags": normalizedTags,
+            "vote": vote,
+        ]
+
+        let jsonData = try JSONSerialization.data(withJSONObject: jsonBody)
+        let referer = EhURL.galleryDetailUrl(gid: gid, token: token, site: site)
+        let request = EhRequestBuilder.buildPostJSONRequest(
+            url: url,
+            json: jsonData,
+            referer: referer,
+            origin: EhURL.origin(for: site)
+        )
+
+        let (data, response) = try await sanitizedData(for: request)
+        try checkResponse(response, data: data)
+        return try GalleryDetailParser.parseVoteTagResponse(data)
+    }
+
+    /// EH API 的数值字段可能由不同边缘节点返回为 JSON number 或字符串。
+    private static func jsonInteger(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string) }
+        return nil
     }
 
     // MARK: - Token API (对应 Android getGalleryToken, JSON API: gtoken)
@@ -1119,7 +1190,7 @@ public actor EhAPI {
            httpResponse.value(forHTTPHeaderField: "Content-Type") == Self.sadPandaType,
            httpResponse.value(forHTTPHeaderField: "Content-Length") == Self.sadPandaLength {
             // 自动清除失效的 igneous Cookie 并通知 UI (V-15)
-            EhCookieManager.shared.clearIgneous()
+            Task { await EhCookieManager.shared.clearIgneous() }
             NotificationCenter.default.post(name: .ehSadPandaDetected, object: nil)
             throw EhError.sadPanda
         }
@@ -1137,7 +1208,7 @@ public actor EhAPI {
            (url == "https://exhentai.org/" || url == "https://exhentai.org"),
            body.isEmpty {
             // 自动清除失效的 igneous Cookie (V-15)
-            EhCookieManager.shared.clearIgneous()
+            Task { await EhCookieManager.shared.clearIgneous() }
             NotificationCenter.default.post(name: .ehSadPandaDetected, object: nil)
             throw EhError.igneousWrong
         }
@@ -1254,20 +1325,20 @@ public enum EhError: LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidUrl: return "无效的链接"
-        case .sadPanda: return "Sad Panda — 请登录或检查 Cookie"
-        case .kokomade: return "今回はここまで — 访问受限"
-        case .httpError(let code, _): return "HTTP 错误 \(code)"
-        case .cloudflare403: return "Cloudflare 安全验证拦截 — 请使用下方「网页登录」通过验证后登录"
-        case .parseError(let msg): return "解析失败: \(msg)"
-        case .networkError(let msg): return "网络错误: \(msg)"
-        case .imageLimitReached: return "509 — 图片配额已用尽"
-        case .noHathClient: return "没有可用的 H@H 客户端"
-        case .cancelled: return "请求已取消"
-        case .igneousWrong: return "igneous cookie 无效，请重新登录或检查 ExHentai 权限"
-        case .offensive: return "该画廊包含攻击性内容，需确认后访问"
-        case .pining: return "该画廊已被删除 (pining for the fjords)"
-        case .galleryUnavailable: return "该画廊不可用"
+        case .invalidUrl: return AppLocalization.localized("无效的链接")
+        case .sadPanda: return AppLocalization.localized("Sad Panda — 请登录或检查 Cookie")
+        case .kokomade: return AppLocalization.localized("今回はここまで — 访问受限")
+        case .httpError(let code, _): return AppLocalization.format("HTTP 错误 %lld", Int64(code))
+        case .cloudflare403: return AppLocalization.localized("Cloudflare 安全验证拦截 — 请使用下方「网页登录」通过验证后登录")
+        case .parseError(let msg): return AppLocalization.format("解析失败: %@", msg)
+        case .networkError(let msg): return AppLocalization.format("网络错误: %@", msg)
+        case .imageLimitReached: return AppLocalization.localized("509 — 图片配额已用尽")
+        case .noHathClient: return AppLocalization.localized("没有可用的 H@H 客户端")
+        case .cancelled: return AppLocalization.localized("请求已取消")
+        case .igneousWrong: return AppLocalization.localized("igneous cookie 无效，请重新登录或检查 ExHentai 权限")
+        case .offensive: return AppLocalization.localized("该画廊包含攻击性内容，需确认后访问")
+        case .pining: return AppLocalization.localized("该画廊已被删除 (pining for the fjords)")
+        case .galleryUnavailable: return AppLocalization.localized("该画廊不可用")
         case .serverError(let msg): return msg
         }
     }
@@ -1280,25 +1351,25 @@ public enum EhError: LocalizedError, Sendable {
         if let urlError = error as? URLError {
             switch urlError.code {
             case .timedOut:
-                return "请求超时 — 请检查网络连接或代理设置"
+                return AppLocalization.localized("请求超时 — 请检查网络连接或代理设置")
             case .notConnectedToInternet:
-                return "无网络连接 — 请检查网络设置"
+                return AppLocalization.localized("无网络连接 — 请检查网络设置")
             case .cannotConnectToHost:
-                return "无法连接到服务器 — 请检查代理/VPN 设置"
+                return AppLocalization.localized("无法连接到服务器 — 请检查代理/VPN 设置")
             case .cannotFindHost, .dnsLookupFailed:
-                return "域名解析失败 — 请检查 DNS 或开启代理/VPN"
+                return AppLocalization.localized("域名解析失败 — 请检查 DNS 或开启代理/VPN")
             case .networkConnectionLost:
-                return "网络连接中断 — 请稍后重试"
+                return AppLocalization.localized("网络连接中断 — 请稍后重试")
             case .secureConnectionFailed:
-                return "安全连接失败 — 请检查代理/VPN 设置"
+                return AppLocalization.localized("安全连接失败 — 请检查代理/VPN 设置")
             case .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot:
-                return "证书验证失败 — 请检查代理设置或关闭域名前置"
+                return AppLocalization.localized("证书验证失败 — 请检查代理设置或关闭域名前置")
             case .cancelled:
-                return "请求已取消"
+                return AppLocalization.localized("请求已取消")
             case .dataNotAllowed:
-                return "蜂窝数据不可用 — 请检查设置"
+                return AppLocalization.localized("蜂窝数据不可用 — 请检查设置")
             default:
-                return "网络错误 (\(urlError.code.rawValue))"
+                return AppLocalization.format("网络错误 (%lld)", Int64(urlError.code.rawValue))
             }
         }
         return error.localizedDescription

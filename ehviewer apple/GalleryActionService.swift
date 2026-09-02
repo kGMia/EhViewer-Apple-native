@@ -19,6 +19,14 @@ import EhDownload
 @MainActor
 final class GalleryActionService {
     static let shared = GalleryActionService()
+    private(set) var watchLaterGIDs: Set<Int64> = []
+    /// GalleryInfo 来自服务器且为值类型。操作完成后用轻量覆盖表立即更新
+    /// 当前列表，而不必刷新整页或等待服务器重新返回 favoriteSlot。
+    private var favoriteOverrides: [Int64: Bool] = [:]
+    /// SwiftUI 的滑动按钮、菜单和触控手势可能在极短时间内重复触发。
+    /// 合并同一 gid 的收藏请求，避免一加一减或重复网络写入导致状态闪烁。
+    private var activeFavoriteGIDs: Set<Int64> = []
+
     private init() {}
 
     // MARK: - 收藏
@@ -29,17 +37,13 @@ final class GalleryActionService {
     /// - 默认 slot == -2: 返回 false，调用方应弹出选择器
     /// - Returns: true 表示已执行操作, false 表示需要弹出选择器
     @discardableResult
-    func quickFavorite(gallery: GalleryInfo) async -> Bool {
+    func quickFavorite(gallery: GalleryInfo) async throws -> Bool {
         let defaultSlot = AppSettings.shared.defaultFavSlot
         if defaultSlot >= 0 && defaultSlot <= 9 {
-            do {
-                try await addFavorite(gid: gallery.gid, token: gallery.token, slot: defaultSlot)
-            } catch {
-                return false
-            }
+            try await addFavorite(gid: gallery.gid, token: gallery.token, slot: defaultSlot)
             return true
         } else if defaultSlot == -1 {
-            addLocalFavorite(gallery: gallery)
+            try await addLocalFavorite(gallery: gallery)
             return true
         }
         return false // 需要弹出选择器
@@ -48,6 +52,7 @@ final class GalleryActionService {
     /// 添加云端收藏 (Fix B-3: 失败时抛出错误，让调用方回滚)
     func addFavorite(gid: Int64, token: String, slot: Int) async throws {
         try await EhAPI.shared.addFavorites(gid: gid, token: token, dstCat: slot)
+        favoriteOverrides[gid] = true
         AppSettings.shared.recentFavCat = slot
         NotificationCenter.default.post(name: .galleryFavoriteChanged,
                                         object: nil,
@@ -55,40 +60,103 @@ final class GalleryActionService {
     }
 
     /// 添加本地收藏 (对齐 Android FAV_CAT_LOCAL = -1)
-    func addLocalFavorite(gallery: GalleryInfo) {
-        var record = LocalFavoriteRecord(
-            gid: gallery.gid, token: gallery.token, title: gallery.bestTitle,
-            category: gallery.category.rawValue, pages: gallery.pages, date: Date()
-        )
-        record.titleJpn = gallery.titleJpn
-        record.thumb = gallery.thumb
-        record.posted = gallery.posted
-        record.uploader = gallery.uploader
-        record.rating = gallery.rating
-        do {
+    func addLocalFavorite(gallery: GalleryInfo) async throws {
+        let record = gallery.localFavoriteRecord()
+        try await Task.detached(priority: .userInitiated) {
             try EhDatabase.shared.insertLocalFavorite(record)
-            NotificationCenter.default.post(name: .galleryFavoriteChanged,
-                                            object: nil,
-                                            userInfo: ["gid": gallery.gid, "favorited": true, "slot": -1])
-        } catch {
-            debugLog("[GalleryActionService] Add local favorite failed: \(error)")
-        }
+        }.value
+        favoriteOverrides[gallery.gid] = true
+        NotificationCenter.default.post(name: .galleryFavoriteChanged,
+                                        object: nil,
+                                        userInfo: ["gid": gallery.gid, "favorited": true, "slot": -1])
     }
 
     /// 取消收藏 (Fix B-3: 失败时抛出错误，让调用方回滚)
     func removeFavorite(gid: Int64, token: String) async throws {
         try await EhAPI.shared.addFavorites(gid: gid, token: token, dstCat: -1)
-        try? EhDatabase.shared.deleteLocalFavorite(gid: gid)
+        try? await Task.detached(priority: .userInitiated) {
+            try EhDatabase.shared.deleteLocalFavorite(gid: gid)
+        }.value
+        favoriteOverrides[gid] = false
         NotificationCenter.default.post(name: .galleryFavoriteChanged,
                                         object: nil,
                                         userInfo: ["gid": gid, "favorited": false])
+    }
+
+    func isFavorited(_ gallery: GalleryInfo) -> Bool {
+        favoriteOverrides[gallery.gid] ?? (gallery.favoriteSlot >= 0)
+    }
+
+    func toggleFavorite(_ gallery: GalleryInfo) async {
+        guard activeFavoriteGIDs.insert(gallery.gid).inserted else { return }
+        defer { activeFavoriteGIDs.remove(gallery.gid) }
+
+        do {
+            if isFavorited(gallery) {
+                try await removeFavorite(gid: gallery.gid, token: gallery.token)
+            } else {
+                // “每次询问”必须由调用方展示收藏夹选择器；这里不擅自
+                // 选取收藏夹。列表和详情页都会在调用本方法前处理它。
+                _ = try await quickFavorite(gallery: gallery)
+            }
+        } catch {
+            ErrorHandler.shared.handle(error, context: "ToggleFavorite")
+        }
     }
 
     // MARK: - 下载
 
     /// 快速下载 (Fix A-1: 已失败/已暂停的任务允许重新启动)
     func startDownload(gallery: GalleryInfo) async {
+        // Ask only after an explicit download action, never during cold start.
+        _ = await DownloadNotificationService.shared.requestAuthorization()
         await DownloadManager.shared.startDownload(gallery: gallery)
+    }
+
+    // MARK: - 稍后再看
+
+    func isInWatchLater(gid: Int64) -> Bool {
+        watchLaterGIDs.contains(gid)
+    }
+
+    func reloadWatchLaterState() async {
+        let gids = (try? await Task.detached(priority: .utility) {
+            Set(try EhDatabase.shared.getAllWatchLater().map(\.gid))
+        }.value) ?? []
+        watchLaterGIDs = gids
+    }
+
+    func addToWatchLater(_ gallery: GalleryInfo) async {
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try EhDatabase.shared.saveToWatchLater(gallery.watchLaterRecord())
+            }.value
+            watchLaterGIDs.insert(gallery.gid)
+            NotificationCenter.default.post(name: .watchLaterChanged, object: gallery.gid)
+        } catch {
+            ErrorHandler.shared.handle(error, context: "AddWatchLater")
+        }
+    }
+
+    func removeFromWatchLater(gid: Int64) async {
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try EhDatabase.shared.deleteWatchLater(gid: gid)
+            }.value
+            watchLaterGIDs.remove(gid)
+            NotificationCenter.default.post(name: .watchLaterChanged, object: gid)
+        } catch {
+            ErrorHandler.shared.handle(error, context: "RemoveWatchLater")
+        }
+    }
+
+
+    func clearWatchLater() async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try EhDatabase.shared.clearWatchLater()
+        }.value
+        watchLaterGIDs.removeAll(keepingCapacity: true)
+        NotificationCenter.default.post(name: .watchLaterChanged, object: nil)
     }
 
     // MARK: - 分享/复制
@@ -131,4 +199,5 @@ final class GalleryActionService {
 extension Notification.Name {
     /// 画廊收藏状态变化 (userInfo: gid, favorited, slot?)
     static let galleryFavoriteChanged = Notification.Name("galleryFavoriteChanged")
+    static let watchLaterChanged = Notification.Name("watchLaterChanged")
 }

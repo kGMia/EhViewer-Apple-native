@@ -248,7 +248,7 @@ public enum FilterMode: Int, Sendable, Codable, CaseIterable {
 
 // MARK: - 排行榜数据
 
-public struct TopListDetail: Sendable {
+public struct TopListDetail: Sendable, Codable {
     public var lists: [TopListCategory]
 
     public init(lists: [TopListCategory] = []) {
@@ -256,7 +256,7 @@ public struct TopListDetail: Sendable {
     }
 }
 
-public struct TopListCategory: Sendable {
+public struct TopListCategory: Sendable, Codable {
     public var name: String
     public var allTime: [TopListItem]
     public var pastYear: [TopListItem]
@@ -271,7 +271,7 @@ public struct TopListCategory: Sendable {
     }
 }
 
-public struct TopListItem: Sendable {
+public struct TopListItem: Sendable, Codable {
     public var text: String
     public var href: String?
 
@@ -316,17 +316,21 @@ public struct GalleryListResult: Sendable {
     public var nextPage: Int?
     public var resultCount: String?
     /// searchnav 模式下的导航链接
+    public var firstHref: String?
     public var prevHref: String?
     public var nextHref: String?
+    public var lastHref: String?
     public var noWatchedTags: Bool
 
     public init(galleries: [GalleryInfo] = [], pages: Int = 0,
                 nextPage: Int? = nil, resultCount: String? = nil,
-                prevHref: String? = nil, nextHref: String? = nil,
+                firstHref: String? = nil, prevHref: String? = nil,
+                nextHref: String? = nil, lastHref: String? = nil,
                 noWatchedTags: Bool = false) {
         self.galleries = galleries; self.pages = pages
         self.nextPage = nextPage; self.resultCount = resultCount
-        self.prevHref = prevHref; self.nextHref = nextHref
+        self.firstHref = firstHref; self.prevHref = prevHref
+        self.nextHref = nextHref; self.lastHref = lastHref
         self.noWatchedTags = noWatchedTags
     }
 }

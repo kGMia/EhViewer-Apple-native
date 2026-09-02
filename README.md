@@ -1,19 +1,21 @@
 # EhViewer-Apple
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.1-brightgreen" alt="Version"/>
-  <img src="https://img.shields.io/badge/platform-iOS%2017%2B%20%7C%20macOS%2014%2B-blue" alt="Platform"/>
+  <img src="https://img.shields.io/badge/version-1.0.0-brightgreen" alt="Version"/>
+  <img src="https://img.shields.io/badge/platform-iOS%2026.2%2B%20%7C%20iPadOS%2026.2%2B%20%7C%20macOS%2026.2%2B-blue" alt="Platform"/>
   <img src="https://img.shields.io/badge/swift-6.0-orange" alt="Swift 6.0"/>
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"/>
 </p>
 
 EhViewer-Apple 是一款适用于 iOS 和 macOS 的 [E-Hentai](https://e-hentai.org) / [ExHentai](https://exhentai.org) 画廊浏览客户端，使用 SwiftUI 原生构建。
 
+本仓库基于 [felixchaos/EhViewer-Apple](https://github.com/felixchaos/EhViewer-Apple) 持续开发，并保留原项目的 Apache License 2.0 授权与版权信息。
+
 > **致敬**: 本项目灵感来源于 Android 端的 [EhViewer](https://github.com/Ehviewer-Overhauled/Ehviewer) 和 [EhViewer_CN_SXJ](https://github.com/xiaojieonly/Ehviewer_CN_SXJ)，感谢原作者的出色工作。
 
 ---
 
-## 📢 v1.0.1 — 代码审计 & 质量加固
+## 📢 v1.0.0 — 现代化与质量加固
 
 基于全面代码审计（详见 [AUDIT_REPORT.md](AUDIT_REPORT.md)），完成以下加固：
 
@@ -36,7 +38,7 @@ EhViewer-Apple 是一款适用于 iOS 和 macOS 的 [E-Hentai](https://e-hentai.
 
 ---
 
-## 📢 v1.0.0 版本说明
+## 核心功能
 
 首个正式版本，包含以下核心功能与优化：
 
@@ -46,7 +48,6 @@ EhViewer-Apple 是一款适用于 iOS 和 macOS 的 [E-Hentai](https://e-hentai.
 - **下载管理** — 后台下载、断点续传、标签分组、进度通知
 - **收藏同步** — 云端收藏夹 + 本地收藏，支持多文件夹管理
 - **多层缓存** — 内存 + 磁盘缓存，大幅提升二次加载速度
-- **安全保护** — Face ID / Touch ID / 密码锁，隐私无忧
 - **多平台原生** — iPhone / iPad / Mac 全平台适配
 
 ## ✨ 功能特性
@@ -56,7 +57,6 @@ EhViewer-Apple 是一款适用于 iOS 和 macOS 的 [E-Hentai](https://e-hentai.
 - 📖 **阅读器** — 横向翻页 / 纵向滚动，支持缩放、手势操作
 - ⬇️ **下载管理** — 后台下载、断点续传、通知提醒
 - ⭐ **收藏管理** — 多文件夹收藏同步
-- 🔐 **安全保护** — Face ID / Touch ID / 密码锁
 - 🌐 **网络优化** — Domain Fronting 回退、DNS over HTTPS
 - 🖥️ **多平台** — iOS / iPadOS / macOS 原生体验
 
@@ -88,18 +88,18 @@ EhViewer-Apple/
 
 | 项目 | 最低版本 |
 |------|---------|
-| Xcode | 16.0+ |
+| Xcode | 26.2+ |
 | Swift | 6.0 |
-| iOS | 17.0+ |
-| macOS | 14.0+ (Sonoma) |
+| iOS / iPadOS | 26.2+ |
+| macOS | 26.2+ |
 
 ## 🚀 快速开始
 
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/felixchaos/EhViewer-Apple.git
-cd EhViewer-Apple
+git clone https://github.com/kGMia/EhViewer-Apple-native.git
+cd EhViewer-Apple-native
 ```
 
 ### 2. 打开项目
@@ -121,7 +121,7 @@ open "ehviewer apple.xcodeproj"
 #### 前置条件
 
 1. **Apple ID** — 免费 Apple ID 即可（无需付费开发者账号）
-2. **Xcode 16.0+** — 从 Mac App Store 安装
+2. **Xcode 26.2+** — 从 Mac App Store 安装
 3. **USB 数据线** — 用于连接 iPhone/iPad（首次需要有线连接）
 
 #### 配置签名
@@ -165,7 +165,7 @@ Apple 公证服务要求使用 App 专用密码（而非你的 Apple ID 登录�
 
 1. 访问 [developer.apple.com/account](https://developer.apple.com/account)
 2. 在页面上方找到 **Membership Details**
-3. **Team ID** 是一个 10 位字母数字组合（如 `HWZEUNLCY6`）
+3. **Team ID** 是一个 10 位字母数字组合
 
 或者在终端中执行：
 ```bash
@@ -187,21 +187,20 @@ security find-identity -v -p codesigning | grep "Developer ID"
 ```bash
 # .env
 APPLE_ID=your-email@example.com
-TEAM_ID=HWZEUNLCY6
+TEAM_ID=YOUR_TEAM_ID
 APP_SPECIFIC_PASSWORD=xxxx-xxxx-xxxx-xxxx
 ```
 
 或者直接导出环境变量：
 ```bash
 export APPLE_ID="your-email@example.com"
-export TEAM_ID="HWZEUNLCY6"
+export TEAM_ID="YOUR_TEAM_ID"
 export APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
 ```
 
 #### 5.5 运行构建脚本
 
 ```bash
-cd "ehviewer apple"   # 进入包含 .xcodeproj 的目录
 ./distribute_mac.sh
 ```
 
@@ -252,6 +251,7 @@ TODO: 添加 App 截图
 
 ## 🙏 致谢
 
+- [felixchaos/EhViewer-Apple](https://github.com/felixchaos/EhViewer-Apple) — 本项目的上游来源
 - [EhViewer](https://github.com/Ehviewer-Overhauled/Ehviewer) — Android 端 EhViewer
 - [EhViewer_CN_SXJ](https://github.com/xiaojieonly/Ehviewer_CN_SXJ) — Android 端中文增强版
 - [GRDB.swift](https://github.com/groue/GRDB.swift) — SQLite 数据库工具包

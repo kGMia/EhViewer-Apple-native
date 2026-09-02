@@ -54,10 +54,18 @@ final class DownloadNotificationBridge: DownloadListener, @unchecked Sendable {
         await MainActor.run {
             #if os(iOS)
             // 结束灵动岛 Live Activity
-            DownloadLiveActivityManager.shared.finishActivity(success: success, title: title)
+            DownloadLiveActivityManager.shared.finishActivity(gid: gid, success: success)
             #endif
             // 完成通知仍使用传统通知 (在通知中心保留记录)
             DownloadNotificationService.shared.onDownloadFinish(gid: gid, title: title, success: success)
+        }
+    }
+
+    func onDownloadPause(gid: Int64, title: String) async {
+        await MainActor.run {
+            #if os(iOS)
+            DownloadLiveActivityManager.shared.endActivity(gid: gid)
+            #endif
         }
     }
 

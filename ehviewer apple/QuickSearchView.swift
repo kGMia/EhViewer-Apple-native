@@ -9,253 +9,388 @@ import SwiftUI
 import EhModels
 import EhDatabase
 
-struct QuickSearchView: View {
-    @State private var vm = QuickSearchViewModel()
-    @State private var showAddSheet = false
-    @Binding var selectedSearch: QuickSearchRecord?
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if vm.searches.isEmpty {
-                    ContentUnavailableView("暂无快速搜索",
-                        systemImage: "magnifyingglass",
-                        description: Text("点击右上角添加常用搜索词"))
-                } else {
-                    searchList
-                }
-            }
-            .navigationTitle("快速搜索")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
-                }
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showAddSheet = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                }
-            }
-            .sheet(isPresented: $showAddSheet) {
-                AddQuickSearchSheet(vm: vm)
-            }
-        }
-        .task {
-            vm.loadSearches()
-        }
-    }
-
-    private var searchList: some View {
-        List {
-            ForEach(vm.searches, id: \.id) { search in
-                Button {
-                    selectedSearch = search
-                    dismiss()
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(search.name ?? search.keyword ?? "未命名")
-                                .font(.body)
-                                .foregroundStyle(.primary)
-
-                            if let keyword = search.keyword, !keyword.isEmpty {
-                                Text(keyword)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-
-                        Spacer()
-
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-            .onDelete { indexSet in
-                vm.delete(at: indexSet)
-            }
-        }
-        #if os(iOS)
-        .listStyle(.insetGrouped)
-        #endif
-    }
+enum SearchPanelKeyboardAction: Equatable {
+    case previous
+    case next
+    case confirm
 }
 
-// MARK: - Quick Search Drawer Content (对齐 Android QuickSearchScene / drawer_list.xml)
+struct SearchPanelKeyboardCommand: Equatable {
+    let id = UUID()
+    let action: SearchPanelKeyboardAction
+}
 
-struct QuickSearchDrawerContent: View {
+/// 统一搜索记录下拉面板：直接显示在搜索框下方，搜索历史在上、
+/// 已保存搜索在下。保留数据库格式与应用逻辑，但不再创建侧边抽屉。
+struct SearchRecordsPanelContent: View {
     @State private var vm = QuickSearchViewModel()
+    @State private var selectedKeyboardIndex: Int?
     @Binding var selectedSearch: QuickSearchRecord?
-    let currentKeyword: String
+    let searchHistory: [String]
+    let currentSearch: QuickSearchRecord
+    let searchText: String
+    let suggestions: [(chinese: String, english: String)]
+    let onSelectHistory: (String) -> Void
+    let onDeleteHistory: (String) -> Void
+    let onSelectSuggestion: (String) -> Void
+    let onSubmitCurrentSearch: () -> Void
     let onDismiss: () -> Void
+    let keyboardCommand: SearchPanelKeyboardCommand?
 
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部标题栏 (对齐 Android drawer header)
-            HStack {
-                Text("快速搜索")
-                    .font(.headline)
-                Spacer()
-                // 收藏当前搜索词 (对齐 Android: 抽屉顶部添加按钮)
-                Button {
-                    let record = QuickSearchRecord(
-                        name: nil,
-                        mode: 0,
-                        category: 0,
-                        keyword: currentKeyword
-                    )
-                    vm.addSearch(record)
-                } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title3)
-                }
-                .disabled(currentKeyword.isEmpty)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            Divider()
-
-            // 搜索词列表
-            if vm.searches.isEmpty {
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 40))
-                        .foregroundStyle(.secondary)
-                    Text("暂无快速搜索")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                    Text("点击 + 收藏当前搜索词")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity)
-            } else {
-                List {
-                    ForEach(vm.searches, id: \.id) { search in
-                        Button {
-                            selectedSearch = search
-                            onDismiss()
-                        } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(search.name ?? search.keyword ?? "未命名")
-                                    .font(.body)
-                                    .foregroundStyle(.primary)
-                                if let keyword = search.keyword, !keyword.isEmpty,
-                                   search.name != nil {
-                                    Text(keyword)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
+            List {
+                if currentKeyword.isEmpty {
+                    Section {
+                        if searchHistory.isEmpty {
+                            emptyRow("暂无搜索历史")
+                        } else {
+                            ForEach(recentSearchHistory, id: \.self) { term in
+                                historyRow(term, item: .history(term))
                             }
                         }
-                        .buttonStyle(.plain)
+                    } header: {
+                        sectionHeader("搜索历史", systemImage: "clock")
                     }
-                    .onDelete { vm.delete(at: $0) }
+
+                    Section {
+                        if vm.searches.isEmpty {
+                            emptyRow("暂无已保存搜索")
+                        } else {
+                            ForEach(vm.searches, id: \.id) { search in
+                                savedSearchRow(search, item: .saved(search))
+                            }
+                        }
+                    } header: {
+                        sectionHeader("已保存的搜索", systemImage: "bookmark")
+                    }
+                } else {
+                    if !matchingHistory.isEmpty {
+                        Section {
+                            ForEach(matchingHistory, id: \.self) { term in
+                                historyRow(term, item: .history(term))
+                            }
+                        } header: {
+                            sectionHeader("搜索历史", systemImage: "clock")
+                        }
+                    }
+
+                    if !matchingSavedSearches.isEmpty {
+                        Section {
+                            ForEach(matchingSavedSearches, id: \.id) { search in
+                                savedSearchRow(search, item: .saved(search))
+                            }
+                        } header: {
+                            sectionHeader("已保存的搜索", systemImage: "bookmark")
+                        }
+                    }
+
+                    if !suggestions.isEmpty {
+                        Section {
+                            ForEach(Array(suggestions.enumerated()), id: \.offset) { _, suggestion in
+                                suggestionRow(
+                                    suggestion,
+                                    item: .suggestion(
+                                        chinese: suggestion.chinese,
+                                        english: suggestion.english
+                                    )
+                                )
+                            }
+                        } header: {
+                            sectionHeader("候选搜索", systemImage: "sparkle.magnifyingglass")
+                        }
+                    } else if !hasMatchingRecord {
+                        emptyRow("暂无候选搜索")
+                    }
                 }
-                .listStyle(.plain)
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .contentMargins(.vertical, 6, for: .scrollContent)
+            .frame(maxHeight: 320)
+
+            if !currentKeyword.isEmpty && !isCurrentSearchSaved {
+                Divider()
+
+                Button(action: saveCurrentSearch) {
+                    Label("保存当前搜索", systemImage: "plus")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .background(isKeyboardSelected(.save) ? Color.accentColor.opacity(0.13) : Color.clear)
+                .onHover { hovering in
+                    if hovering { selectKeyboardItem(.save) }
+                }
             }
         }
+        .frame(maxWidth: .infinity)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .padding(.horizontal, 10)
+        .padding(.top, 4)
+        .accessibilityIdentifier("quickSearch.panel")
         .task { vm.loadSearches() }
-    }
-}
-
-// MARK: - Add Quick Search Sheet
-
-struct AddQuickSearchSheet: View {
-    @Bindable var vm: QuickSearchViewModel
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var name = ""
-    @State private var keyword = ""
-    @State private var minRating = 0
-    @State private var selectedCategories: Set<EhCategory> = []
-
-    private let allCategories: [EhCategory] = [
-        .doujinshi, .manga, .artistCG, .gameCG, .western,
-        .nonH, .imageSet, .cosplay, .asianPorn, .misc
-    ]
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("基本信息") {
-                    TextField("名称 (可选)", text: $name)
-                    TextField("搜索关键词", text: $keyword)
-                }
-
-                Section("最低评分") {
-                    Picker("最低评分", selection: $minRating) {
-                        Text("不限").tag(0)
-                        ForEach(2...5, id: \.self) { rating in
-                            HStack {
-                                ForEach(0..<rating, id: \.self) { _ in
-                                    Image(systemName: "star.fill")
-                                        .foregroundStyle(.orange)
-                                }
-                            }
-                            .tag(rating)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                }
-
-                Section("分类筛选") {
-                    ForEach(allCategories, id: \.rawValue) { category in
-                        Toggle(category.name, isOn: Binding(
-                            get: { selectedCategories.contains(category) },
-                            set: { isOn in
-                                if isOn {
-                                    selectedCategories.insert(category)
-                                } else {
-                                    selectedCategories.remove(category)
-                                }
-                            }
-                        ))
-                    }
-                }
+        .onChange(of: searchText) { _, _ in selectedKeyboardIndex = nil }
+        .onChange(of: keyboardItems.count) { _, count in
+            if let selectedKeyboardIndex, selectedKeyboardIndex >= count {
+                self.selectedKeyboardIndex = count > 0 ? count - 1 : nil
             }
-            .navigationTitle("添加快速搜索")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        save()
-                        dismiss()
-                    }
-                    .disabled(keyword.isEmpty)
-                }
-            }
+        }
+        .onChange(of: keyboardCommand) { _, command in
+            guard let command else { return }
+            handleKeyboardCommand(command.action)
         }
     }
 
-    private func save() {
-        let categoryMask = selectedCategories.reduce(0) { $0 | $1.rawValue }
-        let record = QuickSearchRecord(
-            name: name.isEmpty ? nil : name,
-            mode: 0,
-            category: categoryMask,
-            keyword: keyword
+    private func sectionHeader(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .textCase(nil)
+    }
+
+    private func emptyRow(_ title: String) -> some View {
+        Text(title)
+            .font(.callout)
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 6)
+    }
+
+    private var currentKeyword: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var recentSearchHistory: [String] {
+        Array(searchHistory.prefix(5))
+    }
+
+    private var matchingHistory: [String] {
+        recentSearchHistory.filter { normalized($0) == normalized(currentKeyword) }
+    }
+
+    private var matchingSavedSearches: [QuickSearchRecord] {
+        vm.searches.filter { search in
+            normalized(search.keyword ?? "") == normalized(currentKeyword)
+                || normalized(search.name ?? "") == normalized(currentKeyword)
+        }
+    }
+
+    private var hasMatchingRecord: Bool {
+        !matchingHistory.isEmpty || !matchingSavedSearches.isEmpty
+    }
+
+    private var isCurrentSearchSaved: Bool {
+        vm.searches.contains { vm.isEquivalent($0, to: currentSearch) }
+    }
+
+    private func historyRow(_ term: String, item: KeyboardItem) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                onSelectHistory(term)
+                onDismiss()
+            } label: {
+                Label(term, systemImage: "clock")
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            deleteButton(help: "删除历史记录 \(term)") {
+                onDeleteHistory(term)
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 9)
+        .padding(.vertical, 5)
+        .listRowInsets(EdgeInsets())
+        .background(
+            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
-        vm.addSearch(record)
+        .onHover { hovering in
+            if hovering { selectKeyboardItem(item) }
+        }
+    }
+
+    private func savedSearchRow(_ search: QuickSearchRecord, item: KeyboardItem) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                selectedSearch = search
+                onDismiss()
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(search.name ?? search.keyword ?? "未命名")
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if let keyword = search.keyword, !keyword.isEmpty,
+                           search.name != nil {
+                            Text(keyword)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                } icon: {
+                    Image(systemName: "bookmark")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            deleteButton(help: "删除已保存搜索") {
+                vm.delete(searches: [search])
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 9)
+        .padding(.vertical, 5)
+        .listRowInsets(EdgeInsets())
+        .background(
+            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .onHover { hovering in
+            if hovering { selectKeyboardItem(item) }
+        }
+    }
+
+    private func suggestionRow(
+        _ suggestion: (chinese: String, english: String),
+        item: KeyboardItem
+    ) -> some View {
+        Button {
+            onSelectSuggestion(suggestion.english)
+        } label: {
+            Label {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(suggestion.chinese)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(suggestion.english)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            } icon: {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .listRowInsets(EdgeInsets())
+        .background(
+            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .onHover { hovering in
+            if hovering { selectKeyboardItem(item) }
+        }
+    }
+
+    private func deleteButton(help: String, action: @escaping () -> Void) -> some View {
+        Button(role: .destructive, action: action) {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.semibold))
+                .frame(width: 26, height: 26)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    private func saveCurrentSearch() {
+        guard !currentKeyword.isEmpty, !isCurrentSearchSaved else { return }
+        vm.addSearch(currentSearch)
+    }
+
+    private func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private enum KeyboardItem: Equatable {
+        case history(String)
+        case saved(QuickSearchRecord)
+        case suggestion(chinese: String, english: String)
+        case save
+    }
+
+    private var keyboardItems: [KeyboardItem] {
+        var items: [KeyboardItem]
+        if currentKeyword.isEmpty {
+            items = recentSearchHistory.map(KeyboardItem.history)
+                + vm.searches.map(KeyboardItem.saved)
+        } else {
+            items = matchingHistory.map(KeyboardItem.history)
+                + matchingSavedSearches.map(KeyboardItem.saved)
+                + suggestions.map {
+                    KeyboardItem.suggestion(chinese: $0.chinese, english: $0.english)
+                }
+            if !isCurrentSearchSaved { items.append(.save) }
+        }
+        return items
+    }
+
+    private func isKeyboardSelected(_ item: KeyboardItem) -> Bool {
+        guard let selectedKeyboardIndex,
+              keyboardItems.indices.contains(selectedKeyboardIndex)
+        else { return false }
+        return keyboardItems[selectedKeyboardIndex] == item
+    }
+
+    private func selectKeyboardItem(_ item: KeyboardItem) {
+        selectedKeyboardIndex = keyboardItems.firstIndex(of: item)
+    }
+
+    private func handleKeyboardCommand(_ action: SearchPanelKeyboardAction) {
+        let items = keyboardItems
+        switch action {
+        case .previous:
+            guard !items.isEmpty else { return }
+            selectedKeyboardIndex = selectedKeyboardIndex.map {
+                ($0 - 1 + items.count) % items.count
+            } ?? (items.count - 1)
+        case .next:
+            guard !items.isEmpty else { return }
+            selectedKeyboardIndex = selectedKeyboardIndex.map {
+                ($0 + 1) % items.count
+            } ?? 0
+        case .confirm:
+            guard let selectedKeyboardIndex,
+                  items.indices.contains(selectedKeyboardIndex)
+            else {
+                onSubmitCurrentSearch()
+                return
+            }
+            perform(items[selectedKeyboardIndex])
+        }
+    }
+
+    private func perform(_ item: KeyboardItem) {
+        switch item {
+        case .history(let term):
+            onSelectHistory(term)
+            onDismiss()
+        case .saved(let search):
+            selectedSearch = search
+            onDismiss()
+        case .suggestion(_, let english):
+            selectedKeyboardIndex = nil
+            onSelectSuggestion(english)
+        case .save:
+            saveCurrentSearch()
+        }
     }
 }
 
@@ -274,6 +409,7 @@ class QuickSearchViewModel {
     }
 
     func addSearch(_ record: QuickSearchRecord) {
+        guard !searches.contains(where: { isEquivalent($0, to: record) }) else { return }
         do {
             try EhDatabase.shared.insertQuickSearch(record)
             loadSearches()
@@ -282,19 +418,36 @@ class QuickSearchViewModel {
         }
     }
 
+    func isEquivalent(_ lhs: QuickSearchRecord, to rhs: QuickSearchRecord) -> Bool {
+        lhs.mode == rhs.mode
+            && lhs.category == rhs.category
+            && lhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == rhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+            && lhs.advanceSearch == rhs.advanceSearch
+            && lhs.minRating == rhs.minRating
+            && lhs.pageFrom == rhs.pageFrom
+            && lhs.pageTo == rhs.pageTo
+    }
+
     func delete(at offsets: IndexSet) {
-        for index in offsets {
-            guard let id = searches[index].id else { continue }
+        let records = offsets.compactMap { index in
+            searches.indices.contains(index) ? searches[index] : nil
+        }
+        delete(searches: records)
+    }
+
+    func delete(searches records: [QuickSearchRecord]) {
+        let ids = Set(records.compactMap(\.id))
+        for id in ids {
             do {
                 try EhDatabase.shared.deleteQuickSearch(id: id)
             } catch {
                 debugLog("Failed to delete quick search: \(error)")
             }
         }
-        searches.remove(atOffsets: offsets)
+        searches.removeAll { record in
+            guard let id = record.id else { return false }
+            return ids.contains(id)
+        }
     }
-}
-
-#Preview {
-    QuickSearchView(selectedSearch: .constant(nil))
 }

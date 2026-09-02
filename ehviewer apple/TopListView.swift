@@ -16,11 +16,19 @@ struct TopListView: View {
 
     /// 被推入父导航栈时，不创建自己的 NavigationStack，避免嵌套
     private var isPushed: Bool = false
+    private var externalSelection: Binding<GalleryInfo?>?
 
     private let periods = ["全部时间", "过去一年", "过去一个月", "昨天"]
 
     init(isPushed: Bool = false) {
         self.isPushed = isPushed
+    }
+
+    /// 嵌入自适应主导航时，将画廊交给父级决定是在右栏显示还是
+    /// 在紧凑窗口中原生推入。
+    init(selection: Binding<GalleryInfo?>) {
+        self.isPushed = true
+        self.externalSelection = selection
     }
 
     /// 从排行榜链接中解析画廊 gid 和 token
@@ -85,7 +93,7 @@ struct TopListView: View {
                     Text(error)
                         .foregroundStyle(.secondary)
                     Button("重试") {
-                        Task { await vm.load() }
+                        Task { await vm.load(forceRefresh: true) }
                     }
                     .buttonStyle(.bordered)
                 }
@@ -95,21 +103,34 @@ struct TopListView: View {
                 List(items.indices, id: \.self) { idx in
                     let item = items[idx]
                     if let parsed = Self.parseGalleryHref(item.href) {
-                        NavigationLink {
-                            GalleryDetailView(gallery: GalleryInfo(
-                                gid: parsed.gid,
-                                token: parsed.token,
-                                title: item.text
-                            ))
-                            .id(parsed.gid)
-                        } label: {
-                            TopListRow(rank: idx + 1, item: item)
+                        let gallery = GalleryInfo(
+                            gid: parsed.gid,
+                            token: parsed.token,
+                            title: item.text
+                        )
+                        if let externalSelection {
+                            Button {
+                                externalSelection.wrappedValue = gallery
+                            } label: {
+                                TopListRow(rank: idx + 1, item: item)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            NavigationLink {
+                                GalleryDetailView(gallery: gallery)
+                                    .id(parsed.gid)
+                            } label: {
+                                TopListRow(rank: idx + 1, item: item)
+                            }
                         }
                     } else {
                         TopListRow(rank: idx + 1, item: item)
                     }
                 }
                 .listStyle(.plain)
+                .refreshable {
+                    await vm.load(forceRefresh: true)
+                }
             }
         }
         .navigationTitle("排行榜")
@@ -159,8 +180,9 @@ struct TopListRow: View {
 
 // MARK: - ViewModel
 
+@MainActor
 @Observable
-class TopListViewModel {
+final class TopListViewModel {
     var isLoading = false
     var errorMessage: String?
     var detail: TopListDetail?
@@ -169,25 +191,35 @@ class TopListViewModel {
         detail?.lists.map { $0.name } ?? []
     }
 
-    func load() async {
+    func load(forceRefresh: Bool = false) async {
         guard !isLoading else { return }
-        await MainActor.run {
-            isLoading = true
+        let url = EhURL.topListUrl()
+
+        if !forceRefresh,
+           let cached = await TopListCache.shared.value(for: url, maximumAge: 24 * 60 * 60) {
+            detail = cached
             errorMessage = nil
+            return
         }
 
+        isLoading = true
+        errorMessage = nil
+
         do {
-            let url = EhURL.topListUrl()
             let parsed = try await EhAPI.shared.getTopList(url: url)
-            await MainActor.run {
-                self.detail = parsed
-                self.isLoading = false
-            }
+            detail = parsed
+            isLoading = false
+            await TopListCache.shared.store(parsed, for: url)
         } catch {
-            await MainActor.run {
-                self.errorMessage = EhError.localizedMessage(for: error)
-                self.isLoading = false
+            // 排行榜偶尔不可达时允许回退到过期缓存；内容虽然可能不是
+            // 最新，但比每次进入都显示空白或再次请求更符合其低频特性。
+            if let stale = await TopListCache.shared.value(for: url, maximumAge: nil) {
+                detail = stale
+                errorMessage = nil
+            } else {
+                errorMessage = EhError.localizedMessage(for: error)
             }
+            isLoading = false
         }
     }
 
@@ -200,6 +232,62 @@ class TopListViewModel {
         case 3: return category.yesterday
         default: return category.allTime
         }
+    }
+}
+
+/// 排行榜低频变化：内存命中避免同一次运行中重复解析，磁盘缓存则避免每次
+/// 启动都重新请求。缓存以完整站点 URL 区分 E-Hentai / ExHentai。
+private actor TopListCache {
+    static let shared = TopListCache()
+
+    private struct Entry: Codable {
+        let sourceURL: String
+        let timestamp: Date
+        let detail: TopListDetail
+    }
+
+    private var memoryEntries: [String: Entry] = [:]
+    private let fileURL: URL? = FileManager.default.urls(
+        for: .cachesDirectory,
+        in: .userDomainMask
+    ).first?.appendingPathComponent("top-list-cache.json")
+    private var didReadDisk = false
+
+    func value(for sourceURL: String, maximumAge: TimeInterval?) -> TopListDetail? {
+        readDiskIfNeeded()
+        guard let entry = memoryEntries[sourceURL] else { return nil }
+        if let maximumAge,
+           Date().timeIntervalSince(entry.timestamp) > maximumAge {
+            return nil
+        }
+        return entry.detail
+    }
+
+    func store(_ detail: TopListDetail, for sourceURL: String) {
+        readDiskIfNeeded()
+        memoryEntries[sourceURL] = Entry(
+            sourceURL: sourceURL,
+            timestamp: Date(),
+            detail: detail
+        )
+        persist()
+    }
+
+    private func readDiskIfNeeded() {
+        guard !didReadDisk else { return }
+        didReadDisk = true
+        guard let fileURL,
+              let data = try? Data(contentsOf: fileURL),
+              let entries = try? JSONDecoder().decode([Entry].self, from: data)
+        else { return }
+        memoryEntries = Dictionary(uniqueKeysWithValues: entries.map { ($0.sourceURL, $0) })
+    }
+
+    private func persist() {
+        guard let fileURL,
+              let data = try? JSONEncoder().encode(Array(memoryEntries.values))
+        else { return }
+        try? data.write(to: fileURL, options: .atomic)
     }
 }
 

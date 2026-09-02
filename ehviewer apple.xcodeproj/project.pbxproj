@@ -3,10 +3,11 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 100;
 	objects = {
 
 /* Begin PBXBuildFile section */
+		DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		DC71559A2F3DAC4900D09B4E /* EhModels in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08112F3DA31000717C38 /* EhModels */; };
 		DC71559B2F3DAC4900D09B4E /* EhDatabase in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08122F3DA31000717C38 /* EhDatabase */; };
 		DC71559C2F3DAC4900D09B4E /* EhSettings in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08132F3DA31000717C38 /* EhSettings */; };
@@ -19,6 +20,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		DA26AA010000000000000002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = DC4A07602F3DA21800717C38 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = DA26AA010000000000000009;
+			remoteInfo = "ehviewer apple Live Activity";
+		};
 		DC4A077A2F3DA21800717C38 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = DC4A07602F3DA21800717C38 /* Project object */;
@@ -35,13 +43,33 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		DA26AA010000000000000008 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			dstPath = "";
+			dstSubfolder = PlugIns;
+			files = (
+				DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "ehviewer apple Live Activity.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC4A07682F3DA21800717C38 /* ehviewer apple.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "ehviewer apple.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC4A07792F3DA21800717C38 /* ehviewer appleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "ehviewer appleTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		DC4A07832F3DA21800717C38 /* ehviewer appleUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "ehviewer appleUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		DA26AA01000000000000000E /* Exceptions for "ehviewer apple Live Activity" folder in "ehviewer apple Live Activity" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = DA26AA010000000000000009 /* ehviewer apple Live Activity */;
+		};
 		DC4A078B2F3DA21800717C38 /* Exceptions for "ehviewer apple" folder in "ehviewer apple" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -60,6 +88,14 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		DA26AA010000000000000004 /* ehviewer apple Live Activity */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				DA26AA01000000000000000E /* Exceptions for "ehviewer apple Live Activity" folder in "ehviewer apple Live Activity" target */,
+			);
+			path = "ehviewer apple Live Activity";
+			sourceTree = "<group>";
+		};
 		DC4A076A2F3DA21800717C38 /* ehviewer apple */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -77,9 +113,13 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		DA26AA010000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
 		DC4A07652F3DA21800717C38 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 				DC7155A22F3DAC4900D09B4E /* EhDownload in Frameworks */,
 				DC7155A12F3DAC4900D09B4E /* EhSpider in Frameworks */,
@@ -91,21 +131,16 @@
 				DC71559B2F3DAC4900D09B4E /* EhDatabase in Frameworks */,
 				DC71559A2F3DAC4900D09B4E /* EhModels in Frameworks */,
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		DC4A07762F3DA21800717C38 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		DC4A07802F3DA21800717C38 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
@@ -114,6 +149,7 @@
 			isa = PBXGroup;
 			children = (
 				DC4A076A2F3DA21800717C38 /* ehviewer apple */,
+				DA26AA010000000000000004 /* ehviewer apple Live Activity */,
 				DC4A07862F3DA21800717C38 /* ehviewer appleUITests */,
 				DC4A07692F3DA21800717C38 /* Products */,
 			);
@@ -123,6 +159,7 @@
 			isa = PBXGroup;
 			children = (
 				DC4A07682F3DA21800717C38 /* ehviewer apple.app */,
+				DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */,
 				DC4A07792F3DA21800717C38 /* ehviewer appleTests.xctest */,
 				DC4A07832F3DA21800717C38 /* ehviewer appleUITests.xctest */,
 			);
@@ -132,6 +169,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		DA26AA010000000000000009 /* ehviewer apple Live Activity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DA26AA01000000000000000D /* Build configuration list for PBXNativeTarget "ehviewer apple Live Activity" */;
+			buildPhases = (
+				DA26AA010000000000000007 /* Sources */,
+				DA26AA010000000000000005 /* Frameworks */,
+				DA26AA010000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				DA26AA010000000000000004 /* ehviewer apple Live Activity */,
+			);
+			name = "ehviewer apple Live Activity";
+			productName = "ehviewer apple Live Activity";
+			productReference = DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		DC4A07672F3DA21800717C38 /* ehviewer apple */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = DC4A078C2F3DA21800717C38 /* Build configuration list for PBXNativeTarget "ehviewer apple" */;
@@ -139,10 +194,12 @@
 				DC4A07642F3DA21800717C38 /* Sources */,
 				DC4A07652F3DA21800717C38 /* Frameworks */,
 				DC4A07662F3DA21800717C38 /* Resources */,
+				DA26AA010000000000000008 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				DA26AA01000000000000000A /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				DC4A076A2F3DA21800717C38 /* ehviewer apple */,
@@ -177,8 +234,6 @@
 				DC4A077B2F3DA21800717C38 /* PBXTargetDependency */,
 			);
 			name = "ehviewer appleTests";
-			packageProductDependencies = (
-			);
 			productName = "ehviewer appleTests";
 			productReference = DC4A07792F3DA21800717C38 /* ehviewer appleTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -200,8 +255,6 @@
 				DC4A07862F3DA21800717C38 /* ehviewer appleUITests */,
 			);
 			name = "ehviewer appleUITests";
-			packageProductDependencies = (
-			);
 			productName = "ehviewer appleUITests";
 			productReference = DC4A07832F3DA21800717C38 /* ehviewer appleUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
@@ -216,6 +269,9 @@
 				LastSwiftUpdateCheck = 2620;
 				LastUpgradeCheck = 2620;
 				TargetAttributes = {
+					DA26AA010000000000000009 = {
+						CreatedOnToolsVersion = 26.2;
+					};
 					DC4A07672F3DA21800717C38 = {
 						CreatedOnToolsVersion = 26.2;
 					};
@@ -230,11 +286,13 @@
 				};
 			};
 			buildConfigurationList = DC4A07632F3DA21800717C38 /* Build configuration list for PBXProject "ehviewer apple" */;
-			developmentRegion = en;
+			developmentRegion = "zh-Hans";
 			hasScannedForEncodings = 0;
 			knownRegions = (
+				"zh-Hans",
 				en,
 				Base,
+				"zh-Hant",
 			);
 			mainGroup = DC4A075F2F3DA21800717C38;
 			minimizedProjectReferenceProxies = 1;
@@ -246,12 +304,13 @@
 				DC4A08052F3DA30000717C38 /* XCLocalSwiftPackageReference "Packages/EhDownload" */,
 				DC4A08062F3DA30000717C38 /* XCLocalSwiftPackageReference "Packages/EhUI" */,
 			);
-			preferredProjectObjectVersion = 77;
+			preferredProjectObjectVersion = 100;
 			productRefGroup = DC4A07692F3DA21800717C38 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				DC4A07672F3DA21800717C38 /* ehviewer apple */,
+				DA26AA010000000000000009 /* ehviewer apple Live Activity */,
 				DC4A07782F3DA21800717C38 /* ehviewer appleTests */,
 				DC4A07822F3DA21800717C38 /* ehviewer appleUITests */,
 			);
@@ -259,54 +318,58 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		DC4A07662F3DA21800717C38 /* Resources */ = {
+		DA26AA010000000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DC4A07662F3DA21800717C38 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
 		};
 		DC4A07772F3DA21800717C38 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		DC4A07812F3DA21800717C38 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		DC4A07642F3DA21800717C38 /* Sources */ = {
+		DA26AA010000000000000007 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DC4A07642F3DA21800717C38 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
 		};
 		DC4A07752F3DA21800717C38 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		DC4A077F2F3DA21800717C38 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		DA26AA01000000000000000A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilter = ios;
+			target = DA26AA010000000000000009 /* ehviewer apple Live Activity */;
+			targetProxy = DA26AA010000000000000002 /* PBXContainerItemProxy */;
+		};
 		DC4A077B2F3DA21800717C38 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = DC4A07672F3DA21800717C38 /* ehviewer apple */;
@@ -320,21 +383,81 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		DC4A078D2F3DA21800717C38 /* Debug */ = {
+		DA26AA01000000000000000B /* Debug configuration for PBXNativeTarget "ehviewer apple Live Activity" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = L3B55KYTVT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "ehviewer apple Live Activity/Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple.live-activity";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		DA26AA01000000000000000C /* Release configuration for PBXNativeTarget "ehviewer apple Live Activity" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = L3B55KYTVT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "ehviewer apple Live Activity/Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple.live-activity";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		DC4A078D2F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer apple" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = "ehviewer apple/ehviewer_apple.entitlements";
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "ehviewer apple/ehviewer_apple.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = HWZEUNLCY6;
+				DEVELOPMENT_TEAM = L3B55KYTVT;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "ehviewer apple/Info.plist";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "允许将阅读器中的图片保存到照片图库。";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -350,37 +473,42 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-apple";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Debug;
 		};
-		DC4A078E2F3DA21800717C38 /* Release */ = {
+		DC4A078E2F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer apple" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = "ehviewer apple/ehviewer_apple.entitlements";
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "ehviewer apple/ehviewer_apple.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = HWZEUNLCY6;
+				DEVELOPMENT_TEAM = L3B55KYTVT;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "ehviewer apple/Info.plist";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "允许将阅读器中的图片保存到照片图库。";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -396,23 +524,24 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-apple";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Release;
 		};
-		DC4A078F2F3DA21800717C38 /* Debug */ = {
+		DC4A078F2F3DA21800717C38 /* Debug configuration for PBXProject "ehviewer apple" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -446,6 +575,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -469,12 +599,13 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
 			name = Debug;
 		};
-		DC4A07902F3DA21800717C38 /* Release */ = {
+		DC4A07902F3DA21800717C38 /* Release configuration for PBXProject "ehviewer apple" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -508,6 +639,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -524,11 +656,12 @@
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
 		};
-		DC4A07922F3DA21800717C38 /* Debug */ = {
+		DC4A07922F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer appleTests" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -539,7 +672,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-appleTests";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -554,7 +687,7 @@
 			};
 			name = Debug;
 		};
-		DC4A07932F3DA21800717C38 /* Release */ = {
+		DC4A07932F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer appleTests" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -565,7 +698,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-appleTests";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -580,7 +713,7 @@
 			};
 			name = Release;
 		};
-		DC4A07952F3DA21800717C38 /* Debug */ = {
+		DC4A07952F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer appleUITests" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -590,7 +723,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-appleUITests";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleUITests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -605,7 +738,7 @@
 			};
 			name = Debug;
 		};
-		DC4A07962F3DA21800717C38 /* Release */ = {
+		DC4A07962F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer appleUITests" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -615,7 +748,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "Stellatrix.ehviewer-appleUITests";
+				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleUITests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -633,40 +766,44 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		DA26AA01000000000000000D /* Build configuration list for PBXNativeTarget "ehviewer apple Live Activity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DA26AA01000000000000000B /* Debug configuration for PBXNativeTarget "ehviewer apple Live Activity" */,
+				DA26AA01000000000000000C /* Release configuration for PBXNativeTarget "ehviewer apple Live Activity" */,
+			);
+			defaultConfigurationName = Release;
+		};
 		DC4A07632F3DA21800717C38 /* Build configuration list for PBXProject "ehviewer apple" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DC4A078F2F3DA21800717C38 /* Debug */,
-				DC4A07902F3DA21800717C38 /* Release */,
+				DC4A078F2F3DA21800717C38 /* Debug configuration for PBXProject "ehviewer apple" */,
+				DC4A07902F3DA21800717C38 /* Release configuration for PBXProject "ehviewer apple" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 		DC4A078C2F3DA21800717C38 /* Build configuration list for PBXNativeTarget "ehviewer apple" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DC4A078D2F3DA21800717C38 /* Debug */,
-				DC4A078E2F3DA21800717C38 /* Release */,
+				DC4A078D2F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer apple" */,
+				DC4A078E2F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer apple" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 		DC4A07912F3DA21800717C38 /* Build configuration list for PBXNativeTarget "ehviewer appleTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DC4A07922F3DA21800717C38 /* Debug */,
-				DC4A07932F3DA21800717C38 /* Release */,
+				DC4A07922F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer appleTests" */,
+				DC4A07932F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer appleTests" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 		DC4A07942F3DA21800717C38 /* Build configuration list for PBXNativeTarget "ehviewer appleUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DC4A07952F3DA21800717C38 /* Debug */,
-				DC4A07962F3DA21800717C38 /* Release */,
+				DC4A07952F3DA21800717C38 /* Debug configuration for PBXNativeTarget "ehviewer appleUITests" */,
+				DC4A07962F3DA21800717C38 /* Release configuration for PBXNativeTarget "ehviewer appleUITests" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */

@@ -7,10 +7,14 @@
 
 import SwiftUI
 import EhSettings
+import EhAPI
 import EhDownload
 import EhDatabase
 import EhSpider
 import UniformTypeIdentifiers
+#if os(iOS)
+import AppIntents
+#endif
 #if os(macOS)
 import AppKit
 #else
@@ -19,6 +23,8 @@ import UIKit
 
 struct SettingsView: View {
     @State private var vm = SettingsViewModel()
+    @State private var settingsRevision = 0
+    @State private var newBlockedTag = ""
     @Environment(\.openURL) private var openURL
 
     /// 被推入父导航栈时，不创建自己的 NavigationStack，避免嵌套
@@ -26,6 +32,23 @@ struct SettingsView: View {
 
     init(isPushed: Bool = false) {
         self.isPushed = isPushed
+    }
+
+    /// AppSettings 中仍由 UserDefaults 承载的值需要显式触发一次视图刷新，
+    /// 否则 macOS 的 Toggle/Picker 会在写入后继续显示旧快照。
+    private func settingBinding<Value>(
+        _ keyPath: ReferenceWritableKeyPath<AppSettings, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: {
+                _ = settingsRevision
+                return AppSettings.shared[keyPath: keyPath]
+            },
+            set: { newValue in
+                AppSettings.shared[keyPath: keyPath] = newValue
+                settingsRevision &+= 1
+            }
+        )
     }
 
     var body: some View {
@@ -39,26 +62,46 @@ struct SettingsView: View {
     }
 
     private var settingsInnerContent: some View {
-        Form {
+        Group {
+            #if os(macOS)
+            // macOS Form 会把全部子项的理想高度反馈给 Settings 窗口，
+            // 使窗口被内容撑大。List 提供有界视口和原生滚动。
+            List {
+                settingsSections
+            }
+            .listStyle(.inset)
+            #else
+            Form {
+                settingsSections
+            }
+            #endif
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationTitle("设置")
+        .onChange(of: vm.showLogin) { _, isPresented in
+            if !isPresented { vm.checkLoginState() }
+        }
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+    }
+
+    @ViewBuilder
+    private var settingsSections: some View {
             accountSection
             siteSection
-            #if DEBUG
             filterSection
-            #endif
             displaySection
             favoritesSection
             networkSection
             readingSection
             downloadSection
             cacheSection
-            securitySection
             advancedSection
+            #if os(iOS)
+            shortcutsSection
+            #endif
             aboutSection
-        }
-        .navigationTitle("设置")
-        #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        #endif
     }
 
     // MARK: - Account
@@ -84,7 +127,7 @@ struct SettingsView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Text(vm.hasExAccess ? "ExHentai 可用" : "仅 E-Hentai (未登录)")
+                            Text(AppLocalization.localized(vm.hasExAccess ? "ExHentai 可用" : "仅 E-Hentai (未登录)"))
                                 .font(.caption)
                                 .foregroundStyle(vm.hasExAccess ? Color.green : .secondary)
                         }
@@ -141,6 +184,23 @@ struct SettingsView: View {
                 }
             }
 
+            Button {
+                Task { await vm.syncHiddenTags() }
+            } label: {
+                HStack {
+                    Text("从“我的标签”同步屏蔽项")
+                    Spacer()
+                    if vm.isSyncingHiddenTags {
+                        ProgressView().controlSize(.small)
+                    } else if let result = vm.hiddenTagSyncResult {
+                        Text(result)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .disabled(!vm.isLoggedIn || vm.isSyncingHiddenTags)
+
             // 我的标签 (对齐 Android: my_tags)
             Button {
                 let site = AppSettings.shared.gallerySite
@@ -160,27 +220,15 @@ struct SettingsView: View {
 
             Picker("列表模式", selection: $vm.listMode) {
                 Text("列表").tag(0)
-                Text("紧凑").tag(1)
-                Text("网格").tag(2)
+                Text("瀑布流").tag(1)
             }
 
-            // TODO: Connect to Logic — detailSize 未被 GalleryDetailView 读取
-            #if DEBUG
-            Picker("详情页大小", selection: Binding(
-                get: { AppSettings.shared.detailSize },
-                set: { AppSettings.shared.detailSize = $0 }
-            )) {
-                Text("常规").tag(0)
-                Text("大号").tag(1)
-            }
-            #endif
-
-            Toggle("显示日文标题", isOn: $vm.showJpnTitle)
+            Toggle("显示日文标题", isOn: settingBinding(\.showJpnTitle))
 
             // 标签翻译设置
-            Toggle("显示标签翻译", isOn: $vm.showTagTranslations)
+            Toggle("显示标签翻译", isOn: settingBinding(\.showTagTranslations))
             
-            if vm.showTagTranslations {
+            if AppSettings.shared.showTagTranslations {
                 HStack {
                     Text("标签数据库")
                     Spacer()
@@ -222,62 +270,36 @@ struct SettingsView: View {
                 }
             }
 
-            NavigationLink("标签过滤") {
-                FilterView()
+            NavigationLink {
+                blockedTagsView
+            } label: {
+                HStack {
+                    Text("已屏蔽标签")
+                    Spacer()
+                    Text("\(AppSettings.shared.blockedTags.count)")
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            // 屏蔽列表 (对齐 Android: BlackListActivity)
-            NavigationLink("屏蔽列表") {
-                FilterView()
-            }
-
-            // TODO: Connect to Logic — cellularNetworkWarning 未被网络层检查
-            #if DEBUG
-            Toggle("移动网络提醒", isOn: Binding(
-                get: { AppSettings.shared.cellularNetworkWarning },
-                set: { AppSettings.shared.cellularNetworkWarning = $0 }
-            ))
-            #endif
         }
     }
 
     // MARK: - Filter / Search (对齐 Android: 默认分类/排除标签命名空间/排除语言)
-    // TODO: Connect to Logic — defaultCategories/excludedTagNamespaces/excludedLanguages 未作为 URL 参数发送
-    #if DEBUG
     private var filterSection: some View {
         Section("搜索过滤") {
             NavigationLink("默认搜索分类") {
                 defaultCategoriesView
             }
-
-            NavigationLink("排除的标签命名空间") {
-                excludedNamespacesView
-            }
-
-            NavigationLink("排除的语言") {
-                excludedLanguagesView
-            }
         }
     }
-    #endif
 
     // MARK: - Network
 
     private var networkSection: some View {
         Section("网络") {
-            Toggle("域名前置", isOn: $vm.domainFronting)
-
-            Toggle("DNS over HTTPS", isOn: $vm.dnsOverHttps)
-
-            Toggle("内置 Hosts", isOn: $vm.builtInHosts)
-
-            // TODO: Connect to Logic — builtExHosts 未被 EhDNS 读取
-            #if DEBUG
-            Toggle("内置 ExH Hosts", isOn: Binding(
-                get: { AppSettings.shared.builtExHosts },
-                set: { AppSettings.shared.builtExHosts = $0 }
-            ))
-            #endif
+            Text("网络请求遵循 macOS 的系统 DNS、代理与 VPN 设置。连接失败时会自动尝试内置地址回退。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             
             // 网络诊断按钮
             Button {
@@ -309,96 +331,55 @@ struct SettingsView: View {
 
     private var displaySection: some View {
         Section("外观") {
+            Picker("界面语言", selection: settingBinding(\.appLanguage)) {
+                Text("跟随系统").tag(AppLanguage.system)
+                Text("简体中文").tag(AppLanguage.simplifiedChinese)
+                Text("繁體中文（台灣）").tag(AppLanguage.traditionalChineseTaiwan)
+                Text("English (United States)").tag(AppLanguage.englishUnitedStates)
+            }
+
             // 深色模式 (对齐 Android Settings.KEY_THEME)
-            Picker("主题", selection: Binding(
-                get: { AppSettings.shared.theme },
-                set: { AppSettings.shared.theme = $0 }
-            )) {
+            Picker("主题", selection: settingBinding(\.theme)) {
                 Text("跟随系统").tag(0)
                 Text("浅色").tag(1)
                 Text("深色").tag(2)
             }
 
+            Picker("主题色", selection: settingBinding(\.accentColor)) {
+                ForEach(AppAccentColor.allCases) { accent in
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(accent.previewColor)
+                            .frame(width: 10, height: 10)
+                        Text(accent.displayName)
+                    }
+                    .tag(accent)
+                }
+            }
+
             // 启动页面 (对齐 Android Settings.KEY_LAUNCH_PAGE)
-            Picker("启动页面", selection: Binding(
-                get: { AppSettings.shared.launchPage },
-                set: { AppSettings.shared.launchPage = $0 }
-            )) {
+            Picker("启动页面", selection: settingBinding(\.launchPage)) {
                 Text("首页").tag(0)
                 Text("热门").tag(1)
                 Text("排行榜").tag(2)
                 Text("收藏").tag(3)
                 Text("下载").tag(4)
                 Text("历史").tag(5)
+                Text("订阅").tag(6)
             }
 
-            // TODO: Connect to Logic — showGalleryPages 未被列表视图读取
-            #if DEBUG
-            Toggle("显示画廊页数", isOn: Binding(
-                get: { AppSettings.shared.showGalleryPages },
-                set: { AppSettings.shared.showGalleryPages = $0 }
-            ))
-            #endif
+            Toggle("显示画廊页数", isOn: settingBinding(\.showGalleryPages))
 
-            Toggle("显示评论区", isOn: Binding(
-                get: { AppSettings.shared.showGalleryComment },
-                set: { AppSettings.shared.showGalleryComment = $0 }
-            ))
+            Toggle("显示评论区", isOn: settingBinding(\.showGalleryComment))
 
-            // TODO: Connect to Logic — showGalleryRating 未被详情页读取(评分始终显示)
-            #if DEBUG
-            Toggle("显示评分", isOn: Binding(
-                get: { AppSettings.shared.showGalleryRating },
-                set: { AppSettings.shared.showGalleryRating = $0 }
-            ))
-            #endif
+            Toggle("显示评分", isOn: settingBinding(\.showGalleryRating))
 
-            // TODO: Connect to Logic — showReadProgress 未被列表视图读取
-            #if DEBUG
-            Toggle("显示阅读进度", isOn: Binding(
-                get: { AppSettings.shared.showReadProgress },
-                set: { AppSettings.shared.showReadProgress = $0 }
-            ))
-            #endif
+            Toggle("兼容旧缩略图链接", isOn: settingBinding(\.fixThumbUrl))
 
-            // TODO: Connect to Logic — thumbSize 未被列表/图片视图读取
-            #if DEBUG
-            Picker("缩略图大小", selection: Binding(
-                get: { AppSettings.shared.thumbSize },
-                set: { AppSettings.shared.thumbSize = $0 }
-            )) {
-                Text("小").tag(0)
-                Text("中").tag(1)
-                Text("大").tag(2)
-            }
-            #endif
-
-            // TODO: Connect to Logic — thumbResolution 未被任何代码读取
-            #if DEBUG
-            Picker("缩略图分辨率", selection: Binding(
-                get: { AppSettings.shared.thumbResolution },
-                set: { AppSettings.shared.thumbResolution = $0 }
-            )) {
-                Text("普通").tag(0)
-                Text("高清").tag(1)
-            }
-            #endif
-
-            // TODO: Connect to Logic — fixThumbUrl 未被图片加载代码读取
-            #if DEBUG
-            Toggle("修复缩略图链接", isOn: Binding(
-                get: { AppSettings.shared.fixThumbUrl },
-                set: { AppSettings.shared.fixThumbUrl = $0 }
-            ))
-            #endif
-
-            // 大屏幕列表布局 (对齐 Android: 全宽单列表布局选项)
-            Picker("宽屏布局", selection: Binding(
-                get: { AppSettings.shared.wideScreenListMode },
-                set: { AppSettings.shared.wideScreenListMode = $0 }
-            )) {
-                Text("双栏 (列表+详情)").tag(0)
-                Text("全宽单列表").tag(1)
+            // iPad 横屏与窄窗口会即时响应，无需重新启动应用。
+            Picker("大屏幕浏览布局", selection: settingBinding(\.wideScreenListMode)) {
+                Text("自动双栏（列表+详情）").tag(0)
+                Text("始终单栏").tag(1)
             }
         }
     }
@@ -408,10 +389,7 @@ struct SettingsView: View {
     private var favoritesSection: some View {
         Section("收藏") {
             // 默认收藏夹 (对齐 Android Settings.KEY_DEFAULT_FAV_SLOT)
-            Picker("默认收藏夹", selection: Binding(
-                get: { AppSettings.shared.defaultFavSlot },
-                set: { AppSettings.shared.defaultFavSlot = $0 }
-            )) {
+            Picker("默认收藏夹", selection: settingBinding(\.defaultFavSlot)) {
                 Text("每次询问").tag(-2)
                 ForEach(0..<10) { slot in
                     Text(AppSettings.shared.favCatName(slot)).tag(slot)
@@ -447,42 +425,32 @@ struct SettingsView: View {
     private var readingSection: some View {
         Section("阅读") {
             // 阅读方向 (对齐 Android Settings.KEY_READING_DIRECTION)
-            Picker("阅读方向", selection: Binding(
-                get: { AppSettings.shared.readingDirection },
-                set: { AppSettings.shared.readingDirection = $0 }
-            )) {
+            Picker("阅读方向", selection: settingBinding(\.readingDirection)) {
                 Text("左→右").tag(0)
                 Text("右→左").tag(1)
                 Text("上→下").tag(2)
-                Text("滚动模式").tag(3)
             }
 
             // 页面缩放 (对齐 Android Settings.KEY_PAGE_SCALING)
-            Picker("页面缩放", selection: Binding(
-                get: { AppSettings.shared.pageScaling },
-                set: { AppSettings.shared.pageScaling = $0 }
-            )) {
-                Text("适合屏幕").tag(0)
-                Text("适合宽度").tag(1)
-                Text("适合高度").tag(2)
-                Text("原始大小").tag(3)
-                Text("等比缩放").tag(4)
+            Picker("页面缩放", selection: settingBinding(\.pageScaling)) {
+                Text("原始大小").tag(0)
+                Text("适应宽度").tag(1)
+                Text("适应高度").tag(2)
+                Text("适应屏幕").tag(3)
+                Text("固定缩放").tag(4)
             }
 
             // 起始位置 (对齐 Android Settings.KEY_START_POSITION)
-            Picker("起始位置", selection: Binding(
-                get: { AppSettings.shared.startPosition },
-                set: { AppSettings.shared.startPosition = $0 }
-            )) {
-                Text("默认").tag(0)
-                Text("顶部").tag(1)
-                Text("右上").tag(2)
-                Text("底部").tag(3)
-                Text("右下").tag(4)
-                Text("居中").tag(5)
+            Picker("起始位置", selection: settingBinding(\.startPosition)) {
+                Text("左上").tag(0)
+                Text("右上").tag(1)
+                Text("左下").tag(2)
+                Text("右下").tag(3)
+                Text("居中").tag(4)
             }
 
             // 屏幕旋转 (对齐 Android Settings.KEY_SCREEN_ROTATION)
+            #if os(iOS)
             Picker("屏幕旋转", selection: Binding(
                 get: { AppSettings.shared.screenRotation },
                 set: { newValue in
@@ -497,56 +465,25 @@ struct SettingsView: View {
                 Text("竖屏锁定").tag(1)
                 Text("横屏锁定").tag(2)
             }
+            #endif
 
             Stepper("预加载页数: \(vm.preloadImage)", value: $vm.preloadImage, in: 1...10)
 
-            Toggle("保持屏幕常亮", isOn: $vm.keepScreenOn)
+            Toggle("保持屏幕常亮", isOn: settingBinding(\.keepScreenOn))
 
-            Toggle("全屏阅读", isOn: Binding(
-                get: { AppSettings.shared.readingFullscreen },
-                set: { AppSettings.shared.readingFullscreen = $0 }
-            ))
+            Toggle("全屏阅读", isOn: settingBinding(\.readingFullscreen))
 
-            Toggle("显示时钟", isOn: Binding(
-                get: { AppSettings.shared.showClock },
-                set: { AppSettings.shared.showClock = $0 }
-            ))
+            Toggle("显示时钟", isOn: settingBinding(\.showClock))
 
-            Toggle("显示进度", isOn: Binding(
-                get: { AppSettings.shared.showProgress },
-                set: { AppSettings.shared.showProgress = $0 }
-            ))
+            Toggle("显示进度", isOn: settingBinding(\.showProgress))
 
-            Toggle("显示电量", isOn: Binding(
-                get: { AppSettings.shared.showBattery },
-                set: { AppSettings.shared.showBattery = $0 }
-            ))
+            Toggle("显示电量", isOn: settingBinding(\.showBattery))
 
-            Toggle("显示页间距", isOn: Binding(
-                get: { AppSettings.shared.showPageInterval },
-                set: { AppSettings.shared.showPageInterval = $0 }
-            ))
-
-            // TODO: Connect to Logic — volumePage/reverseVolumePage 未被 ImageReaderView 读取
-            #if DEBUG && os(iOS)
-            Toggle("音量键翻页", isOn: Binding(
-                get: { AppSettings.shared.volumePage },
-                set: { AppSettings.shared.volumePage = $0 }
-            ))
-
-            if AppSettings.shared.volumePage {
-                Toggle("反转音量键方向", isOn: Binding(
-                    get: { AppSettings.shared.reverseVolumePage },
-                    set: { AppSettings.shared.reverseVolumePage = $0 }
-                ))
-            }
-            #endif
+            Toggle("显示页间距", isOn: settingBinding(\.showPageInterval))
 
             // 自定义亮度 (对齐 Android Settings.KEY_CUSTOM_SCREEN_LIGHTNESS)
-            Toggle("自定义亮度", isOn: Binding(
-                get: { AppSettings.shared.customScreenLightness },
-                set: { AppSettings.shared.customScreenLightness = $0 }
-            ))
+            #if os(iOS)
+            Toggle("自定义亮度", isOn: settingBinding(\.customScreenLightness))
 
             if AppSettings.shared.customScreenLightness {
                 Slider(value: Binding(
@@ -556,17 +493,11 @@ struct SettingsView: View {
                     Text("亮度: \(AppSettings.shared.screenLightness)%")
                 }
             }
+            #endif
 
             // 自动翻页间隔 (对齐 Android Settings.KEY_AUTO_PAGE_INTERVAL)
             Stepper("自动翻页间隔: \(vm.autoPageInterval)s", value: $vm.autoPageInterval, in: 1...60)
 
-            // TODO: Connect to Logic — colorFilter/colorFilterColor 未被 ImageReaderView 读取
-            #if DEBUG
-            Toggle("色彩滤镜 (护眼)", isOn: Binding(
-                get: { AppSettings.shared.colorFilter },
-                set: { AppSettings.shared.colorFilter = $0 }
-            ))
-            #endif
         }
     }
 
@@ -574,21 +505,49 @@ struct SettingsView: View {
 
     private var downloadSection: some View {
         Section("下载") {
-            #if os(macOS)
-            // macOS: 自定义下载路径
-            HStack {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
                 Text("下载位置")
                 Spacer()
                 Text(vm.downloadPath)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Button("更改...") {
+                    .frame(maxWidth: 300, alignment: .trailing)
+
+                #if os(macOS)
+                Button("更改…") {
                     vm.chooseDownloadPath()
                 }
                 .buttonStyle(.link)
+                #else
+                Button("更改…") {
+                    vm.showDownloadDirectoryPicker = true
+                }
+                .buttonStyle(.borderless)
+                .fileImporter(
+                    isPresented: $vm.showDownloadDirectoryPicker,
+                    allowedContentTypes: [.folder],
+                    allowsMultipleSelection: false
+                ) { result in
+                    vm.handleDownloadDirectorySelection(result)
+                }
+                #endif
+                }
+
+                HStack {
+                    Text("更改位置会先暂停下载，已有文件不会自动移动。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if vm.hasCustomDownloadPath {
+                        Button("恢复默认") {
+                            vm.resetDownloadPath()
+                        }
+                        .font(.caption)
+                    }
+                }
             }
-            #endif
 
             Stepper("并发线程: \(vm.multiThread)", value: $vm.multiThread, in: 1...5)
 
@@ -597,31 +556,8 @@ struct SettingsView: View {
             // 下载延迟 (对齐 Android Settings.KEY_DOWNLOAD_DELAY)
             Stepper("下载延迟: \(vm.downloadDelay) ms", value: $vm.downloadDelay, in: 0...2000, step: 100)
 
-            // TODO: Connect to Logic — imageResolution 未作为请求参数发送
-            #if DEBUG
-            Picker("图片分辨率", selection: Binding(
-                get: { AppSettings.shared.imageResolution },
-                set: { AppSettings.shared.imageResolution = $0 }
-            )) {
-                ForEach(ImageResolution.allCases) { resolution in
-                    Text(resolution.displayName).tag(resolution)
-                }
-            }
-            #endif
-
             // 下载原图 (对齐 Android Settings.KEY_DOWNLOAD_ORIGIN_IMAGE)
-            Toggle("下载原始图片", isOn: Binding(
-                get: { AppSettings.shared.downloadOriginImage },
-                set: { AppSettings.shared.downloadOriginImage = $0 }
-            ))
-
-            // TODO: Connect to Logic — mediaScan 是 Android 概念，iOS 无意义
-            #if DEBUG
-            Toggle("媒体扫描", isOn: Binding(
-                get: { AppSettings.shared.mediaScan },
-                set: { AppSettings.shared.mediaScan = $0 }
-            ))
-            #endif
+            Toggle("下载原始图片", isOn: settingBinding(\.downloadOriginImage))
 
             // 恢复下载项目 (对齐 Android: restore_download_items)
             Button {
@@ -684,10 +620,7 @@ struct SettingsView: View {
     private var cacheSection: some View {
         Section("缓存") {
             // 阅读缓存大小 (对齐 Android Settings.KEY_READ_CACHE_SIZE)
-            Picker("阅读缓存大小", selection: Binding(
-                get: { AppSettings.shared.readCacheSize },
-                set: { AppSettings.shared.readCacheSize = $0 }
-            )) {
+            Picker("阅读缓存大小", selection: settingBinding(\.readCacheSize)) {
                 Text("40 MB").tag(40)
                 Text("80 MB").tag(80)
                 Text("120 MB").tag(120)
@@ -716,44 +649,12 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Security
-
-    private var securitySection: some View {
-        Section("隐私与安全") {
-            Toggle("启用应用锁", isOn: Binding(
-                get: { AppSettings.shared.enableSecurity },
-                set: { AppSettings.shared.enableSecurity = $0 }
-            ))
-
-            if AppSettings.shared.enableSecurity {
-                Picker("解锁延迟", selection: Binding(
-                    get: { AppSettings.shared.securityDelay },
-                    set: { AppSettings.shared.securityDelay = $0 }
-                )) {
-                    Text("立即").tag(0)
-                    Text("30 秒").tag(30)
-                    Text("1 分钟").tag(60)
-                    Text("5 分钟").tag(300)
-                    Text("15 分钟").tag(900)
-                }
-            }
-        }
-    }
-
     // MARK: - Advanced (对齐 Android Settings: 高级)
 
     private var advancedSection: some View {
         Section("高级") {
             // 历史记录容量 (对齐 Android Settings.KEY_HISTORY_INFO_SIZE)
             Stepper("历史记录上限: \(vm.historyInfoSize)", value: $vm.historyInfoSize, in: 100...2000, step: 100)
-
-            // TODO: Connect to Logic — saveParseErrorBody 未被解析器读取
-            #if DEBUG
-            Toggle("保存解析错误", isOn: Binding(
-                get: { AppSettings.shared.saveParseErrorBody },
-                set: { AppSettings.shared.saveParseErrorBody = $0 }
-            ))
-            #endif
 
             // 导出数据 (对齐 Android: export_data)
             Button("导出数据") {
@@ -774,33 +675,130 @@ struct SettingsView: View {
         }
     }
 
+    #if os(iOS)
+    private var shortcutsSection: some View {
+        Section("Siri 与快捷指令") {
+            ShortcutsLink()
+                .shortcutsLinkStyle(.automatic)
+
+            Text("可从快捷指令、Siri 或 Spotlight 搜索画廊、打开常用页面并继续阅读。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+    #endif
+
     // MARK: - About
 
     private var aboutSection: some View {
         Section("关于") {
-            HStack {
-                Text("版本")
-                Spacer()
-                Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
-                    .foregroundStyle(.secondary)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                vm.versionTapCount += 1
-                if vm.versionTapCount >= 5 {
-                    vm.versionTapCount = 0
-                    vm.showLogExport = true
+            NavigationLink {
+                aboutDetailView
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "books.vertical.fill")
+                        .font(.title2)
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 38, height: 38)
+                        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("EhViewer")
+                            .font(.headline)
+                        Text("版本 \(appVersion) (构建 \(appBuild))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-            }
-
-            Button("源代码") {
-                openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple")!)
             }
 
             NavigationLink("开源协议") {
                 licensesView
             }
         }
+        .sheet(isPresented: $vm.showLogExport) {
+            LogExportView()
+        }
+    }
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+    }
+
+    private var appBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    }
+
+    private var currentPlatformDescription: String {
+        #if os(macOS)
+        "macOS"
+        #else
+        UIDevice.current.userInterfaceIdiom == .pad ? "iPadOS" : "iOS"
+        #endif
+    }
+
+    private var aboutDetailView: some View {
+        List {
+            Section {
+                VStack(spacing: 10) {
+                    Image(systemName: "books.vertical.fill")
+                        .font(.system(size: 46, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 82, height: 82)
+                        .background(Color.accentColor.opacity(0.13), in: RoundedRectangle(cornerRadius: 22))
+                    Text("EhViewer")
+                        .font(.title2.bold())
+                    Text("适用于 Apple 平台的原生 E-Hentai / ExHentai 阅读器")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+            }
+
+            Section("版本信息") {
+                LabeledContent("版本", value: appVersion)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        vm.versionTapCount += 1
+                        if vm.versionTapCount >= 5 {
+                            vm.versionTapCount = 0
+                            vm.showLogExport = true
+                        }
+                    }
+                LabeledContent("构建", value: appBuild)
+                LabeledContent("平台", value: currentPlatformDescription)
+            }
+
+            Section("项目") {
+                Button {
+                    openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple")!)
+                } label: {
+                    Label("源代码", systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                Button {
+                    openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple/issues")!)
+                } label: {
+                    Label("报告问题", systemImage: "exclamationmark.bubble")
+                }
+                NavigationLink {
+                    licensesView
+                } label: {
+                    Label("开源协议与致谢", systemImage: "doc.text")
+                }
+            }
+
+            Section("隐私") {
+                Label("不包含广告、跨应用跟踪或第三方分析 SDK", systemImage: "hand.raised")
+                Text("登录 Cookie、阅读记录、收藏与下载数据保存在设备上；网络请求会直接发送到用户选择的 E-Hentai 或 ExHentai 站点。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("关于 EhViewer")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .sheet(isPresented: $vm.showLogExport) {
             LogExportView()
         }
@@ -819,10 +817,10 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    Text("Copyright © 2024 felixchaos")
+                    Text("Copyright © 2024–2026 felixchaos and contributors")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("""
+                    Text(verbatim: """
 Licensed under the Apache License, Version 2.0 (the "License"); \
 you may not use this file except in compliance with the License. \
 You may obtain a copy of the License at
@@ -856,6 +854,13 @@ limitations under the License.
                     Text("EhViewer_CN_SXJ")
                         .font(.subheadline.bold())
                     Text("EhViewer 中文分支，本项目参考了其 UI 设计与功能逻辑")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("EhPanda / JHenTai")
+                        .font(.subheadline.bold())
+                    Text("活跃的同类开源项目，为导航、阅读与网络交互提供了参考")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1082,20 +1087,77 @@ SOFTWARE.
 
         return List {
             ForEach(allCategories, id: \.1) { name, bit in
-                let isEnabled = (AppSettings.shared.defaultCategories & bit) != 0
                 Toggle(name, isOn: Binding(
-                    get: { isEnabled },
+                    get: {
+                        _ = settingsRevision
+                        return (AppSettings.shared.defaultCategories & bit) != 0
+                    },
                     set: { newValue in
                         if newValue {
                             AppSettings.shared.defaultCategories |= bit
                         } else {
                             AppSettings.shared.defaultCategories &= ~bit
                         }
+                        settingsRevision &+= 1
                     }
                 ))
             }
         }
         .navigationTitle("默认搜索分类")
+    }
+
+    private var blockedTagsView: some View {
+        List {
+            Section {
+                HStack {
+                    TextField("namespace:tag", text: $newBlockedTag)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addBlockedTag)
+                    Button("添加", action: addBlockedTag)
+                        .disabled(newBlockedTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            } footer: {
+                Text("屏蔽标签会应用到首页、热门、订阅和搜索结果。列表缺少标签摘要时，应用会通过图库 API 补全后再显示。")
+            }
+
+            Section("已屏蔽（\(AppSettings.shared.blockedTags.count)）") {
+                if AppSettings.shared.blockedTags.isEmpty {
+                    ContentUnavailableView("暂无屏蔽标签", systemImage: "eye.slash")
+                } else {
+                    ForEach(AppSettings.shared.blockedTags, id: \.self) { tag in
+                        Text(tag)
+                            .textSelection(.enabled)
+                            .contextMenu {
+                                Button("取消屏蔽", role: .destructive) {
+                                    AppSettings.shared.unblockTag(tag)
+                                }
+                            }
+                    }
+                    .onDelete { offsets in
+                        let tags = AppSettings.shared.blockedTags
+                        for index in offsets where tags.indices.contains(index) {
+                            AppSettings.shared.unblockTag(tags[index])
+                        }
+                    }
+                }
+            }
+
+            if !AppSettings.shared.blockedTags.isEmpty {
+                Section {
+                    Button("清空屏蔽标签", role: .destructive) {
+                        AppSettings.shared.blockedTags = []
+                    }
+                }
+            }
+        }
+        .navigationTitle("已屏蔽标签")
+    }
+
+    private func addBlockedTag() {
+        let tag = newBlockedTag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty else { return }
+        AppSettings.shared.blockTag(tag)
+        newBlockedTag = ""
     }
 
     // MARK: - Excluded Tag Namespaces View (对齐 Android: ExcludedTagNamespacesActivity)
@@ -1124,15 +1186,18 @@ SOFTWARE.
             }
 
             ForEach(namespaces, id: \.1) { name, bit in
-                let isExcluded = (AppSettings.shared.excludedTagNamespaces & bit) != 0
                 Toggle(name, isOn: Binding(
-                    get: { isExcluded },
+                    get: {
+                        _ = settingsRevision
+                        return (AppSettings.shared.excludedTagNamespaces & bit) != 0
+                    },
                     set: { newValue in
                         if newValue {
                             AppSettings.shared.excludedTagNamespaces |= bit
                         } else {
                             AppSettings.shared.excludedTagNamespaces &= ~bit
                         }
+                        settingsRevision &+= 1
                     }
                 ))
             }
@@ -1159,10 +1224,12 @@ SOFTWARE.
 
             ForEach(Array(languages.enumerated()), id: \.offset) { index, lang in
                 let bit = 1 << index
-                let currentExcluded = Int(AppSettings.shared.excludedLanguages ?? "0") ?? 0
-                let isExcluded = (currentExcluded & bit) != 0
                 Toggle(lang, isOn: Binding(
-                    get: { isExcluded },
+                    get: {
+                        _ = settingsRevision
+                        let current = Int(AppSettings.shared.excludedLanguages ?? "0") ?? 0
+                        return (current & bit) != 0
+                    },
                     set: { newValue in
                         var current = Int(AppSettings.shared.excludedLanguages ?? "0") ?? 0
                         if newValue {
@@ -1171,6 +1238,7 @@ SOFTWARE.
                             current &= ~bit
                         }
                         AppSettings.shared.excludedLanguages = String(current)
+                        settingsRevision &+= 1
                     }
                 ))
             }
@@ -1190,9 +1258,17 @@ class SettingsViewModel {
     var userId: String?
     var showLogoutConfirm = false
     var showLogin = false
+    var isSyncingHiddenTags = false
+    var hiddenTagSyncResult: String?
 
     var gallerySite: Int = 0 {
-        didSet { AppSettings.shared.gallerySite = EhSite(rawValue: gallerySite) ?? .eHentai }
+        didSet {
+            let newSite = EhSite(rawValue: gallerySite) ?? .eHentai
+            guard newSite != AppSettings.shared.gallerySite else { return }
+            AppSettings.shared.gallerySite = newSite
+            GalleryCache.shared.clearAll()
+            hiddenTagSyncResult = nil
+        }
     }
     var listMode: Int = 0 {
         didSet { AppSettings.shared.listMode = ListMode(rawValue: listMode) ?? .list }
@@ -1211,11 +1287,11 @@ class SettingsViewModel {
         let db = EhTagDatabase.shared
         if db.isLoaded {
             if let version = db.version {
-                return "已加载 (\(version.prefix(10)))"
+                return AppLocalization.format("已加载 (%@)", String(version.prefix(10)))
             }
-            return "已加载"
+            return AppLocalization.localized("已加载")
         }
-        return "未加载"
+        return AppLocalization.localized("未加载")
     }
     
     func updateTagDatabase() async {
@@ -1276,7 +1352,7 @@ class SettingsViewModel {
     var diagnosisResult = ""
     var diagnosisSuccess = false
 
-    var diskCacheSize: String = "计算中..."
+    var diskCacheSize: String = AppLocalization.localized("计算中...")
 
     func calculateCacheSize() {
         let urlCacheSize = URLCache.shared.currentDiskUsage
@@ -1289,32 +1365,70 @@ class SettingsViewModel {
     func clearCache() {
         // 清除内存缓存
         GalleryCache.shared.clearAll()
+        ThumbnailMemoryCache.shared.removeAll()
+        ReaderViewModel.clearDecodedImageCache()
         // 清除 URL 磁盘缓存
         URLCache.shared.removeAllCachedResponses()
         calculateCacheSize()
     }
 
-    #if os(macOS)
+    var showDownloadDirectoryPicker = false
+    private var downloadLocationRevision = 0
+
     var downloadPath: String {
-        if let path = UserDefaults.standard.string(forKey: "downloadPath"), !path.isEmpty {
-            return path
-        }
-        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("download").path
+        _ = downloadLocationRevision
+        return DownloadManager.shared.downloadDirectory.path
     }
 
+    var hasCustomDownloadPath: Bool {
+        _ = downloadLocationRevision
+        return UserDefaults.standard.data(forKey: "downloadDirectoryBookmark") != nil
+            || UserDefaults.standard.string(forKey: "downloadPath")?.isEmpty == false
+    }
+
+    #if os(macOS)
     func chooseDownloadPath() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.title = "选择下载目录"
-        panel.prompt = "选择"
+        panel.title = AppLocalization.localized("选择下载目录")
+        panel.prompt = AppLocalization.localized("选择")
 
         if panel.runModal() == .OK, let url = panel.url {
-            UserDefaults.standard.set(url.path, forKey: "downloadPath")
+            applyDownloadDirectory(url)
         }
     }
     #endif
+
+    func handleDownloadDirectorySelection(_ result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            applyDownloadDirectory(url)
+        } catch {
+            ErrorHandler.shared.handle(error, context: "ChooseDownloadDirectory")
+        }
+    }
+
+    func resetDownloadPath() {
+        Task {
+            await DownloadManager.shared.pauseAllDownloads()
+            DownloadManager.resetDownloadDirectory()
+            downloadLocationRevision &+= 1
+        }
+    }
+
+    private func applyDownloadDirectory(_ url: URL) {
+        Task {
+            await DownloadManager.shared.pauseAllDownloads()
+            do {
+                try DownloadManager.setDownloadDirectory(url)
+                downloadLocationRevision &+= 1
+            } catch {
+                ErrorHandler.shared.handle(error, context: "SetDownloadDirectory")
+            }
+        }
+    }
 
     init() {
         // 从 AppSettings 加载初始值到 stored properties
@@ -1359,6 +1473,27 @@ class SettingsViewModel {
                 userId = memberId
                 AppSettings.shared.userId = memberId
             }
+        }
+    }
+
+    func syncHiddenTags() async {
+        guard !isSyncingHiddenTags else { return }
+        isSyncingHiddenTags = true
+        hiddenTagSyncResult = nil
+        defer { isSyncingHiddenTags = false }
+
+        do {
+            let list = try await EhAPI.shared.getWatchedList(
+                url: EhURL.myTagsUrl(for: AppSettings.shared.gallerySite)
+            )
+            let hiddenTags = list.userTags.filter(\.hidden).map(\.tagName)
+            AppSettings.shared.blockedTags.append(contentsOf: hiddenTags)
+            hiddenTagSyncResult = hiddenTags.isEmpty
+                ? AppLocalization.localized("没有屏蔽项")
+                : AppLocalization.format("已同步 %lld 项", hiddenTags.count)
+        } catch {
+            hiddenTagSyncResult = AppLocalization.localized("同步失败")
+            debugLog("[SettingsVM] 同步我的标签失败: \(error)")
         }
     }
 
@@ -1409,7 +1544,7 @@ class SettingsViewModel {
                         results.append("✓ \(host) → \(ip)")
                     }
                 } else {
-                    results.append("✗ \(host) DNS 解析失败")
+                    results.append(AppLocalization.format("✗ %@ DNS 解析失败", host))
                     allSuccess = false
                 }
             }
@@ -1425,27 +1560,27 @@ class SettingsViewModel {
                     let (_, response) = try await URLSession.shared.data(for: request)
                     if let httpResponse = response as? HTTPURLResponse {
                         if httpResponse.statusCode == 200 || httpResponse.statusCode == 302 {
-                            results.append("✓ \(host) HTTPS 连接正常")
+                            results.append(AppLocalization.format("✓ %@ HTTPS 连接正常", host))
                         } else {
-                            results.append("⚠ \(host) HTTP \(httpResponse.statusCode)")
+                            results.append(AppLocalization.format("⚠ %@ HTTP %lld", host, httpResponse.statusCode))
                         }
                     }
                 } catch let error as NSError {
                     if error.domain == NSURLErrorDomain {
                         switch error.code {
                         case NSURLErrorTimedOut:
-                            results.append("✗ \(host) 连接超时")
+                            results.append(AppLocalization.format("✗ %@ 连接超时", host))
                         case NSURLErrorCannotConnectToHost:
-                            results.append("✗ \(host) 无法连接")
+                            results.append(AppLocalization.format("✗ %@ 无法连接", host))
                         case NSURLErrorSecureConnectionFailed:
-                            results.append("✗ \(host) TLS 错误 (可能被阻断)")
+                            results.append(AppLocalization.format("✗ %@ TLS 错误 (可能被阻断)", host))
                         case NSURLErrorServerCertificateUntrusted:
-                            results.append("✗ \(host) 证书不受信任")
+                            results.append(AppLocalization.format("✗ %@ 证书不受信任", host))
                         default:
-                            results.append("✗ \(host) 错误: \(error.localizedDescription)")
+                            results.append(AppLocalization.format("✗ %@ 错误: %@", host, error.localizedDescription))
                         }
                     } else {
-                        results.append("✗ \(host) 错误: \(error.localizedDescription)")
+                        results.append(AppLocalization.format("✗ %@ 错误: %@", host, error.localizedDescription))
                     }
                     allSuccess = false
                 }
@@ -1455,7 +1590,7 @@ class SettingsViewModel {
             #if os(iOS)
             let proxySettings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any]
             if let httpProxy = proxySettings?["HTTPProxy"] as? String, !httpProxy.isEmpty {
-                results.append("ℹ 检测到 HTTP 代理: \(httpProxy)")
+                results.append(AppLocalization.format("ℹ 检测到 HTTP 代理: %@", httpProxy))
             }
             #endif
             
@@ -1496,7 +1631,7 @@ class SettingsViewModel {
                 options: [.skipsHiddenFiles]
             ) else {
                 await MainActor.run {
-                    self.restoreResultMessage = "无法读取下载目录"
+                    self.restoreResultMessage = AppLocalization.localized("无法读取下载目录")
                     self.isRestoring = false
                 }
                 return
@@ -1509,7 +1644,7 @@ class SettingsViewModel {
                 existingGids = Set(records.map { $0.gid })
             } catch {
                 await MainActor.run {
-                    self.restoreResultMessage = "数据库读取失败: \(error.localizedDescription)"
+                    self.restoreResultMessage = AppLocalization.format("数据库读取失败: %@", error.localizedDescription)
                     self.isRestoring = false
                 }
                 return
@@ -1557,9 +1692,12 @@ class SettingsViewModel {
 
             await MainActor.run {
                 if restoredCount > 0 {
-                    self.restoreResultMessage = "成功恢复 \(restoredCount) 个下载项目" + (errorCount > 0 ? " (\(errorCount) 个失败)" : "")
+                    let restored = AppLocalization.format("成功恢复 %lld 个下载项目", restoredCount)
+                    self.restoreResultMessage = errorCount > 0
+                        ? restored + AppLocalization.format(" (%lld 个失败)", errorCount)
+                        : restored
                 } else {
-                    self.restoreResultMessage = "没有需要恢复的下载项目"
+                    self.restoreResultMessage = AppLocalization.localized("没有需要恢复的下载项目")
                 }
                 self.isRestoring = false
             }
@@ -1582,7 +1720,7 @@ class SettingsViewModel {
                 options: [.skipsHiddenFiles]
             ) else {
                 await MainActor.run {
-                    self.cleanResultMessage = "无法读取下载目录"
+                    self.cleanResultMessage = AppLocalization.localized("无法读取下载目录")
                     self.isCleaning = false
                 }
                 return
@@ -1595,7 +1733,7 @@ class SettingsViewModel {
                 dbGids = Set(records.map { $0.gid })
             } catch {
                 await MainActor.run {
-                    self.cleanResultMessage = "数据库读取失败"
+                    self.cleanResultMessage = AppLocalization.localized("数据库读取失败")
                     self.isCleaning = false
                 }
                 return
@@ -1630,7 +1768,7 @@ class SettingsViewModel {
 
             await MainActor.run {
                 if orphanDirs.isEmpty {
-                    self.cleanResultMessage = "没有冗余数据"
+                    self.cleanResultMessage = AppLocalization.localized("没有冗余数据")
                     self.isCleaning = false
                 } else {
                     self.cleanOrphanCount = orphanDirs.count
@@ -1653,7 +1791,7 @@ class SettingsViewModel {
                 options: [.skipsHiddenFiles]
             ) else {
                 await MainActor.run {
-                    self.cleanResultMessage = "清除失败"
+                    self.cleanResultMessage = AppLocalization.localized("清除失败")
                     self.isCleaning = false
                 }
                 return
@@ -1665,7 +1803,7 @@ class SettingsViewModel {
                 dbGids = Set(records.map { $0.gid })
             } catch {
                 await MainActor.run {
-                    self.cleanResultMessage = "清除失败"
+                    self.cleanResultMessage = AppLocalization.localized("清除失败")
                     self.isCleaning = false
                 }
                 return
@@ -1683,7 +1821,7 @@ class SettingsViewModel {
             }
 
             await MainActor.run {
-                self.cleanResultMessage = "已清除 \(deletedCount) 个冗余目录"
+                self.cleanResultMessage = AppLocalization.format("已清除 %lld 个冗余目录", deletedCount)
                 self.isCleaning = false
             }
         }
@@ -1697,6 +1835,8 @@ class SettingsViewModel {
     /// 清除内存缓存
     func clearMemoryCache() {
         GalleryCache.shared.clearAll()
+        ThumbnailMemoryCache.shared.removeAll()
+        ReaderViewModel.clearDecodedImageCache()
     }
 
     // MARK: - 数据导出/导入 (对齐 Android: ExportDataPreference / ImportDataPreference)
@@ -1704,28 +1844,28 @@ class SettingsViewModel {
     var showImportPicker = false
     var showExportSuccess = false
 
+    /// 仅导入导出当前 Apple 平台确实使用的设置。除避免把 Android 遗留项
+    /// 再次带回外，也防止任意 JSON 写入应用的其他 UserDefaults 键。
+    private static let portableSettingKeys: Set<String> = [
+        "gallery_site", "multi_thread_download", "preload_image",
+        "download_delay", "download_timeout", "download_origin_image",
+        "read_cache_size", "list_mode", "show_jpn_title",
+        "show_tag_translations", "show_gallery_comment", "show_gallery_pages",
+        "show_gallery_rating", "wide_screen_list_mode", "default_categories",
+        "blocked_gallery_tags", "reading_direction", "page_scaling",
+        "start_position", "keep_screen_on", "reading_fullscreen",
+        "gallery_show_clock", "gallery_show_progress", "gallery_show_battery",
+        "show_page_interval", "auto_page_interval", "default_favorite_2",
+        "fix_thumb_url", "enable_secure", "security_delay", "history_info_size",
+        "app_language", "accent_color", "theme", "launch_page",
+    ]
+
     /// 导出数据: 将 UserDefaults 设置导出为 JSON
     func exportData() {
         let defaults = UserDefaults.standard
-        let allKeys = [
-            "gallery_site", "domain_fronting", "dns_over_https", "built_in_hosts",
-            "multi_thread_download", "preload_image", "download_delay", "download_timeout",
-            "download_origin_image", "image_resolution", "read_cache_size", "list_mode",
-            "show_jpn_title", "show_tag_translations", "show_gallery_comment", "show_gallery_rating",
-            "show_read_progress", "wide_screen_list_mode", "show_eh_events", "show_eh_limits",
-            "default_categories", "excluded_tag_namespaces", "excluded_languages",
-            "reading_direction", "page_scaling", "start_position", "keep_screen_on",
-            "reading_fullscreen", "gallery_show_clock", "gallery_show_progress", "gallery_show_battery",
-            "show_page_interval", "volume_page", "reverse_volume_page", "screen_rotation",
-            "auto_page_interval", "color_filter", "default_favorite_2", "thumb_size",
-            "detail_size", "thumb_resolution", "fix_thumb_url", "media_scan",
-            "enable_secure", "security_delay", "save_parse_error_body", "history_info_size",
-            "theme", "launch_page", "show_gallery_pages", "cellular_network_warning",
-            "custom_screen_lightness", "screen_lightness",
-        ]
 
         var exportDict: [String: Any] = [:]
-        for key in allKeys {
+        for key in Self.portableSettingKeys {
             if let value = defaults.object(forKey: key) {
                 exportDict[key] = value
             }
@@ -1755,7 +1895,7 @@ class SettingsViewModel {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "ehviewer_settings.json"
-        panel.title = "导出设置"
+        panel.title = AppLocalization.localized("导出设置")
         if panel.runModal() == .OK, let url = panel.url {
             try? jsonData.write(to: url)
         }
@@ -1780,6 +1920,8 @@ class SettingsViewModel {
 
         let defaults = UserDefaults.standard
         for (key, value) in dict {
+            let isFavoriteName = (0..<10).contains { key == "fav_cat_\($0)" }
+            guard Self.portableSettingKeys.contains(key) || isFavoriteName else { continue }
             defaults.set(value, forKey: key)
         }
 

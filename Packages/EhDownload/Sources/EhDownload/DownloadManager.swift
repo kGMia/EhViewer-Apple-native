@@ -27,24 +27,64 @@ public actor DownloadManager {
     private var activeTask: DownloadTask?
     private let maxConcurrent = 1  // 同一时间只下载一个画廊
     private var isRunning = false
+    /// 数据库加载只执行一次；所有会读写队列的公开入口先等待同一个任务，
+    /// 避免冷启动时空队列覆盖恢复结果或新任务被迟到的加载覆盖。
+    private var initialLoadTask: Task<[DownloadRecord], Never>?
+    private var hasLoadedInitialQueue = false
 
     /// 下载监听器（用于通知集成）
     public weak var listener: DownloadListener?
 
     /// 下载目录
     public nonisolated var downloadDirectory: URL {
-        // macOS: 支持用户自定义路径
-        #if os(macOS)
-        if let customPath = UserDefaults.standard.string(forKey: "downloadPath"),
-           !customPath.isEmpty {
-            return URL(fileURLWithPath: customPath)
+        if let custom = DownloadDirectoryResolver.shared.resolve() {
+            return custom
         }
-        #endif
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("download")
     }
 
+    /// 保存由系统目录选择器授予的持久访问权限。新目录只影响之后的下载；
+    /// 既有文件不会被隐式移动，避免跨卷移动失败或造成不可逆的数据改写。
+    public nonisolated static func setDownloadDirectory(_ url: URL) throws {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+
+        #if os(macOS)
+        let bookmark = try url.bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        #else
+        let bookmark = try url.bookmarkData(
+            options: .minimalBookmark,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        #endif
+        UserDefaults.standard.set(bookmark, forKey: DownloadDirectoryResolver.bookmarkKey)
+        UserDefaults.standard.set(url.path, forKey: "downloadPath")
+        DownloadDirectoryResolver.shared.invalidate()
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    public nonisolated static func resetDownloadDirectory() {
+        UserDefaults.standard.removeObject(forKey: DownloadDirectoryResolver.bookmarkKey)
+        UserDefaults.standard.removeObject(forKey: "downloadPath")
+        DownloadDirectoryResolver.shared.invalidate()
+    }
+
     private init() {
+        initialLoadTask = Task.detached(priority: .userInitiated) {
+            do {
+                return try EhDatabase.shared.getAllDownloads()
+            } catch {
+                print("Failed to load downloads from database: \(error)")
+                return []
+            }
+        }
+
         // 确保下载目录存在
         var dir = downloadDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -56,38 +96,44 @@ public actor DownloadManager {
         try? dir.setResourceValues(resourceValues)
         #endif
 
-        // 从数据库加载下载任务
-        Task { await loadFromDatabase() }
     }
 
-    /// 从数据库加载已有下载任务
-    private func loadFromDatabase() {
-        do {
-            let records = try EhDatabase.shared.getAllDownloads()
-            downloadQueue = records.map { record in
-                let gallery = GalleryInfo(
-                    gid: record.gid, token: record.token,
-                    title: record.title, titleJpn: record.titleJpn,
-                    thumb: record.thumb,
-                    category: EhCategory(rawValue: record.category),
-                    posted: record.posted, uploader: record.uploader,
-                    rating: record.rating, pages: record.pages
-                )
-                return DownloadTask(gallery: gallery, label: record.label, state: record.state)
-            }
-        } catch {
-            print("Failed to load downloads from database: \(error)")
+    private func ensureInitialQueueLoaded() async {
+        guard !hasLoadedInitialQueue else { return }
+        guard let initialLoadTask else {
+            hasLoadedInitialQueue = true
+            return
         }
+
+        let records = await initialLoadTask.value
+        // Actor 在 await 期间可重入；只允许最先恢复的调用写入一次。
+        guard !hasLoadedInitialQueue else { return }
+        downloadQueue = records.map { record in
+            // 上次进程若在下载中退出，内存中的 Spider 已不存在；恢复为等待
+            // 状态，让后台恢复或用户操作可以安全地重新建立任务。
+            let restoredState = DownloadTaskLifecycle.recoveredState(from: record.state)
+            return DownloadTask(
+                gallery: record.galleryInfo,
+                label: record.label,
+                state: restoredState
+            )
+        }
+        for record in records where record.state == Self.stateDownload {
+            try? EhDatabase.shared.updateDownloadState(gid: record.gid, state: Self.stateWait)
+        }
+        hasLoadedInitialQueue = true
+        self.initialLoadTask = nil
     }
 
     // MARK: - 公共接口
 
     /// 添加下载任务 (Fix A-1: 已有 failed/none 状态时自动恢复而非静默忽略)
     public func startDownload(gallery: GalleryInfo, label: String? = nil) async {
+        await ensureInitialQueueLoaded()
         // 检查是否已在队列中
         if let existingIndex = downloadQueue.firstIndex(where: { $0.gallery.gid == gallery.gid }) {
             let existingState = downloadQueue[existingIndex].state
-            if existingState == Self.stateNone || existingState == Self.stateFailed {
+            if DownloadTaskLifecycle.canResume(from: existingState) {
                 // 已暂停或已失败 → 重置为等待并恢复
                 downloadQueue[existingIndex].state = Self.stateWait
                 try? EhDatabase.shared.updateDownloadState(gid: gallery.gid, state: Self.stateWait)
@@ -101,14 +147,7 @@ public actor DownloadManager {
         downloadQueue.append(task)
 
         // 持久化到数据库
-        let record = DownloadRecord(
-            gid: gallery.gid, token: gallery.token,
-            title: gallery.bestTitle, titleJpn: gallery.titleJpn,
-            thumb: gallery.thumb, category: gallery.category.rawValue,
-            posted: gallery.posted, uploader: gallery.uploader,
-            rating: gallery.rating, simpleLanguage: gallery.simpleLanguage,
-            pages: gallery.pages, state: Self.stateWait, date: Date()
-        )
+        let record = gallery.downloadRecord(state: Self.stateWait, label: label)
         try? EhDatabase.shared.insertDownload(record)
 
         // 启动队列处理
@@ -118,13 +157,16 @@ public actor DownloadManager {
     }
 
     /// 暂停下载
-    public func pauseDownload(gid: Int64) {
+    public func pauseDownload(gid: Int64) async {
+        await ensureInitialQueueLoaded()
         if activeTask?.gallery.gid == gid {
+            let title = activeTask?.gallery.bestTitle ?? ""
             if let spider = activeTask?.spider {
                 Task { await spider.cancelAll() }
             }
             activeTask?.state = Self.stateNone
             activeTask = nil
+            await listener?.onDownloadPause(gid: gid, title: title)
             processQueue()
         }
         if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
@@ -134,12 +176,19 @@ public actor DownloadManager {
     }
 
     /// 暂停所有下载（磁盘满时紧急调用）
-    public func pauseAllDownloads() {
+    public func pauseAllDownloads() async {
+        await ensureInitialQueueLoaded()
+        let pausedGID = activeTask?.gallery.gid
+        let pausedTitle = activeTask?.gallery.bestTitle
         // 取消当前活跃任务
         if let spider = activeTask?.spider {
             Task { await spider.cancelAll() }
         }
         activeTask = nil
+
+        if let pausedGID {
+            await listener?.onDownloadPause(gid: pausedGID, title: pausedTitle ?? "")
+        }
 
         // 暂停队列中所有等待/下载中的任务
         for i in downloadQueue.indices {
@@ -152,7 +201,8 @@ public actor DownloadManager {
     }
 
     /// 恢复下载
-    public func resumeDownload(gid: Int64) {
+    public func resumeDownload(gid: Int64) async {
+        await ensureInitialQueueLoaded()
         if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
             downloadQueue[index].state = Self.stateWait
             try? EhDatabase.shared.updateDownloadState(gid: gid, state: Self.stateWait)
@@ -163,7 +213,8 @@ public actor DownloadManager {
     }
 
     /// 删除下载 (可选删除文件)
-    public func deleteDownload(gid: Int64, deleteFiles: Bool = false) {
+    public func deleteDownload(gid: Int64, deleteFiles: Bool = false) async {
+        await ensureInitialQueueLoaded()
         // 先获取 gallery 信息 (必须在 removeAll 之前)
         let task = downloadQueue.first(where: { $0.gallery.gid == gid })
         let title = task?.gallery.bestTitle
@@ -174,6 +225,7 @@ public actor DownloadManager {
                 Task { await spider.cancelAll() }
             }
             activeTask = nil
+            await listener?.onDownloadPause(gid: gid, title: title ?? "")
         }
 
         downloadQueue.removeAll { $0.gallery.gid == gid }
@@ -205,12 +257,14 @@ public actor DownloadManager {
     }
 
     /// 获取所有下载任务
-    public func getAllTasks() -> [DownloadTask] {
-        downloadQueue
+    public func getAllTasks() async -> [DownloadTask] {
+        await ensureInitialQueueLoaded()
+        return downloadQueue
     }
 
     /// 获取任务状态
-    public func getTaskState(gid: Int64) -> Int {
+    public func getTaskState(gid: Int64) async -> Int {
+        await ensureInitialQueueLoaded()
         if activeTask?.gallery.gid == gid {
             return activeTask?.state ?? Self.stateNone
         }
@@ -218,7 +272,8 @@ public actor DownloadManager {
     }
 
     /// 更改下载标签 (对齐 Android DownloadManager.changeLabel)
-    public func changeLabel(gids: [Int64], label: String?) {
+    public func changeLabel(gids: [Int64], label: String?) async {
+        await ensureInitialQueueLoaded()
         for gid in gids {
             if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
                 downloadQueue[index].label = label
@@ -257,10 +312,12 @@ public actor DownloadManager {
         }
         activeTask = nil
         isRunning = false
+        Task { await listener?.onDownloadPause(gid: task.gallery.gid, title: task.gallery.bestTitle) }
     }
 
     /// 恢复队列处理 (用于 BGProcessingTask 唤醒时)
-    public func resumeAllWaiting() {
+    public func resumeAllWaiting() async {
+        await ensureInitialQueueLoaded()
         guard !isRunning else { return }
         if downloadQueue.contains(where: { $0.state == Self.stateWait }) {
             processQueue()
@@ -282,13 +339,14 @@ public actor DownloadManager {
         downloadQueue[nextIndex].state = Self.stateDownload
         activeTask = downloadQueue[nextIndex]
 
-        Task {
-            await executeDownload(index: nextIndex)
-        }
+        let gid = downloadQueue[nextIndex].gallery.gid
+        Task { await executeDownload(gid: gid) }
     }
 
-    private func executeDownload(index: Int) async {
-        guard index < downloadQueue.count else { return }
+    private func executeDownload(gid: Int64) async {
+        guard let initialIndex = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) else {
+            return
+        }
 
         // iOS: 申请后台执行时间, 防止进入后台后 ~30 秒被系统杀死
         #if canImport(UIKit)
@@ -299,7 +357,7 @@ public actor DownloadManager {
         }
         #endif
 
-        let gallery = downloadQueue[index].gallery
+        let gallery = downloadQueue[initialIndex].gallery
         let dir = galleryDirectory(gid: gallery.gid, title: gallery.bestTitle)
 
         // 通知监听器下载开始
@@ -322,7 +380,12 @@ public actor DownloadManager {
 
         // 创建 SpiderQueen
         let spider = SpiderQueen(galleryInfo: gallery, spiderInfo: spiderInfo, mode: .download)
-        downloadQueue[index].spider = spider
+        if let currentIndex = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
+            downloadQueue[currentIndex].spider = spider
+        }
+        if activeTask?.gallery.gid == gid {
+            activeTask?.spider = spider
+        }
 
         // 设置代理以便更新 .ehviewer 文件和进度通知
         let updater = SpiderInfoUpdater(
@@ -353,11 +416,28 @@ public actor DownloadManager {
             }
         }
 
+        // 下载期间任务可能被暂停、删除，或队列顺序发生变化。按 gid
+        // 重新定位，并且只允许仍处于下载状态的任务提交最终结果。
+        guard let finalIndex = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) else {
+            if activeTask?.gallery.gid == gid { activeTask = nil }
+            processQueue()
+            return
+        }
+        guard downloadQueue[finalIndex].state == Self.stateDownload else {
+            if activeTask?.gallery.gid == gid { activeTask = nil }
+            processQueue()
+            return
+        }
+
         // 下载完成
-        let success = finishedCount == gallery.pages
-        downloadQueue[index].state = success ? Self.stateFinish : Self.stateFailed
-        downloadQueue[index].downloadedPages = finishedCount
-        try? EhDatabase.shared.updateDownloadState(gid: gallery.gid, state: downloadQueue[index].state)
+        let completionState = DownloadTaskLifecycle.completionState(
+            finishedPages: finishedCount,
+            totalPages: gallery.pages
+        )
+        let success = completionState == Self.stateFinish
+        downloadQueue[finalIndex].state = completionState
+        downloadQueue[finalIndex].downloadedPages = finishedCount
+        try? EhDatabase.shared.updateDownloadState(gid: gallery.gid, state: downloadQueue[finalIndex].state)
 
         // 通知监听器下载完成
         await listener?.onDownloadFinish(gid: gallery.gid, title: gallery.bestTitle, success: success)
@@ -369,7 +449,7 @@ public actor DownloadManager {
         }
         #endif
 
-        activeTask = nil
+        if activeTask?.gallery.gid == gid { activeTask = nil }
         processQueue()
     }
 
@@ -406,7 +486,8 @@ public actor DownloadManager {
     // MARK: - 下载状态真实检查 (Fix D-2, B-1)
 
     /// 检查画廊是否已完整下载 — 同时验证数据库状态 AND 磁盘文件存在
-    public func isGalleryFullyDownloaded(gid: Int64) -> Bool {
+    public func isGalleryFullyDownloaded(gid: Int64) async -> Bool {
+        await ensureInitialQueueLoaded()
         guard let task = downloadQueue.first(where: { $0.gallery.gid == gid }),
               task.state == Self.stateFinish else { return false }
         let dir = galleryDirectory(gid: gid, title: task.gallery.bestTitle)
@@ -414,9 +495,112 @@ public actor DownloadManager {
     }
 
     /// 获取已下载画廊的目录路径 (由 ReaderViewModel 调用，替代硬编码路径)
-    public func getDownloadedGalleryDirectory(gid: Int64) -> URL? {
+    public func getDownloadedGalleryDirectory(gid: Int64) async -> URL? {
+        await ensureInitialQueueLoaded()
         guard let task = downloadQueue.first(where: { $0.gallery.gid == gid }) else { return nil }
         return galleryDirectory(gid: gid, title: task.gallery.bestTitle)
+    }
+}
+
+/// URL bookmark 解析与 security-scope 生命周期集中在一个加锁对象中。
+/// `downloadDirectory` 是 nonisolated 热路径，不能依赖 actor hop。
+private final class DownloadDirectoryResolver: @unchecked Sendable {
+    static let shared = DownloadDirectoryResolver()
+    static let bookmarkKey = "downloadDirectoryBookmark"
+
+    private let lock = NSLock()
+    private var cachedBookmark: Data?
+    private var cachedURL: URL?
+    private var holdsSecurityScope = false
+    private var hasResolved = false
+
+    func resolve() -> URL? {
+        let bookmark = UserDefaults.standard.data(forKey: Self.bookmarkKey)
+        lock.lock()
+        defer { lock.unlock() }
+
+        if hasResolved, bookmark == cachedBookmark {
+            return cachedURL
+        }
+        releaseCachedScope()
+        cachedBookmark = bookmark
+        hasResolved = true
+
+        guard let bookmark else {
+            // 兼容旧版 macOS 设置；下一次选择目录后会自动迁移到 bookmark。
+            if let path = UserDefaults.standard.string(forKey: "downloadPath"), !path.isEmpty {
+                let url = URL(fileURLWithPath: path, isDirectory: true)
+                cachedURL = url
+                return url
+            }
+            return nil
+        }
+
+        do {
+            var isStale = false
+            #if os(macOS)
+            let url = try URL(
+                resolvingBookmarkData: bookmark,
+                options: .withSecurityScope,
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+            #else
+            let url = try URL(
+                resolvingBookmarkData: bookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+            #endif
+            holdsSecurityScope = url.startAccessingSecurityScopedResource()
+            cachedURL = url
+            return url
+        } catch {
+            cachedURL = nil
+            return nil
+        }
+    }
+
+    func invalidate() {
+        lock.lock()
+        releaseCachedScope()
+        cachedBookmark = nil
+        hasResolved = false
+        lock.unlock()
+    }
+
+    private func releaseCachedScope() {
+        if holdsSecurityScope, let cachedURL {
+            cachedURL.stopAccessingSecurityScopedResource()
+        }
+        holdsSecurityScope = false
+        cachedURL = nil
+    }
+}
+
+/// 下载任务生命周期中的纯状态转换。
+/// 与文件、数据库和网络无关，因此可以稳定地覆盖异常退出、失败重试和
+/// 完成判定，而不需要在单元测试中真正启动 Spider。
+public enum DownloadTaskLifecycle: Sendable {
+    /// 进程退出后不存在仍可继续工作的 Spider；下载中状态必须恢复为等待。
+    public static func recoveredState(from persistedState: Int) -> Int {
+        persistedState == DownloadManager.stateDownload
+            ? DownloadManager.stateWait
+            : persistedState
+    }
+
+    /// 用户开始同一画廊时，仅暂停或失败任务可以被恢复；等待、下载中和
+    /// 已完成任务保持幂等，避免重复排队。
+    public static func canResume(from state: Int) -> Bool {
+        state == DownloadManager.stateNone || state == DownloadManager.stateFailed
+    }
+
+    public static func completionState(finishedPages: Int, totalPages: Int) -> Int {
+        guard totalPages > 0, finishedPages == totalPages else {
+            return DownloadManager.stateFailed
+        }
+        return DownloadManager.stateFinish
     }
 }
 
@@ -530,9 +714,16 @@ public protocol DownloadListener: AnyObject, Sendable {
     /// 下载完成
     func onDownloadFinish(gid: Int64, title: String, success: Bool) async
 
+    /// 下载被用户或系统暂停
+    func onDownloadPause(gid: Int64, title: String) async
+
     /// 509错误
     func on509Error() async
 
     /// 磁盘空间不足
     func onDiskFull() async
+}
+
+public extension DownloadListener {
+    func onDownloadPause(gid: Int64, title: String) async {}
 }

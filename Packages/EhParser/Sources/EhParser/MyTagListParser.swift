@@ -28,10 +28,13 @@ public enum MyTagListParser {
             return list
         }
 
-        let tags = outer.children()
-        // 跳过第一个元素 (header)
-        for i in 1..<tags.size() {
-            let tag = tags.get(i)
+        // The site has used both direct children and nested wrappers for user
+        // tag rows. Selecting by the stable row id avoids silently returning an
+        // empty list when that surrounding markup changes.
+        let rows = try outer.select("[id^=usertag_]").filter { element in
+            element.id().dropFirst("usertag_".count).allSatisfy(\.isNumber)
+        }
+        for tag in rows {
             if let userTag = parseUserTag(tag) {
                 list.userTags.append(userTag)
             }
@@ -46,27 +49,40 @@ public enum MyTagListParser {
             let userTagId = tag.id()
             let id = String(userTagId.dropFirst("usertag_".count))
 
-            // tagName: #tagpreview{id} 的 title 属性
-            let nameId = "tagpreview\(id)"
-            let tagName = try tag.getElementById(nameId)?.attr("title") ?? ""
+            // Both tagpreview{id} and tagpreview_{id} have existed. Fall back
+            // to the row's first tagpreview element and its visible text.
+            let preview = try tag.getElementById("tagpreview\(id)")
+                ?? tag.getElementById("tagpreview_\(id)")
+                ?? tag.select("[id^=tagpreview]").first()
+            let title = try preview?.attr("title") ?? ""
+            let tagName = title.isEmpty ? (try preview?.text() ?? "") : title
+            guard !tagName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
 
             // watched: #tagwatch{id} 的 checked 属性
-            let watchId = "tagwatch\(id)"
-            let watchInput = try tag.getElementById(watchId)
-            let watched = (try watchInput?.attr("checked")) == "checked"
+            let watchInput = try tag.getElementById("tagwatch\(id)")
+                ?? tag.getElementById("tagwatch_\(id)")
+                ?? tag.select("[id^=tagwatch]").first()
+            let watched = watchInput?.hasAttr("checked") == true
 
             // hidden: #taghide{id} 的 checked 属性
-            let hideId = "taghide\(id)"
-            let hideInput = try tag.getElementById(hideId)
-            let hidden = (try hideInput?.attr("checked")) == "checked"
+            let hideInput = try tag.getElementById("taghide\(id)")
+                ?? tag.getElementById("taghide_\(id)")
+                ?? tag.select("[id^=taghide]").first()
+            let hidden = hideInput?.hasAttr("checked") == true
 
             // color: #tagcolor{id} 的 placeholder 属性
-            let colorId = "tagcolor\(id)"
-            let color = try tag.getElementById(colorId)?.attr("placeholder")
+            let colorInput = try tag.getElementById("tagcolor\(id)")
+                ?? tag.getElementById("tagcolor_\(id)")
+                ?? tag.select("[id^=tagcolor]").first()
+            let color = try colorInput?.attr("placeholder")
 
             // tagWeight: #tagweight{id} 的 value 属性
-            let weightId = "tagweight\(id)"
-            let weightString = try tag.getElementById(weightId)?.attr("value") ?? "0"
+            let weightInput = try tag.getElementById("tagweight\(id)")
+                ?? tag.getElementById("tagweight_\(id)")
+                ?? tag.select("[id^=tagweight]").first()
+            let weightString = try weightInput?.attr("value") ?? "0"
             let tagWeight = Int(weightString) ?? 0
 
             return UserTag(

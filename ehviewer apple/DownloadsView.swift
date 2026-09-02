@@ -9,6 +9,7 @@ import SwiftUI
 import EhModels
 import EhDownload
 import EhDatabase
+import EhSettings
 #if os(macOS)
 import AppKit
 #endif
@@ -24,10 +25,27 @@ enum DownloadStatusFilter: String, CaseIterable, Identifiable {
     case failed = "失败"
 
     var id: String { rawValue }
+    var localizedTitle: String { AppLocalization.localized(rawValue) }
 }
 
 struct DownloadsView: View {
     @State private var vm = DownloadsViewModel()
+    @Environment(\.readerPresentationAction) private var readerPresentationAction
+
+    /// 嵌入父级导航栈时不再创建嵌套的 `NavigationStack`。
+    private let isPushed: Bool
+
+    init(isPushed: Bool = false) {
+        self.isPushed = isPushed
+    }
+
+    private var floatingHeaderInset: CGFloat {
+        #if os(macOS)
+        104
+        #else
+        isPushed ? 104 : 44
+        #endif
+    }
 
     // MARK: - 标签/搜索/过滤
     @State private var labels: [DownloadLabelRecord] = []
@@ -40,6 +58,9 @@ struct DownloadsView: View {
     @State private var isSelectMode = false
     @State private var selectedGids: Set<Int64> = []
     @State private var showBatchDeleteConfirm = false
+    /// 单项删除确认必须由页面持有。若把 confirmationDialog 放在可滑动行
+    /// 内，List 收起 swipe 时可能重建/回收该行，菜单会随宿主一起消失。
+    @State private var pendingDeleteTask: DownloadTask?
     @State private var showMoveLabelSheet = false
 
     // MARK: - 标签管理
@@ -52,14 +73,34 @@ struct DownloadsView: View {
     @State private var deletingLabel: DownloadLabelRecord?
 
     // MARK: - 阅读器 (fullScreenCover 呈现，隐藏导航栏)
+    #if os(iOS)
     @State private var readerGallery: GalleryInfo?
+    #else
+    @Environment(\.openWindow) private var openWindow
+    #endif
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                // 标签选择栏
-                labelPicker
+        Group {
+            if isPushed {
+                downloadsContent
+            } else {
+                NavigationStack {
+                    downloadsContent
+                }
+            }
+        }
+        .task {
+            await vm.loadTasks()
+            await loadLabels()
+        }
+        .onDisappear {
+            vm.stopRefreshing()
+        }
+    }
 
+    private var downloadsContent: some View {
+        ZStack(alignment: .top) {
+            Group {
                 // 内容
                 if filteredTasks.isEmpty {
                     ContentUnavailableView(
@@ -67,21 +108,44 @@ struct DownloadsView: View {
                         systemImage: "arrow.down.circle",
                         description: Text(emptyDescription)
                     )
-                    .frame(maxHeight: .infinity)
+                    .padding(.top, floatingHeaderInset)
                 } else {
                     downloadList
                 }
             }
-            .navigationTitle("下载")
+
+            VStack(spacing: 0) {
+                if isPushed {
+                    ContentColumnSearchBar(text: $searchText, prompt: "搜索下载", isFloating: true) {
+                        mainToolbarMenu
+                            .glassEffect(.regular.interactive(), in: .capsule)
+                    }
+                } else {
+                    #if os(macOS)
+                    ContentColumnSearchBar(text: $searchText, prompt: "搜索下载", isFloating: true) {
+                        mainToolbarMenu
+                            .glassEffect(.regular.interactive(), in: .capsule)
+                    }
+                    #endif
+                }
+
+                // 标签选择栏
+                labelPicker
+            }
+            .zIndex(10)
+        }
+        .navigationTitle("下载")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .searchable(text: $searchText, prompt: "搜索下载")
+            .searchableWhen(!isPushed, text: $searchText, prompt: "搜索下载")
             .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    mainToolbarMenu
+                if !isPushed {
+                    ToolbarItem(placement: .automatic) {
+                        mainToolbarMenu
+                    }
                 }
             }
+            #endif
             // 批量移动标签 Sheet
             .sheet(isPresented: $showMoveLabelSheet) {
                 batchMoveLabelSheet
@@ -93,6 +157,24 @@ struct DownloadsView: View {
                 }
                 Button("删除记录和文件", role: .destructive) {
                     batchDelete(withFiles: true)
+                }
+            }
+            .confirmationDialog(
+                "确认删除“\(pendingDeleteTask?.gallery.bestTitle ?? "该下载")”？",
+                isPresented: Binding(
+                    get: { pendingDeleteTask != nil },
+                    set: { if !$0 { pendingDeleteTask = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("仅删除记录", role: .destructive) {
+                    deletePendingTask(withFiles: false)
+                }
+                Button("删除记录和文件", role: .destructive) {
+                    deletePendingTask(withFiles: true)
+                }
+                Button("取消", role: .cancel) {
+                    pendingDeleteTask = nil
                 }
             }
             // 新建标签
@@ -116,17 +198,12 @@ struct DownloadsView: View {
                 }
             }
             // 删除标签确认
-            .confirmationDialog("确认删除标签「\(deletingLabel?.label ?? "")」？\n该标签下的下载将移至默认分组。", isPresented: $showDeleteLabelConfirm, titleVisibility: .visible) {
+        .confirmationDialog("确认删除标签「\(deletingLabel?.label ?? "")」？\n该标签下的下载将移至默认分组。", isPresented: $showDeleteLabelConfirm, titleVisibility: .visible) {
                 Button("删除", role: .destructive) {
                     if let label = deletingLabel {
                         deleteLabel(label)
                     }
                 }
-            }
-        }
-        .task {
-            await vm.loadTasks()
-            loadLabels()
         }
     }
 
@@ -172,23 +249,24 @@ struct DownloadsView: View {
 
     private var emptyTitle: String {
         if selectedLabel != nil || statusFilter != .all || !searchText.isEmpty {
-            return "无匹配下载"
+            return AppLocalization.localized("无匹配下载")
         }
-        return "暂无下载"
+        return AppLocalization.localized("暂无下载")
     }
 
     private var emptyDescription: String {
         if selectedLabel != nil || statusFilter != .all || !searchText.isEmpty {
-            return "试试更换筛选条件"
+            return AppLocalization.localized("试试更换筛选条件")
         }
-        return "在画廊详情页点击下载按钮"
+        return AppLocalization.localized("在画廊详情页点击下载按钮")
     }
 
     // MARK: - 标签选择栏 (对齐 Android DownloadsScene Label Drawer)
 
     private var labelPicker: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
                 // 全部
                 labelChip(title: "全部", isSelected: selectedLabel == nil) {
                     selectedLabel = nil
@@ -229,29 +307,25 @@ struct DownloadsView: View {
                 Button {
                     showNewLabelAlert = true
                 } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(Color.accentColor)
+                    Image(systemName: "plus")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
                 }
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .background(.bar)
+        .scrollClipDisabled()
     }
 
     private func labelChip(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        LiquidGlassFilterChip(isSelected: isSelected, action: action) {
             Text(title)
-                .font(.subheadline)
-                .fontWeight(isSelected ? .semibold : .regular)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(isSelected ? Color.accentColor : Color(.tertiarySystemFill))
-                .foregroundStyle(isSelected ? .white : .primary)
-                .clipShape(Capsule())
         }
-        .buttonStyle(.plain)
     }
 
     private func countForFilter(_ filter: DownloadStatusFilter) -> Int {
@@ -293,7 +367,7 @@ struct DownloadsView: View {
                     }
                 } label: {
                     let allGids = Set(filteredTasks.map { $0.gallery.gid })
-                    Label(selectedGids == allGids ? "取消全选" : "全选",
+                    Label(AppLocalization.localized(selectedGids == allGids ? "取消全选" : "全选"),
                           systemImage: selectedGids == allGids ? "square" : "checkmark.square")
                 }
 
@@ -347,9 +421,9 @@ struct DownloadsView: View {
                     ForEach(DownloadStatusFilter.allCases) { filter in
                         let count = countForFilter(filter)
                         if filter == .all {
-                            Text(filter.rawValue).tag(filter)
+                            Text(filter.localizedTitle).tag(filter)
                         } else {
-                            Text("\(filter.rawValue) (\(count))").tag(filter)
+                            Text(AppLocalization.format("%@ (%lld)", filter.localizedTitle, count)).tag(filter)
                         }
                     }
                 }
@@ -386,48 +460,85 @@ struct DownloadsView: View {
                 }
             }
         } label: {
-            Image(systemName: isSelectMode ? "checkmark.circle.fill" : "ellipsis.circle")
+            Label(
+                AppLocalization.localized(isSelectMode ? "选择中" : "管理"),
+                systemImage: isSelectMode ? "checkmark" : "slider.horizontal.3"
+            )
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 13)
+            .frame(height: 40)
+            .contentShape(Capsule())
         }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
     }
 
     // MARK: - 下载列表
 
     private var downloadList: some View {
         List {
+            Color.clear
+                .frame(height: floatingHeaderInset)
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
             ForEach(filteredTasks, id: \.gallery.gid) { task in
                 if isSelectMode {
-                    Button {
-                        toggleSelection(gid: task.gallery.gid)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: selectedGids.contains(task.gallery.gid) ? "checkmark.circle.fill" : "circle")
-                                .font(.title3)
-                                .foregroundStyle(selectedGids.contains(task.gallery.gid) ? Color.accentColor : Color.secondary)
+                    HStack(spacing: 12) {
+                        Image(systemName: selectedGids.contains(task.gallery.gid) ? "checkmark.circle.fill" : "circle")
+                            .font(.title3)
+                            .foregroundStyle(selectedGids.contains(task.gallery.gid) ? Color.accentColor : Color.secondary)
 
-                            DownloadTaskRow(task: task) {
-                                vm.pauseTask(gid: task.gallery.gid)
-                            } onResume: {
-                                vm.resumeTask(gid: task.gallery.gid)
-                            } onDelete: { withFiles in
-                                vm.deleteTask(gid: task.gallery.gid, withFiles: withFiles)
-                            }
-                        }
+                        DownloadTaskRow(
+                            task: task,
+                            fileSize: vm.fileSizes[task.gallery.gid],
+                            showsInlineControl: false,
+                            onPause: { vm.pauseTask(gid: task.gallery.gid) },
+                            onResume: { vm.resumeTask(gid: task.gallery.gid) },
+                            onRequestDelete: { pendingDeleteTask = task }
+                        )
                     }
-                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    // DownloadTaskRow 自身还有右键/滑动手势；选择手势
+                    // 使用高优先级，确保点整行而不是只点圆圈都能选中。
+                    .highPriorityGesture(
+                        TapGesture().onEnded { toggleSelection(gid: task.gallery.gid) }
+                    )
                 } else {
                     // 点击打开阅读器 (使用 fullScreenCover 避免导航栏残留)
-                    Button {
-                        readerGallery = task.gallery
-                    } label: {
-                        DownloadTaskRow(task: task) {
-                            vm.pauseTask(gid: task.gallery.gid)
-                        } onResume: {
-                            vm.resumeTask(gid: task.gallery.gid)
-                        } onDelete: { withFiles in
-                            vm.deleteTask(gid: task.gallery.gid, withFiles: withFiles)
+                    DownloadTaskRow(
+                        task: task,
+                        fileSize: vm.fileSizes[task.gallery.gid],
+                        onOpen: {
+                        #if os(iOS)
+                        let route = ReaderWindowRoute(
+                            gid: task.gallery.gid,
+                            token: task.gallery.token,
+                            pages: task.gallery.pages,
+                            previewSet: nil,
+                            initialPage: nil
+                        )
+                        if let readerPresentationAction {
+                            readerPresentationAction.present(route)
+                        } else {
+                            readerGallery = task.gallery
                         }
-                    }
-                    .buttonStyle(.plain)
+                        #else
+                        openWindow(value: ReaderWindowRoute(
+                            gid: task.gallery.gid,
+                            token: task.gallery.token,
+                            pages: task.gallery.pages,
+                            previewSet: nil,
+                            initialPage: nil
+                        ))
+                        #endif
+                        },
+                        onPause: { vm.pauseTask(gid: task.gallery.gid) },
+                        onResume: { vm.resumeTask(gid: task.gallery.gid) },
+                        onRequestDelete: { pendingDeleteTask = task }
+                    )
                 }
             }
         }
@@ -436,12 +547,6 @@ struct DownloadsView: View {
         .fullScreenCover(item: $readerGallery) { gallery in
             ImageReaderView(gid: gallery.gid, token: gallery.token, pages: gallery.pages)
                 .id(gallery.gid)
-        }
-        #else
-        .sheet(item: $readerGallery) { gallery in
-            ImageReaderView(gid: gallery.gid, token: gallery.token, pages: gallery.pages)
-                .id(gallery.gid)
-                .frame(minWidth: 800, minHeight: 600)
         }
         #endif
     }
@@ -497,16 +602,24 @@ struct DownloadsView: View {
         selectedGids.removeAll()
     }
 
+    private func deletePendingTask(withFiles: Bool) {
+        guard let task = pendingDeleteTask else { return }
+        pendingDeleteTask = nil
+        vm.deleteTask(gid: task.gallery.gid, withFiles: withFiles)
+    }
+
     // MARK: - 标签管理
 
-    private func loadLabels() {
-        labels = (try? EhDatabase.shared.getAllDownloadLabels()) ?? []
+    private func loadLabels() async {
+        labels = await Task.detached(priority: .userInitiated) {
+            (try? EhDatabase.shared.getAllDownloadLabels()) ?? []
+        }.value
     }
 
     private func createLabel(_ name: String) {
         guard !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         try? EhDatabase.shared.insertDownloadLabel(name.trimmingCharacters(in: .whitespaces))
-        loadLabels()
+        Task { await loadLabels() }
     }
 
     private func renameLabel(_ record: DownloadLabelRecord, newName: String) {
@@ -526,7 +639,7 @@ struct DownloadsView: View {
         if selectedLabel == oldLabel {
             selectedLabel = updated.label
         }
-        loadLabels()
+        Task { await loadLabels() }
     }
 
     private func deleteLabel(_ record: DownloadLabelRecord) {
@@ -542,7 +655,7 @@ struct DownloadsView: View {
 
         try? EhDatabase.shared.deleteDownloadLabel(id: id)
         if selectedLabel == labelName { selectedLabel = nil }
-        loadLabels()
+        Task { await loadLabels() }
     }
 
     // MARK: - 批量操作
@@ -590,16 +703,21 @@ struct DownloadsView: View {
 
 struct DownloadTaskRow: View {
     let task: DownloadTask
+    let fileSize: Int64?
+    var showsInlineControl = true
+    var onOpen: (() -> Void)?
     let onPause: () -> Void
     let onResume: () -> Void
-    let onDelete: (_ withFiles: Bool) -> Void
-
-    @State private var showDeleteConfirm = false
+    let onRequestDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             // 封面
-            CachedAsyncImage(url: URL(string: task.gallery.thumb ?? "")) { img in
+            CachedAsyncImage(url: ThumbnailURLResolver.url(
+                for: task.gallery.thumb,
+                fixLegacy: AppSettings.shared.fixThumbUrl,
+                site: AppSettings.shared.gallerySite
+            )) { img in
                 img.resizable().aspectRatio(contentMode: .fill)
             } placeholder: {
                 Color(.tertiarySystemFill)
@@ -622,7 +740,7 @@ struct DownloadTaskRow: View {
 
                     Spacer()
 
-                    Text("\(task.gallery.pages) 页")
+                    Text(summaryText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -644,8 +762,25 @@ struct DownloadTaskRow: View {
                     }
                 }
             }
+
+            if showsInlineControl, task.state != DownloadManager.stateFinish {
+                Button {
+                    isActive ? onPause() : onResume()
+                } label: {
+                    Image(systemName: isActive ? "pause.fill" : "play.fill")
+                        .font(.callout.weight(.semibold))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isActive ? .orange : .green)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .help(AppLocalization.localized(isActive ? "暂停" : "开始"))
+                .accessibilityLabel(AppLocalization.localized(isActive ? "暂停下载" : "开始下载"))
+            }
         }
         .contentShape(Rectangle())
+        .onTapGesture { onOpen?() }
         .contextMenu {
             // 暂停/恢复
             if task.state == DownloadManager.stateDownload || task.state == DownloadManager.stateWait {
@@ -666,7 +801,7 @@ struct DownloadTaskRow: View {
 
             // 删除
             Button(role: .destructive) {
-                showDeleteConfirm = true
+                onRequestDelete()
             } label: {
                 Label("删除", systemImage: "trash")
             }
@@ -687,7 +822,7 @@ struct DownloadTaskRow: View {
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button(role: .destructive) {
-                showDeleteConfirm = true
+                onRequestDelete()
             } label: {
                 Label("删除", systemImage: "trash")
             }
@@ -709,14 +844,10 @@ struct DownloadTaskRow: View {
                 .tint(.green)
             }
         }
-        .confirmationDialog("确认删除下载？", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
-            Button("仅删除记录", role: .destructive) {
-                onDelete(false)
-            }
-            Button("删除记录和文件", role: .destructive) {
-                onDelete(true)
-            }
-        }
+    }
+
+    private var isActive: Bool {
+        task.state == DownloadManager.stateDownload || task.state == DownloadManager.stateWait
     }
 
     private var statusIcon: some View {
@@ -744,11 +875,11 @@ struct DownloadTaskRow: View {
 
     private var statusText: String {
         switch task.state {
-        case DownloadManager.stateDownload: return "下载中"
-        case DownloadManager.stateWait: return "等待中"
-        case DownloadManager.stateFinish: return "已完成"
-        case DownloadManager.stateFailed: return "失败"
-        default: return "已暂停"
+        case DownloadManager.stateDownload: return AppLocalization.localized("下载中")
+        case DownloadManager.stateWait: return AppLocalization.localized("等待中")
+        case DownloadManager.stateFinish: return AppLocalization.localized("已完成")
+        case DownloadManager.stateFailed: return AppLocalization.localized("失败")
+        default: return AppLocalization.localized("已暂停")
         }
     }
 
@@ -756,18 +887,34 @@ struct DownloadTaskRow: View {
         guard task.gallery.pages > 0 else { return 0 }
         return Double(task.downloadedPages) / Double(task.gallery.pages)
     }
+
+    private var summaryText: String {
+        guard let fileSize else { return AppLocalization.format("%lld 页", task.gallery.pages) }
+        return AppLocalization.format(
+            "%lld 页 · %@",
+            task.gallery.pages,
+            fileSize.formatted(.byteCount(style: .file).locale(AppLocalization.locale))
+        )
+    }
 }
 
 // MARK: - ViewModel
 
+@MainActor
 @Observable
 class DownloadsViewModel {
     var tasks: [DownloadTask] = []
-    /// 进度刷新定时器 (有活跃下载时每秒刷新)
-    private var refreshTimer: Timer?
+    /// 从磁盘异步计算的实际文件大小。它不参与每秒任务状态轮询。
+    var fileSizes: [Int64: Int64] = [:]
+    /// 有活跃下载时运行的可取消进度刷新任务。
+    private var refreshTask: Task<Void, Never>?
+    private var fileSizeTask: Task<Void, Never>?
+    private var refreshTick = 0
 
     func loadTasks() async {
-        tasks = await DownloadManager.shared.getAllTasks()
+        let latestTasks = await DownloadManager.shared.getAllTasks()
+        apply(latestTasks)
+        refreshFileSizes(for: latestTasks, includeActive: true)
         updateRefreshTimer()
     }
 
@@ -777,25 +924,40 @@ class DownloadsViewModel {
             $0.state == DownloadManager.stateDownload || $0.state == DownloadManager.stateWait
         })
 
-        if hasActive && refreshTimer == nil {
-            refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                Task { @MainActor in
-                    self.tasks = await DownloadManager.shared.getAllTasks()
-                    // 如果没有活跃下载了，停止定时器
-                    let stillActive = self.tasks.contains(where: {
+        if hasActive && refreshTask == nil {
+            refreshTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: .seconds(1))
+                    } catch {
+                        return
+                    }
+                    guard let self else { return }
+                    let latestTasks = await DownloadManager.shared.getAllTasks()
+                    self.apply(latestTasks)
+                    self.refreshTick += 1
+                    if self.refreshTick.isMultiple(of: 3) {
+                        self.refreshFileSizes(for: latestTasks, includeActive: true)
+                    }
+                    let stillActive = latestTasks.contains {
                         $0.state == DownloadManager.stateDownload || $0.state == DownloadManager.stateWait
-                    })
+                    }
                     if !stillActive {
-                        self.refreshTimer?.invalidate()
-                        self.refreshTimer = nil
+                        self.refreshTask = nil
+                        return
                     }
                 }
             }
         } else if !hasActive {
-            refreshTimer?.invalidate()
-            refreshTimer = nil
+            stopRefreshing()
         }
+    }
+
+    func stopRefreshing() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        fileSizeTask?.cancel()
+        fileSizeTask = nil
     }
 
     func pauseTask(gid: Int64) {
@@ -845,6 +1007,95 @@ class DownloadsViewModel {
             }
             await loadTasks()
         }
+    }
+
+    /// 只有展示相关字段发生变化时才替换数组，避免相同的一秒轮询结果
+    /// 触发整个 List 重新求值和图片视图更新。
+    private func apply(_ latestTasks: [DownloadTask]) {
+        let hasSamePresentation = tasks.count == latestTasks.count
+            && zip(tasks, latestTasks).allSatisfy { old, new in
+                old.gallery.gid == new.gallery.gid
+                    && old.gallery.bestTitle == new.gallery.bestTitle
+                    && old.gallery.pages == new.gallery.pages
+                    && old.state == new.state
+                    && old.downloadedPages == new.downloadedPages
+                    && old.label == new.label
+            }
+
+        if !hasSamePresentation {
+            tasks = latestTasks
+        }
+
+        let liveGIDs = Set(latestTasks.map { $0.gallery.gid })
+        if fileSizes.keys.contains(where: { !liveGIDs.contains($0) }) {
+            fileSizes = fileSizes.filter { liveGIDs.contains($0.key) }
+        }
+    }
+
+    private func refreshFileSizes(for tasks: [DownloadTask], includeActive: Bool) {
+        guard fileSizeTask == nil else { return }
+        let baseDirectory = DownloadManager.shared.downloadDirectory
+        let inputs = tasks.compactMap { task -> FileSizeInput? in
+            let isActive = task.state == DownloadManager.stateDownload
+                || task.state == DownloadManager.stateWait
+            guard fileSizes[task.gallery.gid] == nil || (includeActive && isActive) else {
+                return nil
+            }
+            let directoryName = DownloadManager.galleryDirectoryName(
+                gid: task.gallery.gid,
+                title: task.gallery.bestTitle
+            )
+            return FileSizeInput(
+                gid: task.gallery.gid,
+                directory: baseDirectory.appendingPathComponent(directoryName)
+            )
+        }
+        guard !inputs.isEmpty else { return }
+
+        fileSizeTask = Task { [weak self] in
+            let measured = await Task.detached(priority: .utility) {
+                Self.measureFileSizes(inputs)
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            self.fileSizes.merge(measured, uniquingKeysWith: { _, latest in latest })
+            self.fileSizeTask = nil
+        }
+    }
+
+    nonisolated private static func measureFileSizes(_ inputs: [FileSizeInput]) -> [Int64: Int64] {
+        let fileManager = FileManager.default
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey
+        ]
+        var result: [Int64: Int64] = [:]
+        result.reserveCapacity(inputs.count)
+
+        for input in inputs {
+            guard let enumerator = fileManager.enumerator(
+                at: input.directory,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else {
+                result[input.gid] = 0
+                continue
+            }
+
+            var total: Int64 = 0
+            for case let fileURL as URL in enumerator {
+                guard let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                      values.isRegularFile == true
+                else { continue }
+                total += Int64(values.fileSize ?? 0)
+            }
+            result[input.gid] = total
+        }
+        return result
+    }
+
+    private struct FileSizeInput: Sendable {
+        let gid: Int64
+        let directory: URL
     }
 }
 

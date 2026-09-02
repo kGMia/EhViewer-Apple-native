@@ -68,28 +68,43 @@ public final class AppSettings: @unchecked Sendable {
         set { _defaults.set(max(1, min(10, newValue)), forKey: "multi_thread_download") }
     }
 
-    @ObservationIgnored
     public var preloadImage: Int {
-        get { _defaults.object(forKey: "preload_image") as? Int ?? 5 }
-        set { _defaults.set(newValue, forKey: "preload_image") }
+        get {
+            access(keyPath: \.preloadImage)
+            return min(10, max(1, _defaults.object(forKey: "preload_image") as? Int ?? 5))
+        }
+        set {
+            let normalized = min(10, max(1, newValue))
+            guard normalized != preloadImage else { return }
+            withMutation(keyPath: \.preloadImage) {
+                _defaults.set(normalized, forKey: "preload_image")
+            }
+        }
     }
 
     @ObservationIgnored
     public var downloadDelay: Int {
-        get { _defaults.integer(forKey: "download_delay") }
-        set { _defaults.set(newValue, forKey: "download_delay") }
+        get { min(2_000, max(0, _defaults.integer(forKey: "download_delay"))) }
+        set { _defaults.set(min(2_000, max(0, newValue)), forKey: "download_delay") }
     }
 
     @ObservationIgnored
     public var downloadTimeout: Int {
-        get { _defaults.object(forKey: "download_timeout") as? Int ?? 60 }
-        set { _defaults.set(newValue, forKey: "download_timeout") }
+        get { min(120, max(10, _defaults.object(forKey: "download_timeout") as? Int ?? 60)) }
+        set { _defaults.set(min(120, max(10, newValue)), forKey: "download_timeout") }
     }
 
-    @ObservationIgnored
     public var downloadOriginImage: Bool {
-        get { _defaults.bool(forKey: "download_origin_image") }
-        set { _defaults.set(newValue, forKey: "download_origin_image") }
+        get {
+            access(keyPath: \.downloadOriginImage)
+            return _defaults.bool(forKey: "download_origin_image")
+        }
+        set {
+            guard newValue != downloadOriginImage else { return }
+            withMutation(keyPath: \.downloadOriginImage) {
+                _defaults.set(newValue, forKey: "download_origin_image")
+            }
+        }
     }
 
     /// 图片分辨率 (对应 Android EhConfig.IMAGE_SIZE_*)
@@ -104,13 +119,19 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     // MARK: - 缓存
-    @ObservationIgnored
     public var readCacheSize: Int {
         get {
+            access(keyPath: \.readCacheSize)
             let v = _defaults.object(forKey: "read_cache_size") as? Int ?? 320
             return max(40, min(640, v))
         }
-        set { _defaults.set(max(40, min(640, newValue)), forKey: "read_cache_size") }
+        set {
+            let normalized = max(40, min(640, newValue))
+            guard normalized != readCacheSize else { return }
+            withMutation(keyPath: \.readCacheSize) {
+                _defaults.set(normalized, forKey: "read_cache_size")
+            }
+        }
     }
 
     // MARK: - 外观 (UI 联动)
@@ -180,23 +201,64 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     // MARK: - 外观 (UI 联动)
-    public var theme: Int {
+    public var appLanguage: AppLanguage {
         get {
-            access(keyPath: \.theme)
-            return _defaults.integer(forKey: "theme")
+            access(keyPath: \.appLanguage)
+            let rawValue = _defaults.string(forKey: "app_language") ?? AppLanguage.system.rawValue
+            return AppLanguage(rawValue: rawValue) ?? .system
         }
         set {
-            guard newValue != _defaults.integer(forKey: "theme") else { return }
-            withMutation(keyPath: \.theme) {
-                _defaults.set(newValue, forKey: "theme")
+            guard newValue.rawValue != (_defaults.string(forKey: "app_language") ?? AppLanguage.system.rawValue) else { return }
+            withMutation(keyPath: \.appLanguage) {
+                _defaults.set(newValue.rawValue, forKey: "app_language")
             }
         }
     }
 
-    @ObservationIgnored
+    /// 应用强调色。保留 `system` 以继续采用系统/Asset Catalog 的默认颜色；
+    /// 其他选项由 SwiftUI 根场景注入，因此无需重启即可刷新整个界面。
+    public var accentColor: AppAccentColor {
+        get {
+            access(keyPath: \.accentColor)
+            let rawValue = _defaults.string(forKey: "accent_color") ?? AppAccentColor.system.rawValue
+            return AppAccentColor(rawValue: rawValue) ?? .system
+        }
+        set {
+            guard newValue.rawValue != (_defaults.string(forKey: "accent_color") ?? AppAccentColor.system.rawValue) else { return }
+            withMutation(keyPath: \.accentColor) {
+                _defaults.set(newValue.rawValue, forKey: "accent_color")
+            }
+        }
+    }
+
+    public var theme: Int {
+        get {
+            access(keyPath: \.theme)
+            let value = _defaults.integer(forKey: "theme")
+            return (0...2).contains(value) ? value : 0
+        }
+        set {
+            let normalized = (0...2).contains(newValue) ? newValue : 0
+            guard normalized != theme else { return }
+            withMutation(keyPath: \.theme) {
+                _defaults.set(normalized, forKey: "theme")
+            }
+        }
+    }
+
     public var launchPage: Int {
-        get { _defaults.integer(forKey: "launch_page") }
-        set { _defaults.set(newValue, forKey: "launch_page") }
+        get {
+            access(keyPath: \.launchPage)
+            let value = _defaults.integer(forKey: "launch_page")
+            return (0...6).contains(value) ? value : 0
+        }
+        set {
+            let normalized = (0...6).contains(newValue) ? newValue : 0
+            guard normalized != launchPage else { return }
+            withMutation(keyPath: \.launchPage) {
+                _defaults.set(normalized, forKey: "launch_page")
+            }
+        }
     }
 
     @ObservationIgnored
@@ -275,10 +337,18 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     /// 大屏幕列表布局模式 (对齐 Android: 0=自适应双栏, 1=全宽单列表)
-    @ObservationIgnored
     public var wideScreenListMode: Int {
-        get { _defaults.integer(forKey: "wide_screen_list_mode") }
-        set { _defaults.set(newValue, forKey: "wide_screen_list_mode") }
+        get {
+            access(keyPath: \.wideScreenListMode)
+            return _defaults.integer(forKey: "wide_screen_list_mode") == 1 ? 1 : 0
+        }
+        set {
+            let normalized = newValue == 1 ? 1 : 0
+            guard normalized != wideScreenListMode else { return }
+            withMutation(keyPath: \.wideScreenListMode) {
+                _defaults.set(normalized, forKey: "wide_screen_list_mode")
+            }
+        }
     }
 
     @ObservationIgnored
@@ -294,22 +364,76 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     // MARK: - 过滤 / 搜索
-    @ObservationIgnored
     public var defaultCategories: Int {
-        get { _defaults.object(forKey: "default_categories") as? Int ?? 0x3FF }
-        set { _defaults.set(newValue, forKey: "default_categories") }
+        get {
+            access(keyPath: \.defaultCategories)
+            return _defaults.object(forKey: "default_categories") as? Int ?? 0x3FF
+        }
+        set {
+            let normalized = newValue & 0x3FF
+            guard normalized != defaultCategories else { return }
+            withMutation(keyPath: \.defaultCategories) {
+                _defaults.set(normalized, forKey: "default_categories")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var excludedTagNamespaces: Int {
-        get { _defaults.integer(forKey: "excluded_tag_namespaces") }
-        set { _defaults.set(newValue, forKey: "excluded_tag_namespaces") }
+        get {
+            access(keyPath: \.excludedTagNamespaces)
+            return _defaults.integer(forKey: "excluded_tag_namespaces")
+        }
+        set {
+            guard newValue != excludedTagNamespaces else { return }
+            withMutation(keyPath: \.excludedTagNamespaces) {
+                _defaults.set(newValue, forKey: "excluded_tag_namespaces")
+            }
+        }
     }
 
-    @ObservationIgnored
+    /// 用户从标签右键菜单加入的本地屏蔽列表。完整保存 namespace:tag，
+    /// 供详情标签和带 simpleTags 的画廊列表即时过滤。
+    public var blockedTags: [String] {
+        get {
+            access(keyPath: \.blockedTags)
+            return _defaults.stringArray(forKey: "blocked_gallery_tags") ?? []
+        }
+        set {
+            let normalized = Array(Set(newValue.map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }.filter { !$0.isEmpty })).sorted()
+            guard normalized != (_defaults.stringArray(forKey: "blocked_gallery_tags") ?? []) else { return }
+            withMutation(keyPath: \.blockedTags) {
+                _defaults.set(normalized, forKey: "blocked_gallery_tags")
+            }
+        }
+    }
+
+    public func blockTag(_ tag: String) {
+        guard !blockedTags.contains(tag.lowercased()) else { return }
+        blockedTags.append(tag)
+    }
+
+    public func unblockTag(_ tag: String) {
+        let normalized = tag.lowercased()
+        blockedTags.removeAll { $0 == normalized }
+    }
+
+    public func isTagBlocked(_ tag: String) -> Bool {
+        blockedTags.contains(tag.lowercased())
+    }
+
     public var excludedLanguages: String? {
-        get { _defaults.string(forKey: "excluded_languages") }
-        set { _defaults.set(newValue, forKey: "excluded_languages") }
+        get {
+            access(keyPath: \.excludedLanguages)
+            return _defaults.string(forKey: "excluded_languages")
+        }
+        set {
+            guard newValue != excludedLanguages else { return }
+            withMutation(keyPath: \.excludedLanguages) {
+                _defaults.set(newValue, forKey: "excluded_languages")
+            }
+        }
     }
 
     @ObservationIgnored
@@ -319,52 +443,130 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     // MARK: - 阅读器
-    @ObservationIgnored
     public var readingDirection: Int {
-        get { _defaults.object(forKey: "reading_direction") as? Int ?? 1 }
-        set { _defaults.set(newValue, forKey: "reading_direction") }
+        get {
+            access(keyPath: \.readingDirection)
+            let value = _defaults.object(forKey: "reading_direction") as? Int ?? 1
+            return (0...2).contains(value) ? value : 1
+        }
+        set {
+            let normalized = (0...2).contains(newValue) ? newValue : 1
+            guard normalized != readingDirection else { return }
+            withMutation(keyPath: \.readingDirection) {
+                _defaults.set(normalized, forKey: "reading_direction")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var pageScaling: Int {
-        get { _defaults.object(forKey: "page_scaling") as? Int ?? 3 }
-        set { _defaults.set(newValue, forKey: "page_scaling") }
+        get {
+            access(keyPath: \.pageScaling)
+            let value = _defaults.object(forKey: "page_scaling") as? Int ?? 3
+            return (0...4).contains(value) ? value : 3
+        }
+        set {
+            let normalized = (0...4).contains(newValue) ? newValue : 3
+            guard normalized != pageScaling else { return }
+            withMutation(keyPath: \.pageScaling) {
+                _defaults.set(normalized, forKey: "page_scaling")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var startPosition: Int {
-        get { _defaults.integer(forKey: "start_position") }
-        set { _defaults.set(newValue, forKey: "start_position") }
+        get {
+            access(keyPath: \.startPosition)
+            let value = _defaults.object(forKey: "start_position") as? Int ?? 1
+            return (0...4).contains(value) ? value : 1
+        }
+        set {
+            let normalized = (0...4).contains(newValue) ? newValue : 1
+            guard normalized != startPosition else { return }
+            withMutation(keyPath: \.startPosition) {
+                _defaults.set(normalized, forKey: "start_position")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var keepScreenOn: Bool {
-        get { _defaults.bool(forKey: "keep_screen_on") }
-        set { _defaults.set(newValue, forKey: "keep_screen_on") }
+        get {
+            access(keyPath: \.keepScreenOn)
+            return _defaults.bool(forKey: "keep_screen_on")
+        }
+        set {
+            guard newValue != keepScreenOn else { return }
+            withMutation(keyPath: \.keepScreenOn) {
+                _defaults.set(newValue, forKey: "keep_screen_on")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var readingFullscreen: Bool {
-        get { _defaults.object(forKey: "reading_fullscreen") as? Bool ?? true }
-        set { _defaults.set(newValue, forKey: "reading_fullscreen") }
+        get {
+            access(keyPath: \.readingFullscreen)
+            return _defaults.object(forKey: "reading_fullscreen") as? Bool ?? true
+        }
+        set {
+            guard newValue != readingFullscreen else { return }
+            withMutation(keyPath: \.readingFullscreen) {
+                _defaults.set(newValue, forKey: "reading_fullscreen")
+            }
+        }
     }
 
-    @ObservationIgnored
+    /// 阅读器背景：0 = 当前页面主色氛围，1 = 纯黑。
+    public var readerBackgroundMode: Int {
+        get {
+            access(keyPath: \.readerBackgroundMode)
+            let value = _defaults.integer(forKey: "reader_background_mode")
+            return value == 1 ? 1 : 0
+        }
+        set {
+            let normalized = newValue == 1 ? 1 : 0
+            guard normalized != readerBackgroundMode else { return }
+            withMutation(keyPath: \.readerBackgroundMode) {
+                _defaults.set(normalized, forKey: "reader_background_mode")
+            }
+        }
+    }
+
     public var showClock: Bool {
-        get { _defaults.object(forKey: "gallery_show_clock") as? Bool ?? true }
-        set { _defaults.set(newValue, forKey: "gallery_show_clock") }
+        get {
+            access(keyPath: \.showClock)
+            return _defaults.object(forKey: "gallery_show_clock") as? Bool ?? true
+        }
+        set {
+            guard newValue != showClock else { return }
+            withMutation(keyPath: \.showClock) {
+                _defaults.set(newValue, forKey: "gallery_show_clock")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var showProgress: Bool {
-        get { _defaults.object(forKey: "gallery_show_progress") as? Bool ?? true }
-        set { _defaults.set(newValue, forKey: "gallery_show_progress") }
+        get {
+            access(keyPath: \.showProgress)
+            return _defaults.object(forKey: "gallery_show_progress") as? Bool ?? true
+        }
+        set {
+            guard newValue != showProgress else { return }
+            withMutation(keyPath: \.showProgress) {
+                _defaults.set(newValue, forKey: "gallery_show_progress")
+            }
+        }
     }
 
-    @ObservationIgnored
     public var showBattery: Bool {
-        get { _defaults.object(forKey: "gallery_show_battery") as? Bool ?? true }
-        set { _defaults.set(newValue, forKey: "gallery_show_battery") }
+        get {
+            access(keyPath: \.showBattery)
+            return _defaults.object(forKey: "gallery_show_battery") as? Bool ?? true
+        }
+        set {
+            guard newValue != showBattery else { return }
+            withMutation(keyPath: \.showBattery) {
+                _defaults.set(newValue, forKey: "gallery_show_battery")
+            }
+        }
     }
 
     @ObservationIgnored
@@ -375,8 +577,8 @@ public final class AppSettings: @unchecked Sendable {
 
     @ObservationIgnored
     public var screenLightness: Int {
-        get { _defaults.object(forKey: "screen_lightness") as? Int ?? 50 }
-        set { _defaults.set(newValue, forKey: "screen_lightness") }
+        get { min(100, max(0, _defaults.object(forKey: "screen_lightness") as? Int ?? 50)) }
+        set { _defaults.set(min(100, max(0, newValue)), forKey: "screen_lightness") }
     }
 
     // MARK: - 阅读器 (新增)
@@ -396,10 +598,17 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     /// 显示页面间距
-    @ObservationIgnored
     public var showPageInterval: Bool {
-        get { _defaults.bool(forKey: "show_page_interval") }
-        set { _defaults.set(newValue, forKey: "show_page_interval") }
+        get {
+            access(keyPath: \.showPageInterval)
+            return _defaults.bool(forKey: "show_page_interval")
+        }
+        set {
+            guard newValue != showPageInterval else { return }
+            withMutation(keyPath: \.showPageInterval) {
+                _defaults.set(newValue, forKey: "show_page_interval")
+            }
+        }
     }
 
     /// 屏幕旋转 (0=跟随系统, 1=竖屏, 2=横屏)
@@ -410,10 +619,18 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     /// 自动翻页延迟 (秒)
-    @ObservationIgnored
     public var autoPageInterval: Int {
-        get { _defaults.object(forKey: "auto_page_interval") as? Int ?? 5 }
-        set { _defaults.set(newValue, forKey: "auto_page_interval") }
+        get {
+            access(keyPath: \.autoPageInterval)
+            return min(60, max(1, _defaults.object(forKey: "auto_page_interval") as? Int ?? 5))
+        }
+        set {
+            let normalized = min(60, max(1, newValue))
+            guard normalized != autoPageInterval else { return }
+            withMutation(keyPath: \.autoPageInterval) {
+                _defaults.set(normalized, forKey: "auto_page_interval")
+            }
+        }
     }
 
     /// 色彩滤镜 (护眼模式)
@@ -439,8 +656,11 @@ public final class AppSettings: @unchecked Sendable {
 
     @ObservationIgnored
     public var defaultFavSlot: Int {
-        get { _defaults.object(forKey: "default_favorite_2") as? Int ?? -2 }
-        set { _defaults.set(newValue, forKey: "default_favorite_2") }
+        get {
+            let value = _defaults.object(forKey: "default_favorite_2") as? Int ?? -2
+            return (-2...9).contains(value) ? value : -2
+        }
+        set { _defaults.set((-2...9).contains(newValue) ? newValue : -2, forKey: "default_favorite_2") }
     }
 
     /// 收藏夹名称 (0-9)
@@ -542,8 +762,11 @@ public final class AppSettings: @unchecked Sendable {
     /// 安全延迟时间 (秒) - 应用进入后台后多久需要重新认证
     @ObservationIgnored
     public var securityDelay: Int {
-        get { _defaults.object(forKey: "security_delay") as? Int ?? 0 }
-        set { _defaults.set(newValue, forKey: "security_delay") }
+        get {
+            let value = _defaults.object(forKey: "security_delay") as? Int ?? 0
+            return [0, 30, 60, 300, 900].contains(value) ? value : 0
+        }
+        set { _defaults.set([0, 30, 60, 300, 900].contains(newValue) ? newValue : 0, forKey: "security_delay") }
     }
 
     // MARK: - 高级
@@ -555,8 +778,8 @@ public final class AppSettings: @unchecked Sendable {
 
     @ObservationIgnored
     public var historyInfoSize: Int {
-        get { max(100, _defaults.object(forKey: "history_info_size") as? Int ?? 100) }
-        set { _defaults.set(max(100, newValue), forKey: "history_info_size") }
+        get { min(2_000, max(100, _defaults.object(forKey: "history_info_size") as? Int ?? 100)) }
+        set { _defaults.set(min(2_000, max(100, newValue)), forKey: "history_info_size") }
     }
 
     // MARK: - Android 对齐: 附加设置
@@ -576,10 +799,17 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     /// 修复缩略图链接 (对齐 Android Settings.KEY_FIX_THUMB_URL)
-    @ObservationIgnored
     public var fixThumbUrl: Bool {
-        get { _defaults.bool(forKey: "fix_thumb_url") }
-        set { _defaults.set(newValue, forKey: "fix_thumb_url") }
+        get {
+            access(keyPath: \.fixThumbUrl)
+            return _defaults.bool(forKey: "fix_thumb_url")
+        }
+        set {
+            guard newValue != _defaults.bool(forKey: "fix_thumb_url") else { return }
+            withMutation(keyPath: \.fixThumbUrl) {
+                _defaults.set(newValue, forKey: "fix_thumb_url")
+            }
+        }
     }
 
     /// 内置 ExHentai Hosts (对齐 Android Settings.KEY_BUILT_IN_HOSTS_EX)
@@ -604,6 +834,8 @@ public final class AppSettings: @unchecked Sendable {
     }
 
     private init() {
+        migrateSettingsIfNeeded()
+
         // 注册默认值
         _defaults.register(defaults: [
             "gallery_site": EhSite.eHentai.rawValue,
@@ -616,6 +848,7 @@ public final class AppSettings: @unchecked Sendable {
             // 新增默认值
             "show_tag_translations": true,
             "show_gallery_comment": true,
+            "show_gallery_pages": true,
             "show_gallery_rating": true,
             "show_read_progress": true,
             "show_eh_events": true,
@@ -631,15 +864,127 @@ public final class AppSettings: @unchecked Sendable {
             "recent_fav_cat": -1,
             "default_favorite_2": -2,
             "thumb_size": 1,
-            "image_size": "auto",
+            "image_resolution": ImageResolution.auto.rawValue,
             "history_info_size": 100,
         ])
+    }
+
+    /// 只处理键名与取值域迁移；不重置用户已经选择的有效设置。
+    private func migrateSettingsIfNeeded() {
+        let schemaKey = "settings_schema_version"
+        guard _defaults.integer(forKey: schemaKey) < 1 else { return }
+
+        if _defaults.string(forKey: "image_resolution") == nil,
+           let legacy = _defaults.string(forKey: "image_size") {
+            let normalized = legacy == "auto" ? ImageResolution.auto.rawValue : legacy
+            if ImageResolution(rawValue: normalized) != nil {
+                _defaults.set(normalized, forKey: "image_resolution")
+            }
+        }
+
+        // 这些选项来自 Android，Apple 平台没有对应行为；清除旧值可避免
+        // 将来导入设置时误以为功能仍然有效。
+        _defaults.removeObject(forKey: "media_scan")
+        _defaults.removeObject(forKey: "detail_size")
+        _defaults.removeObject(forKey: "thumb_resolution")
+        _defaults.set(1, forKey: schemaKey)
     }
 }
 
 public enum ListMode: Int, Sendable, CaseIterable {
     case list = 0
     case grid = 1
+}
+
+/// 应用内界面语言。`system` 保持 Apple 平台默认行为，其余选项仅影响
+/// EhViewer 自身，不会改写系统的 AppleLanguages 偏好。
+public enum AppLanguage: String, Sendable, CaseIterable, Identifiable {
+    case system
+    case simplifiedChinese = "zh-Hans"
+    case traditionalChineseTaiwan = "zh-Hant-TW"
+    case englishUnitedStates = "en-US"
+
+    public var id: String { rawValue }
+
+    public var locale: Locale {
+        switch self {
+        case .system:
+            return .autoupdatingCurrent
+        case .simplifiedChinese:
+            return Locale(identifier: "zh-Hans")
+        case .traditionalChineseTaiwan:
+            return Locale(identifier: "zh-Hant-TW")
+        case .englishUnitedStates:
+            return Locale(identifier: "en-US")
+        }
+    }
+
+    fileprivate var resourceIdentifier: String? {
+        switch self {
+        case .system: return nil
+        case .simplifiedChinese: return "zh-Hans"
+        case .traditionalChineseTaiwan: return "zh-Hant"
+        case .englishUnitedStates: return "en"
+        }
+    }
+}
+
+public enum AppAccentColor: String, Sendable, CaseIterable, Identifiable {
+    case system
+    case blue
+    case purple
+    case pink
+    case red
+    case orange
+    case green
+    case teal
+    case indigo
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .system: return AppLocalization.localized("系统强调色")
+        case .blue: return AppLocalization.localized("蓝色")
+        case .purple: return AppLocalization.localized("紫色")
+        case .pink: return AppLocalization.localized("粉色")
+        case .red: return AppLocalization.localized("红色")
+        case .orange: return AppLocalization.localized("橙色")
+        case .green: return AppLocalization.localized("绿色")
+        case .teal: return AppLocalization.localized("青色")
+        case .indigo: return AppLocalization.localized("靛蓝色")
+        }
+    }
+}
+
+/// 供普通 `String`、通知与 AppKit/UIKit 桥接代码使用的本地化入口。
+/// SwiftUI 字面量仍由 Environment locale 原生处理。
+public enum AppLocalization {
+    public static var locale: Locale { AppSettings.shared.appLanguage.locale }
+
+    public static func localized(
+        _ key: String,
+        table: String? = nil,
+        comment: String = ""
+    ) -> String {
+        let language = AppSettings.shared.appLanguage
+        guard let resourceIdentifier = language.resourceIdentifier,
+              let path = Bundle.main.path(forResource: resourceIdentifier, ofType: "lproj"),
+              let bundle = Bundle(path: path) else {
+            return NSLocalizedString(
+                key,
+                tableName: table,
+                bundle: .main,
+                value: key,
+                comment: comment
+            )
+        }
+        return bundle.localizedString(forKey: key, value: key, table: table)
+    }
+
+    public static func format(_ key: String, _ arguments: CVarArg...) -> String {
+        String(format: localized(key), locale: locale, arguments: arguments)
+    }
 }
 
 /// 图片分辨率选项 (对应 Android EhConfig.IMAGE_SIZE_*)
@@ -655,7 +1000,7 @@ public enum ImageResolution: String, Sendable, CaseIterable, Identifiable {
 
     public var displayName: String {
         switch self {
-        case .auto: return "自动"
+        case .auto: return AppLocalization.localized("自动")
         case .x780: return "780x"
         case .x980: return "980x"
         case .x1280: return "1280x"

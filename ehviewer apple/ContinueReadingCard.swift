@@ -13,9 +13,14 @@ import EhSettings
 
 /// 继续阅读卡片 — 显示最近阅读的画廊，一键跳转阅读器
 struct ContinueReadingCard: View {
+    @Environment(\.readerPresentationAction) private var readerPresentationAction
     @State private var latestRecord: HistoryRecord?
     @State private var readingProgress: Int?
+    #if os(iOS)
     @State private var readerLaunchItem: ReaderLaunchItem?
+    #else
+    @Environment(\.openWindow) private var openWindow
+    #endif
 
     var body: some View {
         Group {
@@ -81,17 +86,42 @@ struct ContinueReadingCard: View {
     @ViewBuilder
     private func cardContent(record: HistoryRecord) -> some View {
         Button {
-            readerLaunchItem = ReaderLaunchItem(
+            #if os(iOS)
+            let item = ReaderLaunchItem(
                 gid: record.gid,
                 token: record.token,
                 pages: record.pages,
                 previewSet: nil,
                 initialPage: readingProgress
             )
+            if let readerPresentationAction {
+                readerPresentationAction.present(ReaderWindowRoute(
+                    gid: item.gid,
+                    token: item.token,
+                    pages: item.pages,
+                    previewSet: item.previewSet,
+                    initialPage: item.initialPage
+                ))
+            } else {
+                readerLaunchItem = item
+            }
+            #else
+            openWindow(value: ReaderWindowRoute(
+                gid: record.gid,
+                token: record.token,
+                pages: record.pages,
+                previewSet: nil,
+                initialPage: readingProgress
+            ))
+            #endif
         } label: {
             HStack(spacing: 12) {
                 // 封面
-                CachedAsyncImage(url: URL(string: record.thumb ?? "")) { img in
+                CachedAsyncImage(url: ThumbnailURLResolver.url(
+                    for: record.thumb,
+                    fixLegacy: AppSettings.shared.fixThumbUrl,
+                    site: AppSettings.shared.gallerySite
+                )) { img in
                     img.resizable().aspectRatio(contentMode: .fill)
                 } placeholder: {
                     Color(.tertiarySystemFill)
