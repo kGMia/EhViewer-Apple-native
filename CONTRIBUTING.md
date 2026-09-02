@@ -6,13 +6,13 @@
 
 ### 报告 Bug
 
-1. 在 [Issues](https://github.com/felixchaos/EhViewer-Apple/issues) 页面搜索是否已有相同问题
+1. 在 [Issues](https://github.com/kGMia/EhViewer-Apple-native/issues) 页面搜索是否已有相同问题
 2. 如果没有，创建新 Issue 并使用 **Bug Report** 模板
 3. 尽可能提供详细信息：设备型号、系统版本、复现步骤、截图/录屏
 
 ### 功能建议
 
-1. 在 [Issues](https://github.com/felixchaos/EhViewer-Apple/issues) 页面创建新 Issue
+1. 在 [Issues](https://github.com/kGMia/EhViewer-Apple-native/issues) 页面创建新 Issue
 2. 使用 **Feature Request** 模板
 3. 描述你期望的功能和使用场景
 
@@ -59,9 +59,9 @@ docs: 更新 README 安装说明
 
 ### 环境要求
 
-- **Xcode 16.0+**
+- **Xcode 26.2+**
 - **Swift 6.0**
-- **iOS 17.0+** / **macOS 14.0+**
+- **iOS / iPadOS 26.2+** / **macOS 26.2+**
 
 ### 项目架构
 
@@ -77,8 +77,8 @@ docs: 更新 README 安装说明
 ### 本地开发
 
 ```bash
-git clone https://github.com/felixchaos/EhViewer-Apple.git
-cd EhViewer-Apple
+git clone https://github.com/kGMia/EhViewer-Apple-native.git
+cd EhViewer-Apple-native
 open "ehviewer apple.xcodeproj"
 ```
 
@@ -99,7 +99,7 @@ open "ehviewer apple.xcodeproj"
 
 ## ❓ 有问题？
 
-- 开一个 [Discussion](https://github.com/felixchaos/EhViewer-Apple/discussions) 或 Issue
+- 开一个 [Discussion](https://github.com/kGMia/EhViewer-Apple-native/discussions) 或 Issue
 - 注明你的环境信息（Xcode 版本、系统版本等）
 
 再次感谢你的贡献！ ❤️

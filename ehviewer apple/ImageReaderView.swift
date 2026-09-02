@@ -12,6 +12,9 @@ import EhModels
 import EhSpider
 import EhSettings
 import EhDatabase
+import EhDownload
+import Translation
+import Vision
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -22,10 +25,111 @@ import UIKit
 private func nativeImage(_ img: UIImage) -> Image { Image(uiImage: img) }
 #else
 import AppKit
+import UniformTypeIdentifiers
 private func nativeImage(_ img: NSImage) -> Image { Image(nsImage: img) }
 #endif
 
+/// Cross-platform navigation payload. macOS uses it as a WindowGroup value,
+/// while iOS uses the same Codable route for App Intents and full-screen presentation.
+struct ReaderWindowRoute: Codable, Hashable, Identifiable {
+    let id: UUID
+    let gid: Int64
+    let token: String
+    let pages: Int
+    let previewSet: PreviewSet?
+    let initialPage: Int?
+
+    init(
+        gid: Int64,
+        token: String,
+        pages: Int,
+        previewSet: PreviewSet?,
+        initialPage: Int?
+    ) {
+        id = UUID()
+        self.gid = gid
+        self.token = token
+        self.pages = pages
+        self.previewSet = previewSet
+        self.initialPage = initialPage
+    }
+}
+
+/// iOS/iPadOS 的阅读器统一由主导航根节点呈现。详情页会在横竖屏切换时
+/// 由单栏/双栏容器重建；若 fullScreenCover 挂在详情页上，宿主销毁会
+/// 连带关闭阅读器。根级动作让呈现状态不再依赖某个临时页面。
+struct ReaderPresentationAction {
+    let present: @MainActor (ReaderWindowRoute) -> Void
+}
+
+private struct ReaderPresentationActionKey: EnvironmentKey {
+    static let defaultValue: ReaderPresentationAction? = nil
+}
+
+extension EnvironmentValues {
+    var readerPresentationAction: ReaderPresentationAction? {
+        get { self[ReaderPresentationActionKey.self] }
+        set { self[ReaderPresentationActionKey.self] = newValue }
+    }
+}
+
+#if os(macOS)
+struct ReaderCommandActions {
+    let leftArrow: () -> Void
+    let rightArrow: () -> Void
+    let previousPage: () -> Void
+    let nextPage: () -> Void
+    let exit: () -> Void
+    let toggleFullscreen: () -> Void
+}
+
+private struct ReaderCommandActionsKey: FocusedValueKey {
+    typealias Value = ReaderCommandActions
+}
+
+extension FocusedValues {
+    var readerCommandActions: ReaderCommandActions? {
+        get { self[ReaderCommandActionsKey.self] }
+        set { self[ReaderCommandActionsKey.self] = newValue }
+    }
+}
+#endif
+
 // MARK: - ImageReaderView
+
+/// 设置窗口与已打开阅读器之间的轻量同步快照。只包含会影响当前界面的值，
+/// 避免把 UserDefaults 查询放进翻页和滚动热路径。
+private struct ReaderRuntimeSettings: Equatable {
+    let readingDirection: Int
+    let pageScaling: Int
+    let startPosition: Int
+    let keepScreenOn: Bool
+    let fullscreen: Bool
+    let showClock: Bool
+    let showProgress: Bool
+    let showBattery: Bool
+    let showPageInterval: Bool
+    let backgroundMode: Int
+}
+
+enum ReaderBackgroundMode: Int, CaseIterable {
+    case ambient = 0
+    case pureBlack = 1
+
+    var label: String {
+        switch self {
+        case .ambient: AppLocalization.localized("页面氛围色")
+        case .pureBlack: AppLocalization.localized("纯黑")
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .ambient: "circle.lefthalf.filled"
+        case .pureBlack: "circle.fill"
+        }
+    }
+}
 
 struct ImageReaderView: View {
     let gid: Int64
@@ -38,24 +142,30 @@ struct ImageReaderView: View {
     @State private var vm: ReaderViewModel
     @State private var showOverlay = true
     @State private var showSettings = false
-    /// 页面网格（对齐 Android 阅读器的「目录」）——
-    /// 此前跳页只有底部那条 slider，200 页的本子要靠手感拖
-    @State private var showPageGrid = false
-    /// 单页分享/存储用的临时文件（对齐 Android page_menu_share / save_to）
-    @State private var shareItem: ReaderShareItem?
     @State private var hasAppliedInitialPage = false
     @State private var isZoomed = false
     @State private var showTutorial = false
-
-    // 跳页输入
-    /// 进度条拖动中的本地值 —— 松手才提交给 ViewModel
-    @State private var isSeeking = false
-    @State private var seekValue: Double = 0
+    #if os(macOS)
+    @State private var readerWindow: NSWindow?
+    @State private var isFullScreen = false
+    #endif
+    @State private var recognizedImageText = ""
+    @State private var showImageTranslation = false
+    @State private var isRecognizingImageText = false
+    @State private var imageTranslationError = ""
+    @State private var showImageTranslationError = false
 
     // 从设置读取
-    @State private var readingDirection: ReadingDirection = .topToBottom
+    @State private var readingDirection: ReadingDirection = .rightToLeft
     @State private var scaleMode: ScaleMode = .fit
     @State private var startPosition: StartPosition = .topRight
+    @State private var pageDisplayMode: ReaderPageDisplayMode = .double
+    @State private var firstPageStandalone: Bool = true
+    @State private var pageAnimationEnabled: Bool = true
+    @State private var backgroundMode: ReaderBackgroundMode = .ambient
+    @State private var pageNavigationDelta: Int = 1
+    @State private var readerViewportSize: CGSize = .zero
+    @State private var lastHapticProgressPage: Int?
 
     // 自动翻页
     @State private var autoPageEnabled = false
@@ -69,29 +179,29 @@ struct ImageReaderView: View {
     @State private var isUpdatingFromScroll = false
     @State private var hasAppliedInitialScroll = false
     @State private var lastScrollChangeTime: Date = .distantPast
+    @State private var verticalZoomScale: CGFloat = 1.0
+    @State private var verticalBaseScale: CGFloat = 1.0
     /// Perf P0-2: 一次性缓存 showPageInterval 设置，避免滚动路径上读 UserDefaults
     @State private var verticalPageInterval: Bool = false
+    @State private var showClock: Bool = true
+    @State private var showProgress: Bool = true
+    @State private var showBattery: Bool = true
 
     // Perf: 翻页去抖 — 快速滑动时取消上一次预加载，仅处理最终落地页
     @State private var pageChangeTask: Task<Void, Never>?
 
     @Environment(\.dismiss) private var dismiss
 
-    #if os(macOS)
-    /// macOS 键盘焦点 — `.onKeyPress` 需要视图先获得焦点
-    /// (iOS 不能这么做: 程序化聚焦会弹出软键盘，见 KeyCommandCatcher)
-    @FocusState private var isReaderFocused: Bool
-    #endif
+    // 点击区域比例
+    private let tapZoneRatio: CGFloat = 0.25
+    /// 纵向边缘死区比例 (上下各 15%)
+    private let tapZoneVerticalDeadZone: CGFloat = 0.15
+    /// 双页在更窄的阅读区域内收益很低，也会挤压底部进度控件。
+    private let minimumPageLayoutControlWidth: CGFloat = 720
 
-    #if os(iOS)
-    /// 音量键 / 媒体模式翻页器
-    @State private var volumePageTurner = VolumeKeyPageTurner()
-    #endif
-
-    // 点击区域比例 (左右各 30%，中间 40% 用于工具栏)
-    private let tapZoneRatio: CGFloat = 0.30
-    /// 纵向边缘死区比例 (上下各 20%，防止误触)
-    private let tapZoneVerticalDeadZone: CGFloat = 0.20
+    private var supportsPageLayoutSelection: Bool {
+        readerViewportSize.width >= minimumPageLayoutControlWidth
+    }
 
     /// 显式初始化器 (Fix D-2: 移除 isDownloaded 参数，由 ReaderViewModel 自行检查)
     init(
@@ -141,9 +251,12 @@ struct ImageReaderView: View {
                 immersiveOverlay(geometry: geometry)
 
                 // HUD 显示 (时钟/电量/进度)
-                if !showOverlay {
+                if shouldShowReaderHUD {
                     hudOverlay(geometry: geometry)
                 }
+
+                // 浮动导航按钮 (工具栏隐藏时显示，提供翻页+工具栏切换)
+                floatingNavigationOverlay(geometry: geometry)
 
                 // 新手教程
                 if showTutorial {
@@ -151,90 +264,128 @@ struct ImageReaderView: View {
                 }
             }
             .onAppear {
-                // 检测宽屏+横屏 → 双页模式 (iPad 竖屏不触发)
-                vm.updateLayout(screenWidth: geometry.size.width, screenHeight: geometry.size.height)
-                vm.computeSpreads()
+                readerViewportSize = geometry.size
+                applyPageLayout(in: geometry.size)
             }
             .onChange(of: geometry.size) { _, newSize in
-                vm.updateLayout(screenWidth: newSize.width, screenHeight: newSize.height)
+                readerViewportSize = newSize
+                applyPageLayout(in: newSize)
             }
         }
         #if os(iOS)
-        .statusBarHidden(AppSettings.shared.readingFullscreen)
-        .persistentSystemOverlays(AppSettings.shared.readingFullscreen ? .hidden : .automatic)
+        .statusBarHidden(shouldHideSystemStatusBar)
+        .persistentSystemOverlays(shouldHideSystemStatusBar ? .hidden : .automatic)
         #endif
         .ignoresSafeArea()
+        #if os(macOS)
+        .background {
+            ReaderWindowAccessor { window in
+                guard readerWindow !== window else { return }
+                readerWindow = window
+                isFullScreen = window?.styleMask.contains(.fullScreen) == true
+                if AppSettings.shared.readingFullscreen,
+                   let window,
+                   window.sheetParent == nil,
+                   !window.styleMask.contains(.fullScreen) {
+                    DispatchQueue.main.async {
+                        window.toggleFullScreen(nil)
+                    }
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { note in
+            if note.object as? NSWindow === readerWindow {
+                isFullScreen = true
+                AppSettings.shared.readingFullscreen = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { note in
+            if note.object as? NSWindow === readerWindow {
+                isFullScreen = false
+                AppSettings.shared.readingFullscreen = false
+            }
+        }
+        #endif
         #if os(iOS)
         .toolbar(.hidden, for: .navigationBar)
         #else
         .toolbar(.hidden)
         #endif
         .onAppear(perform: setupReader)
+        .onChange(of: persistedReaderSettings) { _, newSettings in
+            applyRuntimeSettings(newSettings)
+        }
+        .onChange(of: readingDirection) { _, _ in
+            applyPageLayout()
+        }
+        .onChange(of: pageDisplayMode) { _, newValue in
+            UserDefaults.standard.set(newValue.rawValue, forKey: "reader_page_display_mode")
+            applyPageLayout()
+        }
+        .onChange(of: firstPageStandalone) { _, newValue in
+            UserDefaults.standard.set(newValue, forKey: "reader_first_page_standalone")
+            applyPageLayout()
+        }
+        .onChange(of: pageAnimationEnabled) { _, newValue in
+            UserDefaults.standard.set(newValue, forKey: "reader_page_animation")
+        }
         .onDisappear(perform: cleanupReader)
         .task {
             await initializeReader()
             // Fix F2-2: 只有真正打开阅读器才记录历史 (从详情页 loadDetail 迁移到这里)
-            recordReadingHistory()
+            await recordReadingHistory()
         }
         .sheet(isPresented: $showSettings) {
+            #if os(macOS)
             ReaderSettingsSheet(
                 readingDirection: $readingDirection,
                 scaleMode: $scaleMode,
                 startPosition: $startPosition,
-                autoPageEnabled: $autoPageEnabled
+                autoPageEnabled: $autoPageEnabled,
+                showClock: $showClock,
+                showProgress: $showProgress,
+                showBattery: $showBattery,
+                showPageInterval: $verticalPageInterval,
+                pageDisplayMode: $pageDisplayMode,
+                pageAnimationEnabled: $pageAnimationEnabled,
+                backgroundMode: $backgroundMode,
+                showsPageLayoutSettings: supportsPageLayoutSelection,
+                isFullScreen: $isFullScreen,
+                onToggleFullscreen: toggleReaderFullscreen
             )
+            #else
+            ReaderSettingsSheet(
+                readingDirection: $readingDirection,
+                scaleMode: $scaleMode,
+                startPosition: $startPosition,
+                autoPageEnabled: $autoPageEnabled,
+                showClock: $showClock,
+                showProgress: $showProgress,
+                showBattery: $showBattery,
+                showPageInterval: $verticalPageInterval,
+                pageDisplayMode: $pageDisplayMode,
+                pageAnimationEnabled: $pageAnimationEnabled,
+                backgroundMode: $backgroundMode,
+                showsPageLayoutSettings: supportsPageLayoutSelection
+            )
+            #endif
         }
-        #if os(iOS)
-        .sheet(item: $shareItem) { item in
-            ShareSheet(items: [item.url])
+        .translationPresentation(
+            isPresented: $showImageTranslation,
+            text: recognizedImageText
+        )
+        .alert("无法翻译图片文字", isPresented: $showImageTranslationError) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(imageTranslationError)
         }
-        #endif
-        .sheet(isPresented: $showPageGrid) {
-            ReaderPageGrid(total: vm.totalPages, current: vm.currentPage) { target in
-                showPageGrid = false
-                vm.currentPage = target
-                vm.lazyCurrentPage = target
-                vm.verticalScrollPage = target
-                if vm.isDoublePageEnabled { vm.syncSpreadIndex() }
-                Task { await vm.onPageChange(target) }
-            }
-        }
-        // 跳页弹窗已随浮动导航一起删除：跳页现在走顶栏的目录网格
-        // （ReaderPageGrid）和底栏的滑杆，不再需要手输页码
-        // 切换阅读模式时从 NSCache 恢复已加载图片，避免重新下载
-        .onChange(of: readingDirection) { _, _ in
-            vm.restoreCachedImages(around: vm.currentPage)
-        }
-        // 键盘 / 外置翻页器
-        //
-        // iOS 走 UIKit responder chain (KeyCommandCatcher):
-        //   之前用的是 SwiftUI `.focusable()` + `@FocusState`，但在 iOS 上程序化聚焦
-        //   一个普通视图会被系统当成文本输入，切换阅读方向时直接弹出软键盘，
-        //   而且 SwiftUI 的焦点手势会和阅读器内部的点击手势抢事件。
-        // macOS 上 `.focusable()` 没有这些副作用，继续用 onKeyPress。
-        #if os(iOS)
-        .background {
-            KeyCommandCatcher { action in
-                handleReaderKey(action)
-            }
-            .frame(width: 0, height: 0)
-            .allowsHitTesting(false)
-        }
-        #else
-        .focusable()
-        .focused($isReaderFocused)
-        .onAppear { isReaderFocused = true }
-        .onChange(of: showSettings) { _, isShowing in
-            if !isShowing { isReaderFocused = true }
-        }
-        // ⚠️ 方向键的含义要和点击区域一致: 左键 = 左侧点击区
-        //    (RTL 下左边是"下一页")。原来这里是反的，和 handleTapZone / Android 都对不上
+        // 键盘事件 (macOS / iPad 键盘)
         .onKeyPress(.leftArrow) {
-            handleKeyNavigation(forward: readingDirection == .rightToLeft)
+            handleLeftArrow()
             return .handled
         }
         .onKeyPress(.rightArrow) {
-            handleKeyNavigation(forward: readingDirection != .rightToLeft)
+            handleRightArrow()
             return .handled
         }
         .onKeyPress(.space) {
@@ -246,7 +397,6 @@ struct ImageReaderView: View {
             return .handled
         }
         .onKeyPress(.upArrow) {
-            // 竖向滚动模式交给 ScrollView 自己滚动
             if readingDirection == .topToBottom { return .ignored }
             goToPreviousPage()
             return .handled
@@ -256,6 +406,15 @@ struct ImageReaderView: View {
             goToNextPage()
             return .handled
         }
+        #if os(macOS)
+        .focusedSceneValue(\.readerCommandActions, ReaderCommandActions(
+            leftArrow: handleLeftArrow,
+            rightArrow: handleRightArrow,
+            previousPage: goToPreviousPage,
+            nextPage: goToNextPage,
+            exit: { dismiss() },
+            toggleFullscreen: toggleReaderFullscreen
+        ))
         .onKeyPress(.pageUp) {
             goToPreviousPage()
             return .handled
@@ -272,103 +431,166 @@ struct ImageReaderView: View {
             goToPage(vm.totalPages - 1)
             return .handled
         }
-        .onKeyPress(.return) {
-            goToNextPage()
-            return .handled
-        }
         #endif
-        // 色彩滤镜 (对齐 Android GalleryActivity 的 colorFilter 叠加层)
-        // 盖在所有内容之上、不吃手势；关掉时完全不参与渲染
-        .overlay {
-            if colorFilterOverlay != nil {
-                colorFilterOverlay
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-            }
-        }
         #if os(iOS)
-        // 边缘侧滑返回 — 仅在工具栏可见时启用，避免与翻页手势冲突。
-        //
-        // 必须限制在左边缘 24pt 内：它此前铺满整屏且 allowsHitTesting(true)，
-        // 作为最上层 overlay 把顶栏按钮的点击全吃了——返回键点不动就是这个原因。
-        // 边缘侧滑本来也只需要边缘那一条。
-        .overlay(alignment: .leading) {
-            if showOverlay {
-                EdgeSwipeDismissView { dismiss() }
-                    .frame(width: 24)
-                    .frame(maxHeight: .infinity)
-                    .allowsHitTesting(true)
-            }
+        // 边缘侧滑返回 (fullScreenCover 无 UINavigationController，需自行添加手势)
+        .overlay {
+            EdgeSwipeDismissView { dismiss() }
+                .allowsHitTesting(true)
         }
         #endif
     }
 
-    /// 页码标签用的页号 —— 拖进度条时显示拖到的目标页，
-    /// 否则松手前数字一直不动，会让人以为拖动没生效
-    private var displayedPage: Int {
-        guard isSeeking else { return vm.currentPage }
-        return min(max(0, Int(seekValue.rounded())), max(0, vm.totalPages - 1))
+    #if os(macOS)
+    private func toggleReaderFullscreen() {
+        guard let window = readerWindow, window.sheetParent == nil else { return }
+        window.toggleFullScreen(nil)
+    }
+    #endif
+
+    /// Apply the user's single/double-page choice on every platform. The old
+    /// iOS path only looked at orientation, so changing the Picker never
+    /// affected `isDoublePageEnabled` on iPad.
+    private func applyPageLayout(in viewportSize: CGSize? = nil) {
+        let anchoredPage = vm.currentPage
+        let size = viewportSize ?? readerViewportSize
+        #if os(macOS)
+        let hasRoomForSpread = size.width >= minimumPageLayoutControlWidth
+        #else
+        let hasRoomForSpread = size.width >= minimumPageLayoutControlWidth
+            && size.width > size.height
+        #endif
+        vm.isDoublePageEnabled = hasRoomForSpread
+            && readingDirection != .topToBottom
+            && pageDisplayMode == .double
+        vm.firstPageStandalone = firstPageStandalone
+        vm.computeSpreads()
+        vm.synchronizePagePosition(anchoredPage)
     }
 
-    /// 护眼滤镜色 —— 设置里存的是 ARGB 整数 (对齐 Android colorFilterColor)
-    private var colorFilterOverlay: Color? {
-        guard AppSettings.shared.colorFilter else { return nil }
-        let argb = AppSettings.shared.colorFilterColor
-        let a = Double((argb >> 24) & 0xFF) / 255.0
-        let r = Double((argb >> 16) & 0xFF) / 255.0
-        let g = Double((argb >> 8) & 0xFF) / 255.0
-        let b = Double(argb & 0xFF) / 255.0
-        guard a > 0 else { return nil }
-        // 默认值 0x20000000 是半透明黑，直接压暗屏幕
-        return Color(red: r, green: g, blue: b).opacity(a)
-    }
+    // MARK: - Ambient Background (模糊氛围背景)
 
-    // MARK: - Reader Background
-
-    /// 纯黑背景 — 节省 OLED 屏幕电量，移除 CIAreaAverage 计算
+    /// 主色调氛围背景 — 使用当前页的 CIAreaAverage 提取色填充未覆盖区域
+    /// 修复: 翻页时如果新页颜色未就绪，保持上一页颜色而非闪黑
     @ViewBuilder
     private var ambientBackground: some View {
-        Color.black.ignoresSafeArea()
+        readerAmbientColor
+            .ignoresSafeArea()
+            .animation(.easeInOut(duration: 0.4), value: vm.dominantColors[vm.currentPage] != nil)
+            .animation(.easeInOut(duration: 0.25), value: backgroundMode)
+    }
+
+    private var readerAmbientColor: Color {
+        if backgroundMode == .pureBlack {
+            return .black
+        }
+        return vm.dominantColors[vm.currentPage]
+            ?? vm.dominantColors.values.first
+            ?? Color.black
+    }
+
+    /// 控件不再假定阅读背景永远为深色。按当前页面的主色亮度选择黑/白
+    /// 前景，并同步改变玻璃染色，保证浅色页面上的文字仍然清晰。
+    private var readerBackgroundIsLight: Bool {
+        let red: CGFloat
+        let green: CGFloat
+        let blue: CGFloat
+
+        #if os(macOS)
+        guard let nativeColor = NSColor(readerAmbientColor).usingColorSpace(.deviceRGB) else {
+            return false
+        }
+        red = nativeColor.redComponent
+        green = nativeColor.greenComponent
+        blue = nativeColor.blueComponent
+        #else
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        guard UIColor(readerAmbientColor).getRed(&r, green: &g, blue: &b, alpha: &a) else {
+            return false
+        }
+        red = r
+        green = g
+        blue = b
+        #endif
+
+        func linearize(_ component: CGFloat) -> CGFloat {
+            component <= 0.04045
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
+        }
+
+        let luminance = 0.2126 * linearize(red)
+            + 0.7152 * linearize(green)
+            + 0.0722 * linearize(blue)
+        return luminance > 0.48
+    }
+
+    private var readerForegroundColor: Color {
+        readerBackgroundIsLight ? .black : .white
+    }
+
+    private var readerSecondaryForegroundColor: Color {
+        readerForegroundColor.opacity(0.72)
+    }
+
+    private var readerPanelTint: Color {
+        readerBackgroundIsLight ? .white.opacity(0.42) : .black.opacity(0.30)
+    }
+
+    /// macOS 的系统强调色可以由用户在系统设置中修改。直接读取
+    /// controlAccentColor，避免 Slider 回退为固定的默认蓝色。
+    private var readerThemeColor: Color {
+        if let selected = AppSettings.shared.accentColor.swiftUIColor {
+            return selected
+        }
+        #if os(macOS)
+        return Color(nsColor: .controlAccentColor)
+        #else
+        return Color.accentColor
+        #endif
     }
 
     // MARK: - Setup
 
+    private var persistedReaderSettings: ReaderRuntimeSettings {
+        let settings = AppSettings.shared
+        return ReaderRuntimeSettings(
+            readingDirection: settings.readingDirection,
+            pageScaling: settings.pageScaling,
+            startPosition: settings.startPosition,
+            keepScreenOn: settings.keepScreenOn,
+            fullscreen: settings.readingFullscreen,
+            showClock: settings.showClock,
+            showProgress: settings.showProgress,
+            showBattery: settings.showBattery,
+            showPageInterval: settings.showPageInterval,
+            backgroundMode: settings.readerBackgroundMode
+        )
+    }
+
     private func setupReader() {
-        readingDirection = ReadingDirection(rawValue: AppSettings.shared.readingDirection) ?? .topToBottom
-        scaleMode = ScaleMode(rawValue: AppSettings.shared.pageScaling) ?? .fit
-        startPosition = StartPosition(rawValue: AppSettings.shared.startPosition) ?? .topRight
-        verticalPageInterval = AppSettings.shared.showPageInterval
+        applyRuntimeSettings(persistedReaderSettings, updateWindowMode: false)
+        pageDisplayMode = ReaderPageDisplayMode(
+            rawValue: UserDefaults.standard.object(forKey: "reader_page_display_mode") as? Int ?? ReaderPageDisplayMode.double.rawValue
+        ) ?? .double
+        pageAnimationEnabled = UserDefaults.standard.object(forKey: "reader_page_animation") as? Bool ?? true
+        firstPageStandalone = UserDefaults.standard.object(forKey: "reader_first_page_standalone") as? Bool ?? true
 
         #if os(iOS)
         if AppSettings.shared.keepScreenOn {
             UIApplication.shared.isIdleTimerDisabled = true
         }
-        UIDevice.current.isBatteryMonitoringEnabled = true
         if AppSettings.shared.customScreenLightness {
             setScreenBrightness(CGFloat(AppSettings.shared.screenLightness) / 100.0)
         }
-        // 音量键翻页 (媒体模式的外置翻页器) — 对齐 Android volume_page 设置
-        if AppSettings.shared.volumePage {
-            volumePageTurner.start(
-                onNext: { goToNextPage() },
-                onPrevious: { goToPreviousPage() }
-            )
-        }
-        #endif
-
+        #else
         timeTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
             currentTime = Date()
         }
-
-        if readingDirection != .topToBottom && !hasAppliedInitialPage {
-            let targetPage = vm.currentPage
-            if targetPage > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    self.vm.currentPage = targetPage
-                }
-            }
-            hasAppliedInitialPage = true
-        }
+        #endif
 
         let tutorialKey = "reader_tutorial_shown"
         if !UserDefaults.standard.bool(forKey: tutorialKey) {
@@ -380,91 +602,73 @@ struct ImageReaderView: View {
         }
     }
 
+    private func applyRuntimeSettings(
+        _ settings: ReaderRuntimeSettings,
+        updateWindowMode: Bool = true
+    ) {
+        readingDirection = ReadingDirection(rawValue: settings.readingDirection) ?? .rightToLeft
+        scaleMode = ScaleMode(rawValue: settings.pageScaling) ?? .fit
+        startPosition = StartPosition(rawValue: settings.startPosition) ?? .topRight
+        verticalPageInterval = settings.showPageInterval
+        showClock = settings.showClock
+        showProgress = settings.showProgress
+        showBattery = settings.showBattery
+        backgroundMode = ReaderBackgroundMode(rawValue: settings.backgroundMode) ?? .ambient
+
+        #if os(iOS)
+        UIApplication.shared.isIdleTimerDisabled = settings.keepScreenOn
+        #elseif os(macOS)
+        if updateWindowMode,
+           let window = readerWindow,
+           window.sheetParent == nil,
+           settings.fullscreen != window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+        }
+        #endif
+    }
+
     private func cleanupReader() {
         #if os(iOS)
         UIApplication.shared.isIdleTimerDisabled = false
-        UIDevice.current.isBatteryMonitoringEnabled = false
-        volumePageTurner.stop()
         #endif
         timeTimer?.invalidate()
         autoPageTask?.cancel()
         pageChangeTask?.cancel()
+        vm.cancelBackgroundWork()
         saveReadingProgress()
     }
 
-    /// 从本地已有的记录里凑出一条历史。
-    ///
-    /// 依次找：已有的历史行（续读同一本，保留原信息只更新时间）→ 下载记录 →
-    /// 本地收藏。三处都没有就返回 nil，宁可不记，也不要往历史里塞一行认不出来的空记录。
-    private static func historyRecordFromLocalSources(
-        gid: Int64, token: String, pages: Int
-    ) -> HistoryRecord? {
-        if let existing = (try? EhDatabase.shared.getHistory(gid: gid)) ?? nil {
-            return existing
-        }
-        if let dl = (try? EhDatabase.shared.getDownload(gid: gid)) ?? nil {
-            var r = HistoryRecord(gid: gid, token: dl.token, title: dl.title,
-                                  titleJpn: dl.titleJpn, thumb: dl.thumb,
-                                  category: dl.category, posted: dl.posted,
-                                  uploader: dl.uploader, rating: dl.rating,
-                                  simpleLanguage: dl.simpleLanguage,
-                                  pages: dl.pages > 0 ? dl.pages : pages,
-                                  mode: 0, date: Date())
-            r.simpleTags = dl.simpleTags
-            return r
-        }
-        if let fav = (try? EhDatabase.shared.getLocalFavorite(gid: gid)) ?? nil {
-            var r = HistoryRecord(gid: gid, token: fav.token, title: fav.title,
-                                  titleJpn: fav.titleJpn, thumb: fav.thumb,
-                                  category: fav.category, posted: fav.posted,
-                                  uploader: fav.uploader, rating: fav.rating,
-                                  simpleLanguage: fav.simpleLanguage,
-                                  pages: fav.pages > 0 ? fav.pages : pages,
-                                  mode: 0, date: Date())
-            r.simpleTags = fav.simpleTags
-            return r
-        }
-        return nil
-    }
-
     /// Fix F2-2: 只有真正打开阅读器才计入历史 (从 GalleryDetailViewModel.loadDetail 迁移至此)
-    private func recordReadingHistory() {
-        // 从缓存中获取画廊信息
-        if let detail = GalleryCache.shared.getDetail(gid: gid) {
-            let info = detail.info
-            var record = HistoryRecord(
-                gid: info.gid, token: info.token,
-                title: info.bestTitle, category: info.category.rawValue,
-                pages: info.pages, mode: 0, date: Date()
+    private func recordReadingHistory() async {
+        let record: HistoryRecord
+        // 详情缓存优先；从下载页直接打开时通常没有详情缓存，此时必须
+        // 回退到下载任务持久化的 GalleryInfo，不能写入空标题历史记录。
+        if let detail = GalleryCache.shared.getDetail(gid: gid),
+           !detail.info.bestTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            record = detail.info.historyRecord()
+        } else if let downloadedGallery = await DownloadManager.shared.getAllTasks()
+            .first(where: { $0.gallery.gid == gid })?
+            .gallery {
+            record = downloadedGallery.historyRecord()
+        } else {
+            // 非下载入口且缓存不可用时仍保留阅读位置；后续再次从带元数据
+            // 的入口打开会通过 INSERT OR REPLACE 自动补全。
+            record = HistoryRecord(
+                gid: gid, token: token,
+                title: "", category: 0,
+                pages: pages, mode: 0, date: Date()
             )
-            record.titleJpn = info.titleJpn
-            record.thumb = info.thumb
-            record.posted = info.posted
-            record.uploader = info.uploader
-            record.rating = info.rating
-            record.simpleTags = info.simpleTags
-            record.simpleLanguage = info.simpleLanguage
-            do {
+        }
+
+        let historyLimit = AppSettings.shared.historyInfoSize
+        do {
+            try await Task.detached(priority: .utility) {
                 try EhDatabase.shared.insertHistory(record)
-                try EhDatabase.shared.trimHistory(maxCount: AppSettings.shared.historyInfoSize)
-                NotificationCenter.default.post(name: .galleryHistoryChanged, object: nil)
-            } catch {
-                debugLog("Failed to record reading history: \(error)")
-            }
-        } else if var record = Self.historyRecordFromLocalSources(gid: gid, token: token, pages: pages) {
-            // 没有详情缓存（从下载列表 / 收藏直接打开阅读器）时，去本地已有的记录里取。
-            //
-            // 此前这里直接写一条 title: "" / category: 0 的空记录，
-            // 历史页上就是一行「Untitled · Unknown · 0.00」——比不记还糟：
-            // 用户既认不出是哪一本，那行还占着位置。
-            record.date = Date()
-            do {
-                try EhDatabase.shared.insertHistory(record)
-                try EhDatabase.shared.trimHistory(maxCount: AppSettings.shared.historyInfoSize)
-                NotificationCenter.default.post(name: .galleryHistoryChanged, object: nil)
-            } catch {
-                debugLog("Failed to record reading history: \(error)")
-            }
+                try EhDatabase.shared.trimHistory(maxCount: historyLimit)
+            }.value
+            NotificationCenter.default.post(name: .ehHistoryDidChange, object: nil)
+        } catch {
+            debugLog("Failed to record reading history: \(error)")
         }
 
         // 记录最后阅读的画廊 GID (给"继续阅读"功能使用)
@@ -475,72 +679,54 @@ struct ImageReaderView: View {
     private func initializeReader() async {
         // 🛡️ 身份守卫: 将 View 持有的 gid 显式传给 ViewModel
         // Context Switch → resetState() → UI 立即转 Loading
-        // Hit Cache → 跳过初始化但仍应用 initialPage
+        // Hit Cache → 跳过整个初始化流程
         let needsLoad = vm.prepareForGallery(targetGid: gid, targetToken: token)
+        guard needsLoad else { return }
 
-        if needsLoad {
-            // Fix D-1, B-1: 从 DownloadManager 查询真实下载状态，替代硬编码 isDownloaded
-            await vm.setupLocalGallery()
+        // Fix D-1, B-1: 从 DownloadManager 查询真实下载状态，替代硬编码 isDownloaded
+        await vm.setupLocalGallery()
 
-            // Fix Race: setupLocalGallery 完成后再设置 totalPages
-            if pages > 0 {
-                vm.totalPages = pages
-            }
-
-            if let ps = previewSet {
-                vm.extractPTokens(from: ps)
-            }
-
-            if vm.totalPages == 0 {
-                await vm.fetchGalleryInfo()
-            }
-
-            // 获取页数后重算 spreads
-            vm.computeSpreads()
+        // Fix Race: setupLocalGallery 完成后再设置 totalPages
+        // 这样页面视图的 .task 不会在 isDownloaded 确定前触发 loadPage
+        if pages > 0 {
+            vm.totalPages = pages
         }
 
-        // Fix: 无论是否缓存命中，都应用目标页面
-        // 用户可能从不同缩略图进入同一画廊 → initialPage 必须被尊重
+        if let ps = previewSet {
+            vm.extractPTokens(from: ps)
+        }
+
+        if vm.totalPages == 0 {
+            await vm.fetchGalleryInfo()
+        }
+
+        // Fix Race: 阅读进度恢复移到这里 (从 init 迁移)
+        let targetPage: Int
         if let initial = initialPage, initial >= 0, initial < vm.totalPages {
-            vm.currentPage = initial
+            targetPage = initial
         } else if initialPage == nil {
-            // 没指定页就恢复上次读到的位置。
-            //
-            // 这里原本还要求 needsLoad——也就是「只在首次加载时恢复」。
-            // 但 needsLoad 为 false 表示这个 ViewModel 已经载着同一本书了，
-            // 此时两个分支都不成立，currentPage 保持默认的 0：
-            // 明明有进度，却从第一页开始。恢复只该看「调用方有没有指定页」，
-            // 与要不要重新加载数据无关。
             let key = "reading_progress_\(gid)"
             if let saved = UserDefaults.standard.object(forKey: key) as? Int, vm.totalPages > 0 {
-                vm.currentPage = min(saved, max(0, vm.totalPages - 1))
+                targetPage = min(saved, max(0, vm.totalPages - 1))
+            } else {
+                targetPage = 0
             }
-        }
-
-        // 🔑 同步所有滚动位置绑定 — onChange 不触发初始值，必须显式设置
-        // lazyCurrentPage 驱动 .scrollPosition(id:)，不同步会导致 ScrollView 停留在第 0 页
-        vm.lazyCurrentPage = vm.currentPage
-        vm.verticalScrollPage = vm.currentPage
-        if vm.isDoublePageEnabled {
-            vm.syncSpreadIndex()
-        }
-
-        if needsLoad {
-            await vm.loadCurrentPage()
         } else {
-            // 缓存命中: 仍然触发目标页的加载/预加载
-            await vm.onPageChange(vm.currentPage)
+            targetPage = 0
         }
-    }
 
-    /// 往后翻就收起工具条，进入全屏。
-    ///
-    /// 只在「前进」时收，不在回退时展开：读者往下读是连续动作，工具条留在
-    /// 那里一直挡着；而往回翻常常是为了找刚才那一页，这时候突然弹出工具条
-    /// 反而更碍事。要用工具条点一下屏幕中间就行。
-    private func enterFullscreenOnAdvance(from old: Int?, to new: Int?) {
-        guard let new, let old, new > old, showOverlay else { return }
-        withAnimation(.easeInOut(duration: 0.2)) { showOverlay = false }
+        // Build spreads first, then seed every native scrolling position with
+        // the same target before the first reader frame becomes interactive.
+        vm.computeSpreads()
+        vm.synchronizePagePosition(targetPage)
+
+        // 详情页的预览图通常已在内存或 URLCache 中，先用它估算
+        // 首帧背景，完整阅读图到达后 ReaderViewModel 会自动校准。
+        if let previewSet {
+            vm.seedDominantColor(from: previewSet, for: targetPage)
+        }
+
+        await vm.loadCurrentPage()
     }
 
     // MARK: - Progress Persistence
@@ -552,68 +738,76 @@ struct ImageReaderView: View {
 
     // MARK: - Navigation
 
-    #if os(iOS)
-    /// 把硬件按键映射成翻页动作 —— 方向键要按当前阅读方向解释
-    private func handleReaderKey(_ action: ReaderKeyAction) {
-        switch action {
-        case .previousPage: goToPreviousPage()
-        case .nextPage:     goToNextPage()
-        case .firstPage:    goToPage(0)
-        case .lastPage:     goToPage(vm.totalPages - 1)
-        case .dismiss:      dismiss()
-        case .arrowLeft:    handleKeyNavigation(forward: readingDirection == .rightToLeft)
-        case .arrowRight:   handleKeyNavigation(forward: readingDirection != .rightToLeft)
-        case .arrowUp:      goToPreviousPage()
-        case .arrowDown:    goToNextPage()
-        }
+    private func handleLeftArrow() {
+        readingDirection == .rightToLeft ? goToNextPage() : goToPreviousPage()
     }
-    #endif
 
-    private func handleKeyNavigation(forward: Bool) {
-        if forward { goToNextPage() } else { goToPreviousPage() }
+    private func handleRightArrow() {
+        readingDirection == .rightToLeft ? goToPreviousPage() : goToNextPage()
     }
 
     private func goToNextPage() {
+        goToNextPage(feedback: true)
+    }
+
+    private func goToNextPage(feedback: Bool) {
+        pageNavigationDelta = 1
         if vm.isDoublePageEnabled {
             // 双页模式: 按 spread 翻页
             guard let currentIdx = vm.currentSpreadIndex else { return }
             let nextSpread = currentIdx + 1
             guard nextSpread < vm.spreads.count else { return }
             let nextPage = vm.pageForSpread(nextSpread)
-            // 不使用 withAnimation: ScrollView 自带翻页动画，额外动画会导致闪烁
-            vm.currentPage = nextPage
-            vm.currentSpreadIndex = nextSpread
-            Task { await vm.onPageChange(nextPage) }
+            if feedback { Haptics.tap() }
+            updateHorizontalPagePosition(page: nextPage, spread: nextSpread)
         } else {
             guard vm.currentPage < vm.totalPages - 1 else { return }
-            vm.currentPage += 1
-            Task { await vm.onPageChange(vm.currentPage) }
+            let nextPage = vm.currentPage + 1
+            if feedback { Haptics.tap() }
+            updateHorizontalPagePosition(page: nextPage)
         }
     }
 
     private func goToPreviousPage() {
+        pageNavigationDelta = -1
         if vm.isDoublePageEnabled {
             guard let currentIdx = vm.currentSpreadIndex else { return }
             let prevSpread = currentIdx - 1
             guard prevSpread >= 0 else { return }
             let prevPage = vm.pageForSpread(prevSpread)
-            vm.currentPage = prevPage
-            vm.currentSpreadIndex = prevSpread
-            Task { await vm.onPageChange(prevPage) }
+            Haptics.tap()
+            updateHorizontalPagePosition(page: prevPage, spread: prevSpread)
         } else {
             guard vm.currentPage > 0 else { return }
-            vm.currentPage -= 1
-            Task { await vm.onPageChange(vm.currentPage) }
+            let previousPage = vm.currentPage - 1
+            Haptics.tap()
+            updateHorizontalPagePosition(page: previousPage)
         }
     }
 
     private func goToPage(_ page: Int) {
         let target = max(0, min(vm.totalPages - 1, page))
-        vm.currentPage = target
-        if vm.isDoublePageEnabled {
-            vm.syncSpreadIndex()
+        pageNavigationDelta = target >= vm.currentPage ? 1 : -1
+        let spread = vm.isDoublePageEnabled ? vm.spreadIndex(for: target) : nil
+        updateHorizontalPagePosition(page: target, spread: spread)
+    }
+
+    /// Programmatic turns update SwiftUI's native paging position in one
+    /// transaction on every platform. Updating the logical page and the
+    /// scroll target together avoids a second correction frame on iPad.
+    private func updateHorizontalPagePosition(page: Int, spread: Int? = nil) {
+        let updatePosition = {
+            vm.synchronizePagePosition(page)
+            if let spread { vm.currentSpreadIndex = spread }
         }
-        Task { await vm.onPageChange(target) }
+
+        if pageAnimationEnabled {
+            withAnimation(.smooth(duration: 0.28), updatePosition)
+        } else {
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction, updatePosition)
+        }
     }
 
     // MARK: - Auto Page
@@ -634,15 +828,15 @@ struct ImageReaderView: View {
                 try? await Task.sleep(nanoseconds: UInt64(AppSettings.shared.autoPageInterval) * 1_000_000_000)
                 if !Task.isCancelled && autoPageEnabled {
                     await MainActor.run {
-                        goToNextPage()
+                        goToNextPage(feedback: false)
                     }
                 }
             }
         }
     }
 
-    // MARK: - Horizontal Page Reader (iOS)
-    // Perf P0-1: 使用 ScrollView + LazyHStack + .scrollTargetBehavior(.paging) 替代 TabView
+    // MARK: - Horizontal Page Reader
+    // Perf P0-1: 使用 ScrollView + LazyHStack + 原生 view-aligned paging 替代 TabView
     // TabView(.page) 是非懒加载的 — 会一次性实例化所有子 View
     // LazyHStack 只创建可见区域内的 View，40 页画廊 → 仅 ~3 个 View
 
@@ -660,17 +854,17 @@ struct ImageReaderView: View {
                     }
                     .scrollTargetLayout()
                 }
-                .scrollTargetBehavior(.paging)
+                // Limit a fast iPad flick to one spread while retaining the
+                // native, finger-tracking horizontal transition.
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
                 .scrollPosition(id: $vm.currentSpreadIndex)
-                #if os(iOS)
                 .environment(\.layoutDirection, readingDirection == .rightToLeft ? .rightToLeft : .leftToRight)
-                #endif
-                .onChange(of: vm.currentSpreadIndex) { oldIdx, newIdx in
-                    enterFullscreenOnAdvance(from: oldIdx, to: newIdx)
+                .onChange(of: vm.currentSpreadIndex) { _, newIdx in
+                    guard hasAppliedInitialPage else { return }
                     guard let idx = newIdx else { return }
                     let page = vm.pageForSpread(idx)
                     if vm.currentPage != page {
-                        vm.currentPage = page
+                        vm.synchronizePagePosition(page)
                     }
                     saveReadingProgress()
                     // Perf: 去抖 — 快速翻页时只处理最终落地页
@@ -693,17 +887,16 @@ struct ImageReaderView: View {
                     }
                     .scrollTargetLayout()
                 }
-                .scrollTargetBehavior(.paging)
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
                 .scrollPosition(id: $vm.lazyCurrentPage)
-                // 图片缩放时禁用翻页滚动，让 SwiftUIZoomableImage 的拖动手势控制平移
-                .scrollDisabled(isZoomed)
-                #if os(iOS)
                 .environment(\.layoutDirection, readingDirection == .rightToLeft ? .rightToLeft : .leftToRight)
-                #endif
-                .onChange(of: vm.lazyCurrentPage) { oldPage, newPage in
-                    enterFullscreenOnAdvance(from: oldPage, to: newPage)
-                    if let page = newPage, page != vm.currentPage {
-                        vm.currentPage = page
+                .onChange(of: vm.lazyCurrentPage) { _, newPage in
+                    guard hasAppliedInitialPage else { return }
+                    guard let page = newPage,
+                          page >= 0,
+                          page < vm.totalPages else { return }
+                    if page != vm.currentPage {
+                        vm.synchronizePagePosition(page)
                     }
                     saveReadingProgress()
                     // Perf: 去抖 — 快速滑动时取消上一次预加载，仅处理结束页
@@ -711,7 +904,7 @@ struct ImageReaderView: View {
                     pageChangeTask = Task {
                         try? await Task.sleep(nanoseconds: 80_000_000) // 80ms debounce
                         guard !Task.isCancelled else { return }
-                        await vm.onPageChange(vm.currentPage)
+                        await vm.onPageChange(page)
                     }
                 }
                 .onChange(of: vm.currentPage) { _, newPage in
@@ -722,6 +915,23 @@ struct ImageReaderView: View {
                 }
             }
         }
+        .task(id: vm.totalPages) {
+            guard vm.totalPages > 0, !hasAppliedInitialPage else { return }
+            let targetPage = vm.currentPage
+
+            // Let LazyHStack register its IDs, then reassert the target without
+            // animation. ScrollView may publish its default ID (0) during these
+            // first layout passes; the guards above prevent that transient value
+            // from overwriting the requested preview page.
+            await Task.yield()
+            await Task.yield()
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                vm.synchronizePagePosition(targetPage)
+            }
+            hasAppliedInitialPage = true
+        }
     }
 
     // MARK: - macOS Page Reader
@@ -729,28 +939,150 @@ struct ImageReaderView: View {
     #if os(macOS)
     private func macOSPageReader(geometry: GeometryProxy) -> some View {
         ZStack {
-            if vm.isDoublePageEnabled {
-                let spreadIdx = vm.currentSpreadIndex ?? 0
-                let spread = spreadIdx < vm.spreads.count
-                    ? vm.spreads[spreadIdx]
-                    : vm.spreads.last ?? PageSpread(id: 0, primaryPage: 0, secondaryPage: nil)
-                spreadPageView(spread: spread)
-            } else {
-                pageImage(index: vm.currentPage)
-            }
+            // Native paging keeps the outgoing and incoming pages in one
+            // scroll container, avoiding the overlap/flicker produced by an
+            // asymmetric transition between two full-size image views.
+            horizontalPageReader(geometry: geometry)
 
             ScrollWheelPageNavigator(
                 onNext: { goToNextPage() },
                 onPrevious: { goToPreviousPage() },
+                onSwipeLeft: {
+                    readingDirection == .rightToLeft ? goToPreviousPage() : goToNextPage()
+                },
+                onSwipeRight: {
+                    readingDirection == .rightToLeft ? goToNextPage() : goToPreviousPage()
+                },
+                onSingleTap: { location, viewSize in
+                    handleTapZone(location: location, viewSize: viewSize)
+                },
                 isZoomed: isZoomed
             )
         }
-        .onChange(of: vm.currentPage) { _, newPage in
-            saveReadingProgress()
-            Task { await vm.onPageChange(newPage) }
+        .contextMenu {
+            Button {
+                copyCurrentReaderImage()
+            } label: {
+                Label("拷贝图片", systemImage: "doc.on.doc")
+            }
+            .disabled(vm.cachedImages[vm.currentPage] == nil)
+
+            Button {
+                saveCurrentReaderImage()
+            } label: {
+                Label("下载图片…", systemImage: "arrow.down.to.line")
+            }
+            .disabled(vm.imageURLs[vm.currentPage] == nil)
+
+            Divider()
+
+            Button {
+                recognizeAndTranslateCurrentImage()
+            } label: {
+                Label(
+                    AppLocalization.localized(isRecognizingImageText ? "正在识别文字…" : "翻译图片文字…"),
+                    systemImage: "translate"
+                )
+            }
+            .disabled(vm.cachedImages[vm.currentPage] == nil || isRecognizingImageText)
+
+            Divider()
+
+            Button {
+                Task { await vm.loadOriginalImage(vm.currentPage) }
+            } label: {
+                Label(
+                    AppLocalization.localized(vm.pagesUsingOriginalImage.contains(vm.currentPage) ? "已加载原图" : "加载原图"),
+                    systemImage: "photo.badge.arrow.down"
+                )
+            }
+            .disabled(vm.pagesUsingOriginalImage.contains(vm.currentPage))
+        }
+    }
+
+    private func copyCurrentReaderImage() {
+        guard let image = vm.cachedImages[vm.currentPage] else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([image])
+    }
+
+    private func recognizeAndTranslateCurrentImage() {
+        recognizeAndTranslateImage(at: vm.currentPage)
+    }
+
+    private func saveCurrentReaderImage() {
+        let page = vm.currentPage
+        let sourceExtension = vm.imageURLs[page]
+            .flatMap(URL.init(string:))?
+            .pathExtension
+            .lowercased()
+        let fileExtension = (sourceExtension?.isEmpty == false ? sourceExtension : nil) ?? "jpg"
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(gid)-\(page + 1).\(fileExtension)"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: fileExtension) ?? .image]
+
+        let save: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task {
+                do {
+                    let data = try await vm.sourceImageData(for: page)
+                    try data.write(to: destination, options: .atomic)
+                } catch {
+                    debugLog("[Reader] Saving image failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if let readerWindow {
+            panel.beginSheetModal(for: readerWindow, completionHandler: save)
+        } else {
+            save(panel.runModal())
         }
     }
     #endif
+
+    private func recognizeAndTranslateImage(at index: Int) {
+        guard !isRecognizingImageText, let image = vm.cachedImages[index] else { return }
+        #if os(iOS)
+        guard let cgImage = image.cgImage else { return }
+        #else
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        #endif
+
+        isRecognizingImageText = true
+        Task {
+            do {
+                var request = RecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.automaticallyDetectsLanguage = true
+                request.usesLanguageCorrection = true
+
+                let observations = try await request.perform(on: cgImage)
+                let text = observations
+                    .compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                isRecognizingImageText = false
+                if text.isEmpty {
+                    imageTranslationError = AppLocalization.localized("当前页面没有识别到可翻译的文字。")
+                    showImageTranslationError = true
+                } else {
+                    recognizedImageText = text
+                    showImageTranslation = true
+                }
+            } catch is CancellationError {
+                isRecognizingImageText = false
+            } catch {
+                isRecognizingImageText = false
+                imageTranslationError = error.localizedDescription
+                showImageTranslationError = true
+            }
+        }
+    }
 
     // MARK: - Spread Page View (双页合成视图)
 
@@ -758,18 +1090,23 @@ struct ImageReaderView: View {
     @ViewBuilder
     private func spreadPageView(spread: PageSpread) -> some View {
         if let composited = vm.spreadImage(at: spread.id, direction: readingDirection) {
-            ZoomableImageView(
-                image: composited,
-                scaleMode: scaleMode,
-                startPosition: startPosition,
-                allowsHorizontalScrollAtMinZoom: false,
-                onSingleTap: { location, viewSize in
-                    handleTapZone(location: location, viewSize: viewSize)
-                },
-                onZoomChanged: { zoomed in
-                    isZoomed = zoomed
-                }
-            )
+            readerImageContextMenu(for: spread.pages) {
+                ZoomableImageView(
+                    image: composited,
+                    scaleMode: scaleMode,
+                    startPosition: startPosition,
+                    allowsHorizontalScrollAtMinZoom: false,
+                    onSingleTap: { location, viewSize in
+                        handleTapZone(location: location, viewSize: viewSize)
+                    },
+                    onZoomChanged: { zoomed in
+                        isZoomed = zoomed
+                    },
+                    pageSwipeAnimationEnabled: pageAnimationEnabled,
+                    onSwipeLeft: handleReaderSwipeLeft,
+                    onSwipeRight: handleReaderSwipeRight
+                )
+            }
         } else {
             // 至少一页尚未加载 — 显示加载状态
             VStack(spacing: 12) {
@@ -783,18 +1120,26 @@ struct ImageReaderView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // 两页都交给看护。此前这里是一次性的 TaskGroup，和单页/垂直模式
-            // 修掉的是同一个毛病：预加载正在下其中一页时被翻页取消，
-            // 这个 .task 早就跑完了不会重来，合成图缺一页就永远出不来。
-            .task(id: spread.pages.map { "\(vm.imageURLs[$0] ?? "")_\(vm.retryGeneration[$0, default: 0])" }
-                            .joined(separator: "|")) {
+            .task(id: spreadPreparationID(spread)) {
+                // 同时加载两页
                 await withTaskGroup(of: Void.self) { group in
                     for p in spread.pages {
-                        group.addTask { await vm.superviseLoading(of: p) }
+                        group.addTask {
+                            await vm.loadPageWithRetry(p)
+                            await vm.downloadImageData(p)
+                        }
                     }
                 }
+                await vm.prepareSpreadImage(at: spread.id, direction: readingDirection)
             }
         }
+    }
+
+    private func spreadPreparationID(_ spread: PageSpread) -> String {
+        let retryState = spread.pages.map { page in
+            "\(page):\(vm.retryGeneration[page, default: 0])"
+        }.joined(separator: ",")
+        return "\(spread.id):\(readingDirection.rawValue):\(retryState)"
     }
 
     /// 单页加载指示器 (复用于 spread 和单页模式)
@@ -812,16 +1157,15 @@ struct ImageReaderView: View {
                 Button("重新加载") {
                     Task { await vm.retryLoadPage(index) }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.white.opacity(0.9))
+                .buttonStyle(.glassProminent)
             }
-        } else if let progress = vm.downloadProgress[index], progress >= 0 {
+        } else if let progress = vm.downloadProgress[index], progress > 0 {
             ZStack {
                 Circle()
                     .stroke(Color.white.opacity(0.3), lineWidth: 3)
                     .frame(width: 48, height: 48)
                 Circle()
-                    .trim(from: 0, to: max(0.01, progress))
+                    .trim(from: 0, to: progress)
                     .stroke(Color.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                     .frame(width: 48, height: 48)
                     .rotationEffect(.degrees(-90))
@@ -847,37 +1191,42 @@ struct ImageReaderView: View {
     // .scrollPosition 是 SwiftUI 原生 API，内部由 runtime 高效追踪
 
     private func verticalScrollReader(geometry: GeometryProxy) -> some View {
-        let contentWidth = geometry.size.width
+        let contentWidth = geometry.size.width * verticalZoomScale
         let showInterval = verticalPageInterval
 
         return ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
+            ScrollView([.vertical, .horizontal], showsIndicators: false) {
                 LazyVStack(spacing: showInterval ? 8 : 0) {
                     ForEach(0..<vm.totalPages, id: \.self) { idx in
-                        verticalPageImage(index: idx, containerWidth: contentWidth)
+                        verticalPageImage(index: idx)
                             .frame(width: contentWidth)
                             .id(idx)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .center)
             }
-            .clipped()
-            // Perf: 垂直模式不再使用 SwiftUIZoomableImage，无需 scrollDisabled
             .scrollTargetLayout()
             .scrollPosition(id: $vm.verticalScrollPage, anchor: .top)
             .scrollBounceBehavior(.basedOnSize)
             .contentShape(Rectangle())
-            // Fix: 使用 SpatialTapGesture 恢复点击翻页区域
-            // 用 simultaneousGesture 不阻塞 ScrollView 的滚动手势
-            // 滚动后 500ms 内忽略点击，防止惯性滚动误触
+            // 移除了 TapGesture: 防止滚动时疯狂误触工具栏
+            // 工具栏切换改由底部浮动导航栏的中央按钮触发
+            #if os(iOS)
             .simultaneousGesture(
-                SpatialTapGesture()
+                MagnifyGesture()
+                    .onChanged { value in
+                        verticalZoomScale = max(1.0, min(3.0, verticalBaseScale * value.magnification))
+                    }
                     .onEnded { value in
-                        let timeSinceScroll = Date().timeIntervalSince(lastScrollChangeTime)
-                        guard timeSinceScroll > 0.5 else { return }
-                        handleTapZone(location: value.location, viewSize: geometry.size)
+                        verticalBaseScale = verticalZoomScale
+                        if verticalZoomScale < 1.1 {
+                            withAnimation(.spring()) {
+                                verticalZoomScale = 1.0
+                                verticalBaseScale = 1.0
+                            }
+                        }
                     }
             )
+            #endif
             .onAppear {
                 if vm.currentPage > 0 && !hasAppliedInitialScroll {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -891,21 +1240,13 @@ struct ImageReaderView: View {
                     }
                 }
             }
-            .onChange(of: vm.verticalScrollPage) { oldPage, newPage in
-                enterFullscreenOnAdvance(from: oldPage, to: newPage)
+            .onChange(of: vm.verticalScrollPage) { _, newPage in
                 // 滚动引起的页码变化 → 同步 currentPage
                 guard let page = newPage, page != vm.currentPage else { return }
                 isUpdatingFromScroll = true
-                vm.currentPage = page
+                vm.synchronizePagePosition(page)
                 lastScrollChangeTime = Date()
                 saveReadingProgress()
-                // Perf: 去抖预加载 — 快速滚动时只处理最终落地页，避免大量并发预加载
-                pageChangeTask?.cancel()
-                pageChangeTask = Task {
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms debounce
-                    guard !Task.isCancelled else { return }
-                    await vm.onPageChange(page)
-                }
                 DispatchQueue.main.async {
                     self.isUpdatingFromScroll = false
                 }
@@ -925,10 +1266,7 @@ struct ImageReaderView: View {
 
     /// 垂直滚动模式的页面图片 — 宽度撑满、高度按比例
     @ViewBuilder
-    private func verticalPageImage(index: Int, containerWidth: CGFloat) -> some View {
-        // 预估占位高度 (典型漫画页比例 ~1.4:1)，减少图片加载时的布局跳动
-        let estimatedHeight = containerWidth * 1.4
-
+    private func verticalPageImage(index: Int) -> some View {
         if vm.errorPages.contains(index) {
             VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle")
@@ -941,47 +1279,35 @@ struct ImageReaderView: View {
                 Button("重新加载") {
                     Task { await vm.retryLoadPage(index) }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.white.opacity(0.9))
+                .buttonStyle(.glassProminent)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: estimatedHeight)
+            .frame(height: 300)
         } else if let cachedImage = vm.image(at: index) {
-            // Perf: 垂直滚动模式使用轻量渲染 — 不加载 SwiftUIZoomableImage 的
-            // GeometryReader + PreferenceKey + 3 套手势识别器，大幅减少 LazyVStack 滑动开销
             let imgSize = cachedImage.size
-            let ratio = imgSize.width > 0 ? imgSize.height / imgSize.width : 1.4
-
-            // 单页菜单在横竖两种模式下都要有。垂直模式走的是这条独立的
-            // 轻量渲染路径，只在 pageImage 上挂菜单的话，上下滚动模式里长按没反应。
-            Group {
-                if cachedImage.isAnimated {
-                    #if os(macOS)
-                    AnimatedImageView(image: cachedImage, contentMode: .scaleProportionallyUpOrDown)
-                        .frame(width: containerWidth, height: containerWidth * ratio)
-                    #else
-                    AnimatedImageView(image: cachedImage, contentMode: .scaleAspectFit)
-                        .frame(width: containerWidth, height: containerWidth * ratio)
-                    #endif
+            let ratio = imgSize.width > 0 ? imgSize.height / imgSize.width : 1.0
+            readerImageContextMenu(for: [index]) {
+                if cachedImage.isAnimatedPlatformImage {
+                    PlatformAnimatedImageView(image: cachedImage, contentMode: .fit)
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(1.0 / ratio, contentMode: .fit)
                 } else {
                     nativeImage(cachedImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: containerWidth)
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(1.0 / ratio, contentMode: .fit)
                 }
-            }
-            .contextMenu {
-                pageMenu(index: index, image: cachedImage)
             }
         } else if vm.imageURLs[index] != nil {
             VStack(spacing: 8) {
-                if let progress = vm.downloadProgress[index], progress >= 0 {
+                if let progress = vm.downloadProgress[index], progress > 0 {
                     ZStack {
                         Circle()
                             .stroke(Color.white.opacity(0.3), lineWidth: 3)
                             .frame(width: 48, height: 48)
                         Circle()
-                            .trim(from: 0, to: max(0.01, progress))
+                            .trim(from: 0, to: progress)
                             .stroke(Color.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                             .frame(width: 48, height: 48)
                             .rotationEffect(.degrees(-90))
@@ -999,10 +1325,9 @@ struct ImageReaderView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .frame(height: estimatedHeight)
-            // 同上：看护到出结果为止，不是只试一次
+            .frame(height: 300)
             .task(id: "\(vm.imageURLs[index] ?? "")_\(vm.retryGeneration[index, default: 0])") {
-                await vm.superviseLoading(of: index)
+                await vm.downloadImageData(index)
             }
         } else {
             VStack(spacing: 8) {
@@ -1016,61 +1341,14 @@ struct ImageReaderView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .frame(height: estimatedHeight)
-            // 同上：解析地址这一步被取消后也要有人接着管
+            .frame(height: 300)
             .task {
-                await vm.superviseLoading(of: index)
+                await vm.loadPageWithRetry(index)
             }
         }
     }
 
     // MARK: - Single Page Image (翻页模式单页)
-
-    /// 单页菜单。四项与 Android GalleryActivity.showPageDialog 一一对应：
-    /// 刷新本页 / 分享 / 保存到相册 / 存储到文件。
-    @ViewBuilder
-    private func pageMenu(index: Int, image: PlatformImage) -> some View {
-        #if os(iOS)
-        Button {
-            // 对齐 Android: removeCache(page) + forceRequest(page)
-            Task { await vm.retryLoadPage(index) }
-        } label: {
-            Label("刷新本页", systemImage: "arrow.clockwise")
-        }
-
-        Button {
-            if let url = ReaderImageSaver.temporaryFile(for: image, gid: gid, page: index) {
-                shareItem = ReaderShareItem(url: url)
-            } else {
-                EhToast.failure("无法准备图片")
-            }
-        } label: {
-            Label("分享", systemImage: "square.and.arrow.up")
-        }
-
-        Button {
-            Task { await ReaderImageSaver.saveToPhotos(image) }
-        } label: {
-            Label("保存到相册", systemImage: "photo.badge.arrow.down")
-        }
-
-        Button {
-            // 「存储到文件」走的也是系统面板，那里有「存储到文件」这一项，
-            // 对应 Android 的 page_menu_save_to
-            if let url = ReaderImageSaver.temporaryFile(for: image, gid: gid, page: index) {
-                shareItem = ReaderShareItem(url: url)
-            }
-        } label: {
-            Label("存储到文件", systemImage: "folder.badge.plus")
-        }
-        #else
-        Button {
-            Task { await vm.retryLoadPage(index) }
-        } label: {
-            Label("刷新本页", systemImage: "arrow.clockwise")
-        }
-        #endif
-    }
 
     private func pageImage(index: Int) -> some View {
         Group {
@@ -1086,50 +1364,36 @@ struct ImageReaderView: View {
                     Button("重新加载") {
                         Task { await vm.retryLoadPage(index) }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.white.opacity(0.9))
+                    .buttonStyle(.glassProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let cachedImage = vm.image(at: index) {
-                #if os(iOS)
-                SwiftUIZoomableImage(
-                    image: cachedImage,
-                    isFullPage: true,
-                    onSingleTap: { location, viewSize in
-                        handleTapZone(location: location, viewSize: viewSize)
-                    },
-                    onZoomChanged: { zoomed in
-                        isZoomed = zoomed
-                    }
-                )
-                // 单页菜单（对齐 Android GalleryActivity.showPageDialog）。
-                // 此前一项都没有：一页加载坏了只能退出重进，想留一张也没出口。
-                .contextMenu {
-                    pageMenu(index: index, image: cachedImage)
+                readerImageContextMenu(for: [index]) {
+                    ZoomableImageView(
+                        image: cachedImage,
+                        scaleMode: scaleMode,
+                        startPosition: startPosition,
+                        allowsHorizontalScrollAtMinZoom: readingDirection == .topToBottom,
+                        onSingleTap: { location, viewSize in
+                            handleTapZone(location: location, viewSize: viewSize)
+                        },
+                        onZoomChanged: { zoomed in
+                            isZoomed = zoomed
+                        },
+                        pageSwipeAnimationEnabled: pageAnimationEnabled,
+                        onSwipeLeft: handleReaderSwipeLeft,
+                        onSwipeRight: handleReaderSwipeRight
+                    )
                 }
-                #else
-                ZoomableImageView(
-                    image: cachedImage,
-                    scaleMode: scaleMode,
-                    startPosition: startPosition,
-                    allowsHorizontalScrollAtMinZoom: readingDirection == .topToBottom,
-                    onSingleTap: { location, viewSize in
-                        handleTapZone(location: location, viewSize: viewSize)
-                    },
-                    onZoomChanged: { zoomed in
-                        isZoomed = zoomed
-                    }
-                )
-                #endif
             } else if vm.imageURLs[index] != nil {
                 VStack(spacing: 8) {
-                    if let progress = vm.downloadProgress[index], progress >= 0 {
+                    if let progress = vm.downloadProgress[index], progress > 0 {
                         ZStack {
                             Circle()
                                 .stroke(Color.white.opacity(0.3), lineWidth: 3)
                                 .frame(width: 48, height: 48)
                             Circle()
-                                .trim(from: 0, to: max(0.01, progress))
+                                .trim(from: 0, to: progress)
                                 .stroke(Color.white, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                                 .frame(width: 48, height: 48)
                                 .rotationEffect(.degrees(-90))
@@ -1147,11 +1411,8 @@ struct ImageReaderView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // 看护到出结果为止。此前这里是一次性的 .task：下载被取消之后
-                // 占位符还在屏幕上（它从没消失过），id 也没变，于是不会重跑，
-                // 这一页就永远停在转圈上。
                 .task(id: "\(vm.imageURLs[index] ?? "")_\(vm.retryGeneration[index, default: 0])") {
-                    await vm.superviseLoading(of: index)
+                    await vm.downloadImageData(index)
                 }
             } else {
                 VStack(spacing: 8) {
@@ -1165,19 +1426,103 @@ struct ImageReaderView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // 解析 pToken / 图片地址这一步同样会被翻页取消，
-                // 一样交给看护，不然卡在这一层也是永久转圈
                 .task {
-                    await vm.superviseLoading(of: index)
+                    await vm.loadPageWithRetry(index)
                 }
             }
         }
     }
 
+    /// iOS/iPadOS 使用系统 context menu 提供长按操作。macOS 已在阅读器
+    /// 外层提供右键菜单，因此保持原有实现，避免出现重复菜单。
+    @ViewBuilder
+    private func readerImageContextMenu<Content: View>(
+        for pageIndices: [Int],
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        #if os(iOS)
+        content()
+            .contextMenu {
+                Button {
+                    Task {
+                        for index in pageIndices where !vm.pagesUsingOriginalImage.contains(index) {
+                            await vm.loadOriginalImage(index)
+                        }
+                    }
+                } label: {
+                    Label("加载原图", systemImage: "photo.badge.arrow.down")
+                }
+                .disabled(pageIndices.allSatisfy(vm.pagesUsingOriginalImage.contains))
+
+                Button {
+                    if let page = pageIndices.first {
+                        recognizeAndTranslateImage(at: page)
+                    }
+                } label: {
+                    Label(
+                        AppLocalization.localized(isRecognizingImageText ? "正在识别文字…" : "翻译图片文字…"),
+                        systemImage: "translate"
+                    )
+                }
+                .disabled(
+                    isRecognizingImageText
+                        || pageIndices.first.flatMap { vm.cachedImages[$0] } == nil
+                )
+
+                Button {
+                    if let page = pageIndices.first {
+                        saveReaderImage(page)
+                    }
+                } label: {
+                    Label("保存图片", systemImage: "square.and.arrow.down")
+                }
+                .disabled(pageIndices.first.flatMap { vm.cachedImages[$0] } == nil)
+
+                Button {
+                    if let page = pageIndices.first {
+                        copyReaderImage(page)
+                    }
+                } label: {
+                    Label("拷贝图片", systemImage: "doc.on.doc")
+                }
+                .disabled(pageIndices.first.flatMap { vm.cachedImages[$0] } == nil)
+            }
+        #else
+        content()
+        #endif
+    }
+
+    #if os(iOS)
+    private func saveReaderImage(_ index: Int) {
+        guard let image = vm.cachedImages[index] else { return }
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+    }
+
+    private func copyReaderImage(_ index: Int) {
+        guard let image = vm.cachedImages[index] else { return }
+        UIPasteboard.general.image = image
+    }
+    #endif
+
     // MARK: - Tap Zone Detection
+
+    private func handleReaderSwipeLeft() {
+        readingDirection == .rightToLeft ? goToPreviousPage() : goToNextPage()
+    }
+
+    private func handleReaderSwipeRight() {
+        readingDirection == .rightToLeft ? goToNextPage() : goToPreviousPage()
+    }
 
     private func handleTapZone(location: CGPoint, viewSize: CGSize) {
         guard viewSize.width > 0 && viewSize.height > 0 else { return }
+
+        #if os(macOS)
+        if isFullScreen && showOverlay {
+            withAnimation(.easeInOut(duration: 0.2)) { showOverlay = false }
+            return
+        }
+        #endif
 
         let relX = location.x / viewSize.width
         let relY = location.y / viewSize.height
@@ -1187,21 +1532,22 @@ struct ImageReaderView: View {
         }
 
         if relX < tapZoneRatio {
-            // 左侧 25%: RTL → 下一页, LTR/垂直 → 上一页
             if readingDirection == .rightToLeft {
                 goToNextPage()
-            } else {
+            } else if readingDirection == .leftToRight {
                 goToPreviousPage()
+            } else {
+                withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
             }
         } else if relX > (1 - tapZoneRatio) {
-            // 右侧 25%: RTL → 上一页, LTR/垂直 → 下一页
             if readingDirection == .rightToLeft {
                 goToPreviousPage()
-            } else {
+            } else if readingDirection == .leftToRight {
                 goToNextPage()
+            } else {
+                withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
             }
         } else {
-            // 中间 50%: 切换工具栏
             withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
         }
     }
@@ -1222,7 +1568,7 @@ struct ImageReaderView: View {
             VStack(spacing: 4) {
                 Image(systemName: readingDirection == .rightToLeft ? "arrow.right" : "arrow.left")
                     .font(.title2)
-                Text(readingDirection == .rightToLeft ? "下一页" : "上一页")
+                Text(AppLocalization.localized(readingDirection == .rightToLeft ? "下一页" : "上一页"))
                     .font(.caption.bold())
             }
             .foregroundStyle(.white)
@@ -1255,7 +1601,7 @@ struct ImageReaderView: View {
             VStack(spacing: 4) {
                 Image(systemName: readingDirection == .rightToLeft ? "arrow.left" : "arrow.right")
                     .font(.title2)
-                Text(readingDirection == .rightToLeft ? "上一页" : "下一页")
+                Text(AppLocalization.localized(readingDirection == .rightToLeft ? "上一页" : "下一页"))
                     .font(.caption.bold())
             }
             .foregroundStyle(.white)
@@ -1297,9 +1643,8 @@ struct ImageReaderView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 32)
                         .padding(.vertical, 12)
-                        .background(.white.opacity(0.2), in: Capsule())
-                        .overlay(Capsule().stroke(.white.opacity(0.5), lineWidth: 1))
                 }
+                .buttonStyle(.glassProminent)
                 .padding(.bottom, max(40, geometry.safeAreaInsets.bottom + 20))
             }
 
@@ -1337,7 +1682,7 @@ struct ImageReaderView: View {
         VStack {
             // 顶部工具栏 — 从顶部滑入
             if showOverlay {
-                topBar
+                topBar(geometry: geometry)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
@@ -1345,246 +1690,373 @@ struct ImageReaderView: View {
 
             // 底部工具栏 — 从底部滑入
             if showOverlay {
-                bottomBar
+                bottomBar(geometry: geometry)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.3), value: showOverlay)
     }
 
-    private var topBar: some View {
-        // 两枚玻璃胶囊而非一条通栏工具栏：阅读器的主体是图，
-        // 通栏会在图上压出一条硬边，胶囊只占它需要的宽度。
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Button(action: { dismiss() }) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(EhReaderChrome.label)
-                }
-
-                if let title = readerTitle {
-                    Text(title)
-                        .font(EhFont.caption)
-                        .foregroundStyle(EhReaderChrome.label)
-                        .lineLimit(1)
-                        .frame(maxWidth: 150, alignment: .leading)
-                }
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 38)
-            .ehReaderGlass(cornerRadius: 19)
-
-            Spacer(minLength: 8)
-
-            // 双页与阅读方向只在底栏出现一次。
-            // 此前顶栏和底栏各有一份，同一个开关在屏幕上有两个位置、
-            // 两种样式，按哪个都行——这不是「快捷方式」，是重复。
-            HStack(spacing: 14) {
-                Button { showPageGrid = true } label: {
-                    Image(systemName: "square.grid.2x2")
-                        .foregroundStyle(EhReaderChrome.label)
-                }
-
-                // 齿轮。这里原来画的是 sun.max，点开却是整个阅读设置面板——
-                // 图标承诺的是亮度，打开的是设置。
-                Button { showSettings = true } label: {
-                    Image(systemName: "gearshape")
-                        .foregroundStyle(EhReaderChrome.label)
-                }
-            }
-            .font(.system(size: 15, weight: .medium))
-            .padding(.horizontal, 14)
-            .frame(height: 38)
-            .ehReaderGlass(cornerRadius: 19)
-        }
-        .padding(.horizontal, EhSpacing.page)
-        .padding(.top, 50)
-    }
-
-    /// 顶栏胶囊里的画廊标题。
-    ///
-    /// 阅读器只拿到 gid/token，标题从详情缓存里取——这份缓存在进阅读器之前
-    /// 必然已经填好（详情页是唯一入口），所以不必为它多发一次请求。
-    /// 取不到就不显示，胶囊缩成只有返回键，不占无谓的宽度。
-    private var readerTitle: String? {
-        guard let info = GalleryCache.shared.getDetail(gid: gid)?.info else { return nil }
-        let title = info.suitableTitle(preferJpn: AppSettings.shared.showJpnTitle)
-        return title.isEmpty ? nil : title
-    }
-
-    /// 底部页码文案 —— 双页时显示成 "12–13"
-    private var pageIndicatorText: String {
-        if vm.isDoublePageEnabled, let idx = vm.currentSpreadIndex, idx < vm.spreads.count {
-            let spread = vm.spreads[idx]
-            if let sec = spread.secondaryPage {
-                return "\(spread.primaryPage + 1)–\(sec + 1)"
-            }
-            return "\(spread.primaryPage + 1)"
-        }
-        return "\(displayedPage + 1)"
-    }
-
-    private var bottomBar: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: EhSpacing.row) {
-                Text(pageIndicatorText)
-                    .font(EhFont.mono(13, weight: .semibold))
-                    .foregroundStyle(EhReaderChrome.label)
-                    .frame(minWidth: 44, alignment: .leading)
-
-                // 拖动期间只更新本地 state，不碰 vm.currentPage。
-                // currentPage 是 @Observable，每动一像素写一次会让整个阅读器
-                // (ScrollView + 所有页视图) 重新求值 —— 这正是拖进度条卡顿的原因。
-                Slider(
-                    value: Binding(
-                        get: { isSeeking ? seekValue : Double(vm.currentPage) },
-                        // setter 自己置 isSeeking —— 不能依赖 onEditingChanged(true)
-                        // 先于第一次 set 到达，否则它会把刚拖到的值清回当前页
-                        set: { newValue in
-                            isSeeking = true
-                            seekValue = newValue
+    private func topBar(geometry: GeometryProxy) -> some View {
+        GlassEffectContainer(spacing: 12) {
+            ZStack {
+                // 页码显示 (双页模式标注 spread)
+                Group {
+                    if vm.isDoublePageEnabled, let currentIdx = vm.currentSpreadIndex, currentIdx < vm.spreads.count {
+                        let spread = vm.spreads[currentIdx]
+                        if let sec = spread.secondaryPage {
+                            Text("\(spread.primaryPage + 1)–\(sec + 1) / \(vm.totalPages)")
+                        } else {
+                            Text("\(spread.primaryPage + 1) / \(vm.totalPages)")
                         }
-                    ),
-                    in: 0...Double(max(vm.totalPages - 1, 1)),
-                    step: 1
-                ) { editing in
-                    guard !editing else { return }
-                    isSeeking = false
-                    let target = Int(seekValue.rounded())
-                    guard target != vm.currentPage,
-                          target >= 0, target < vm.totalPages else { return }
-                    vm.currentPage = target
-                    vm.lazyCurrentPage = target
-                    vm.verticalScrollPage = target
-                    if vm.isDoublePageEnabled { vm.syncSpreadIndex() }
-                    Task { await vm.onPageChange(target) }
+                    } else {
+                        Text("\(vm.currentPage + 1) / \(vm.totalPages)")
+                    }
                 }
-                .tint(EhColor.accentFill)
+                .font(.subheadline.weight(.medium).monospacedDigit())
+                .foregroundStyle(readerForegroundColor)
+                .padding(.horizontal, 16)
+                .frame(height: 40)
+                .glassEffect(.regular.tint(readerPanelTint), in: .capsule)
 
-                Text("\(vm.totalPages)")
-                    .font(EhFont.mono(13))
-                    .foregroundStyle(EhReaderChrome.tertiaryLabel)
-            }
+                HStack(spacing: 12) {
+                    Button(action: { dismiss() }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(width: 20, height: 20)
+                    }
+                    .help("关闭阅读器")
 
-            // 四个模式块：双页 / 方向 / 自动翻页 / 护眼。
-            // 这四项在阅读中随时可能要改，此前分散在设置面板与顶栏菜单里，
-            // 每改一次都要中断阅读。
-            HStack(spacing: 6) {
-                modeBlock("双页", isOn: vm.isDoublePageEnabled) {
-                    vm.toggleDoublePage()
+                    Spacer(minLength: 120)
+
+                    #if os(macOS)
+                    Button(action: toggleReaderFullscreen) {
+                        Image(systemName: isFullScreen
+                              ? "arrow.down.right.and.arrow.up.left"
+                              : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(width: 20, height: 20)
+                    }
+                    .help(AppLocalization.localized(isFullScreen ? "退出全屏" : "进入全屏"))
+                    .accessibilityLabel(AppLocalization.localized(isFullScreen ? "退出全屏" : "进入全屏"))
+                    #endif
+
+                    Button(action: { showSettings = true }) {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(width: 20, height: 20)
+                    }
+                    .help("阅读设置")
+                    .accessibilityLabel("阅读设置")
                 }
-                modeBlock(readingDirection == .rightToLeft ? "右→左" : "左→右",
-                          isOn: readingDirection == .rightToLeft) {
-                    readingDirection = readingDirection == .rightToLeft ? .leftToRight : .rightToLeft
-                    AppSettings.shared.readingDirection = readingDirection.rawValue
-                }
-                modeBlock("自动", isOn: autoPageEnabled) { toggleAutoPage() }
-                // 护眼滤镜留在设置面板里。它是「设一次就不动」的偏好，
-                // 不该和翻页方向这类阅读中随时要改的东西抢同一排位置。
+                .buttonStyle(.glass)
             }
         }
-        .padding(EhSpacing.page)
-        .ehReaderGlass(cornerRadius: EhRadius.card)
-        .padding(.horizontal, EhSpacing.page)
-        // 阅读器整屏忽略安全区（图要铺满），底栏就得自己把 Home Indicator
-        // 的高度让出来，否则最后一排按钮被屏幕底边切掉——这条在带
-        // Home Indicator 的机器上是必然发生，不是偶发。
-        .padding(.bottom, max(8, safeAreaBottomInset))
+        .foregroundStyle(readerForegroundColor)
+        .padding(.horizontal, readerHorizontalInset(geometry))
+        .padding(.top, max(readerTopPadding, geometry.safeAreaInsets.top + 18))
     }
 
-    /// 底部安全区高度。阅读器用了 ignoresSafeArea，GeometryProxy 报的是 0，
-    /// 只能问窗口要。
-    private var safeAreaBottomInset: CGFloat {
-        #if os(iOS)
-        let scenes = UIApplication.shared.connectedScenes
-        let window = scenes.compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows)
-            .first { $0.isKeyWindow }
-        return window?.safeAreaInsets.bottom ?? 0
-        #else
-        return 0
-        #endif
-    }
+    private func bottomBar(geometry: GeometryProxy) -> some View {
+        GlassEffectContainer(spacing: 8) {
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(ReadingDirection.allCases, id: \.rawValue) { direction in
+                            Button {
+                                readingDirection = direction
+                                AppSettings.shared.readingDirection = direction.rawValue
+                            } label: {
+                                Label(direction.label, systemImage: direction.icon)
+                            }
+                        }
+                    } label: {
+                        Label(readingDirection.label, systemImage: readingDirection.icon)
+                    }
+                    .help("阅读顺序")
+                    .accessibilityLabel("阅读顺序：\(readingDirection.label)")
 
-    private func modeBlock(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
-        Button {
-            Haptics.tap()
-            action()
-        } label: {
-            Text(title)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(isOn ? EhColor.onAccentFill : EhReaderChrome.label)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background {
-                    RoundedRectangle(cornerRadius: EhRadius.smallControl, style: .continuous)
-                        .fill(isOn ? EhColor.accentFill : EhReaderChrome.fill)
+                    if supportsPageLayoutSelection {
+                        Menu {
+                            ForEach(ReaderPageDisplayMode.allCases, id: \.rawValue) { mode in
+                                Button {
+                                    pageDisplayMode = mode
+                                } label: {
+                                    if pageDisplayMode == mode {
+                                        Label(mode.label, systemImage: "checkmark")
+                                    } else {
+                                        Text(mode.label)
+                                    }
+                                }
+                            }
+                            Divider()
+                            Toggle("第一页单独显示", isOn: $firstPageStandalone)
+                                .disabled(pageDisplayMode == .single || readingDirection == .topToBottom)
+                        } label: {
+                            Label(pageDisplayMode.label, systemImage: pageDisplayMode == .double ? "rectangle.split.2x1" : "rectangle")
+                        }
+                        .help("页面布局")
+                        .accessibilityLabel("页面布局：\(pageDisplayMode.label)")
+                    }
+
+                    Spacer()
+                    Text("第 \(vm.currentPage + 1) 页，共 \(vm.totalPages) 页")
+                        .monospacedDigit()
+
+                    Button(action: toggleAutoPage) {
+                        Label(
+                            AppLocalization.localized(autoPageEnabled ? "暂停" : "自动翻页"),
+                            systemImage: autoPageEnabled ? "pause.fill" : "play.fill"
+                        )
+                    }
+                    .buttonStyle(.glass(
+                        .regular.tint(autoPageEnabled ? .accentColor : nil)
+                    ))
+                    .accessibilityLabel(AppLocalization.localized(autoPageEnabled ? "暂停自动翻页" : "开始自动翻页"))
                 }
+                .font(.caption2)
+                .foregroundStyle(readerForegroundColor)
+
+                HStack(spacing: 14) {
+                    Button(action: readingDirection == .rightToLeft ? goToNextPage : goToPreviousPage) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 15, weight: .bold))
+                            .frame(width: 18, height: 18)
+                    }
+                    .disabled(readingDirection == .rightToLeft
+                              ? vm.currentPage == vm.totalPages - 1
+                              : vm.currentPage == 0)
+                    .help(AppLocalization.localized(readingDirection == .rightToLeft ? "下一页" : "上一页"))
+                    .accessibilityLabel(AppLocalization.localized(readingDirection == .rightToLeft ? "下一页" : "上一页"))
+
+                    Slider(
+                        value: readerProgressBinding,
+                        in: 0...Double(max(vm.totalPages - 1, 1)),
+                        step: 1
+                    ) { isEditing in
+                        if isEditing {
+                            lastHapticProgressPage = vm.currentPage
+                        } else {
+                            lastHapticProgressPage = nil
+                            if vm.isDoublePageEnabled { vm.syncSpreadIndex() }
+                            Task { await vm.onPageChange(vm.currentPage) }
+                        }
+                    }
+                    .tint(readerThemeColor)
+                    .accentColor(readerThemeColor)
+                    .accessibilityLabel("阅读进度")
+                    .accessibilityValue("第 \(vm.currentPage + 1) 页，共 \(vm.totalPages) 页")
+
+                    Button(action: readingDirection == .rightToLeft ? goToPreviousPage : goToNextPage) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 15, weight: .bold))
+                            .frame(width: 18, height: 18)
+                    }
+                    .disabled(readingDirection == .rightToLeft
+                              ? vm.currentPage == 0
+                              : vm.currentPage == vm.totalPages - 1)
+                    .help(AppLocalization.localized(readingDirection == .rightToLeft ? "上一页" : "下一页"))
+                    .accessibilityLabel(AppLocalization.localized(readingDirection == .rightToLeft ? "上一页" : "下一页"))
+                }
+
+            }
+            .foregroundStyle(readerForegroundColor)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .glassEffect(
+                .regular.tint(readerPanelTint),
+                in: UnevenRoundedRectangle(
+                    topLeadingRadius: 24,
+                    bottomLeadingRadius: readerPanelOuterCornerRadius(geometry),
+                    bottomTrailingRadius: readerPanelOuterCornerRadius(geometry),
+                    topTrailingRadius: 24,
+                    style: .continuous
+                )
+            )
+            .buttonStyle(.glass)
+            .frame(maxWidth: 760)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, readerHorizontalInset(geometry))
+        .padding(.bottom, max(18, geometry.safeAreaInsets.bottom + 10))
+    }
+
+    /// 保持控制面板远离圆角屏幕、刘海和 Stage Manager 窗口边缘。
+    private func readerHorizontalInset(_ geometry: GeometryProxy) -> CGFloat {
+        max(20, max(geometry.safeAreaInsets.leading, geometry.safeAreaInsets.trailing) + 10)
+    }
+
+    private func readerPanelOuterCornerRadius(_ geometry: GeometryProxy) -> CGFloat {
+        // Home Indicator 安全区能可靠区分圆角 iPhone 与方角窗口；面板向内
+        // 缩进后使用相应的连续曲率，使底部轮廓与屏幕边框近似同心。
+        if geometry.safeAreaInsets.bottom >= 20 {
+            return min(42, max(32, geometry.safeAreaInsets.bottom + 3))
+        }
+        return 26
+    }
+
+    private var readerProgressBinding: Binding<Double> {
+        Binding(
+            get: {
+                let maxPage = max(vm.totalPages - 1, 0)
+                return Double(readingDirection == .rightToLeft ? maxPage - vm.currentPage : vm.currentPage)
+            },
+            set: { value in
+                let maxPage = max(vm.totalPages - 1, 0)
+                let visualPage = max(0, min(maxPage, Int(value.rounded())))
+                let target = readingDirection == .rightToLeft ? maxPage - visualPage : visualPage
+                if target != vm.currentPage, lastHapticProgressPage != target {
+                    Haptics.select()
+                    lastHapticProgressPage = target
+                }
+                pageNavigationDelta = target >= vm.currentPage ? 1 : -1
+                vm.currentPage = target
+            }
+        )
     }
 
     // MARK: - HUD Overlay
 
-    /// 底部信息条：时钟 · 页码 · 电量，同一行。
-    ///
-    /// 此前时钟和电量各自贴在屏幕最底边，而页码在另一个浮层里居中——三者
-    /// 压在同一条边上互相挤，还盖住 Home Indicator。位置算的是
-    /// `geometry.safeAreaInsets.bottom`，但阅读器整屏 ignoresSafeArea，
-    /// 那个值是 0，所以怎么加都贴边。
-    ///
-    /// 翻页/跳页按钮已经删掉：它悬在画面正中偏下，遮挡太重，而翻页本来就能
-    /// 点两侧或滑动，跳页在工具栏的滑杆和目录网格里都有。这里只留页码。
     private func hudOverlay(geometry: GeometryProxy) -> some View {
         VStack {
             Spacer()
-            HStack(spacing: EhSpacing.row) {
-                if AppSettings.shared.showClock {
+            HStack {
+                #if os(macOS)
+                if showClock {
                     Text(currentTime, style: .time)
-                        .font(EhFont.mono(11))
-                        .foregroundStyle(.white.opacity(0.55))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(readerForegroundColor)
                 }
 
-                Spacer(minLength: 8)
-
-                if vm.totalPages > 0 {
-                    Text("\(displayedPage + 1) / \(vm.totalPages)")
-                        .font(EhFont.mono(12, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(.black.opacity(0.35), in: Capsule())
-                }
-
-                Spacer(minLength: 8)
-
-                if AppSettings.shared.showBattery {
-                    batteryView
-                }
+                Spacer()
+                #endif
             }
-            .padding(.horizontal, EhSpacing.page)
-            .padding(.bottom, max(10, safeAreaBottomInset))
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, max(20, geometry.safeAreaInsets.leading + 12))
+            .padding(.bottom, max(12, geometry.safeAreaInsets.bottom + 4))
+            .foregroundStyle(readerForegroundColor)
         }
     }
 
-    private var batteryView: some View {
-        HStack(spacing: 2) {
-            #if os(iOS)
-            let level = Int(UIDevice.current.batteryLevel * 100)
-            let isCharging = UIDevice.current.batteryState == .charging
-            Image(systemName: isCharging ? "battery.100.bolt" : "battery.\(min(100, max(0, (level / 25) * 25)))")
-                .font(.caption)
-            Text("\(max(0, level))%")
-                .font(.caption.monospacedDigit())
-            #else
-            Image(systemName: "battery.100")
-                .font(.caption)
-            #endif
+    // MARK: - Floating Navigation Overlay (浮动导航)
+
+    /// 浮动导航栏 — 工具栏隐藏时始终可见，提供翻页和工具栏切换
+    /// 修复: 上下滚动模式无法翻页 + 没有上/下一页按钮
+    @ViewBuilder
+    private func floatingNavigationOverlay(geometry: GeometryProxy) -> some View {
+        if shouldShowFloatingNavigation {
+            let isRTL = readingDirection == .rightToLeft
+            let isVertical = readingDirection == .topToBottom
+            let isFirstPage = vm.currentPage <= 0
+            let isLastPage = vm.currentPage >= vm.totalPages - 1
+
+            VStack {
+                Spacer()
+
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 10) {
+                    // 左侧 / 上一页按钮
+                    Button {
+                        if isRTL { goToNextPage() } else { goToPreviousPage() }
+                    } label: {
+                        Image(systemName: isVertical ? "chevron.up" : "chevron.left")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(readerForegroundColor)
+                            .frame(width: 28, height: 22)
+                    }
+                    .disabled(isRTL ? isLastPage : isFirstPage)
+                    .opacity((isRTL ? isLastPage : isFirstPage) ? 0.25 : 0.8)
+
+                    // 中央: 页码 + 点击切换工具栏
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { showOverlay.toggle() }
+                    } label: {
+                        Group {
+                            if showProgress {
+                                Text("\(vm.currentPage + 1) / \(vm.totalPages)")
+                                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                            } else {
+                                Image(systemName: "ellipsis")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                        }
+                        .foregroundStyle(readerSecondaryForegroundColor)
+                        .frame(minWidth: showProgress ? 72 : 38, minHeight: 22)
+                    }
+
+                    // 右侧 / 下一页按钮
+                    Button {
+                        if isRTL { goToPreviousPage() } else { goToNextPage() }
+                    } label: {
+                        Image(systemName: isVertical ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(readerForegroundColor)
+                            .frame(width: 28, height: 22)
+                    }
+                    .disabled(isRTL ? isFirstPage : isLastPage)
+                    .opacity((isRTL ? isFirstPage : isLastPage) ? 0.25 : 0.8)
+                    }
+                }
+                .buttonStyle(.glass)
+                .padding(.bottom, max(16, geometry.safeAreaInsets.bottom + 4))
+            }
         }
-        .foregroundStyle(.white.opacity(0.7))
+    }
+
+    private var shouldShowFloatingNavigation: Bool {
+        #if os(macOS)
+        !showOverlay && vm.totalPages > 0 && !isFullScreen
+        #else
+        !showOverlay && vm.totalPages > 0
+        #endif
+    }
+
+    private var shouldShowReaderHUD: Bool {
+        #if os(macOS)
+        !showOverlay && !isFullScreen && showClock
+        #else
+        false
+        #endif
+    }
+
+    #if os(iOS)
+    /// iOS 的时钟和电量属于同一个系统状态栏，不能由应用分别重绘而仍保持
+    /// 系统样式。任一状态项开启时显示系统栏；全屏时遵循沉浸式设置隐藏。
+    private var shouldHideSystemStatusBar: Bool {
+        AppSettings.shared.readingFullscreen || (!showClock && !showBattery)
+    }
+    #endif
+
+    private var readerTopPadding: CGFloat {
+        #if os(macOS)
+        18
+        #else
+        60
+        #endif
+    }
+
+}
+
+#if os(macOS)
+/// Resolves the NSWindow hosting the reader so full-screen commands target the
+/// correct window even when several application windows are open.
+private struct ReaderWindowAccessor: NSViewRepresentable {
+    let onResolve: @MainActor (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            onResolve(view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            onResolve(nsView.window)
+        }
     }
 }
+#endif
 
 // MARK: - Reader Settings Sheet
 
@@ -1593,6 +2065,27 @@ struct ReaderSettingsSheet: View {
     @Binding var scaleMode: ScaleMode
     @Binding var startPosition: StartPosition
     @Binding var autoPageEnabled: Bool
+    @Binding var showClock: Bool
+    @Binding var showProgress: Bool
+    @Binding var showBattery: Bool
+    @Binding var showPageInterval: Bool
+    @Binding var pageDisplayMode: ReaderPageDisplayMode
+    @Binding var pageAnimationEnabled: Bool
+    @Binding var backgroundMode: ReaderBackgroundMode
+    let showsPageLayoutSettings: Bool
+    #if os(macOS)
+    @Binding var isFullScreen: Bool
+    let onToggleFullscreen: () -> Void
+    #endif
+    @State private var keepScreenOn = AppSettings.shared.keepScreenOn
+    @State private var autoPageInterval = AppSettings.shared.autoPageInterval
+    @State private var draftShowClock = false
+    @State private var draftShowProgress = false
+    @State private var draftShowBattery = false
+    @State private var draftShowPageInterval = false
+    @State private var draftPageAnimation = true
+    @State private var draftFullscreen = false
+    @State private var hasLoadedDrafts = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -1620,6 +2113,18 @@ struct ReaderSettingsSheet: View {
                     }
                 }
 
+                Section("背景") {
+                    Picker("阅读背景", selection: $backgroundMode) {
+                        ForEach(ReaderBackgroundMode.allCases, id: \.rawValue) { mode in
+                            Label(mode.label, systemImage: mode.icon).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: backgroundMode) { _, newValue in
+                        AppSettings.shared.readerBackgroundMode = newValue.rawValue
+                    }
+                }
+
                 Section("起始位置") {
                     Picker("位置", selection: $startPosition) {
                         ForEach(StartPosition.allCases, id: \.rawValue) { pos in
@@ -1631,87 +2136,79 @@ struct ReaderSettingsSheet: View {
                     }
                 }
 
+                if showsPageLayoutSettings && readingDirection != .topToBottom {
+                    Section("页面布局") {
+                        Picker("显示方式", selection: $pageDisplayMode) {
+                            ForEach(ReaderPageDisplayMode.allCases, id: \.rawValue) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Toggle("翻页动画", isOn: $draftPageAnimation)
+                            .onChange(of: draftPageAnimation) { _, value in
+                                guard hasLoadedDrafts else { return }
+                                pageAnimationEnabled = value
+                            }
+                    }
+                }
+
                 Section("显示") {
-                    Toggle("显示时钟", isOn: Binding(
-                        get: { AppSettings.shared.showClock },
-                        set: { AppSettings.shared.showClock = $0 }
-                    ))
-                    Toggle("显示进度", isOn: Binding(
-                        get: { AppSettings.shared.showProgress },
-                        set: { AppSettings.shared.showProgress = $0 }
-                    ))
-                    Toggle("显示电量", isOn: Binding(
-                        get: { AppSettings.shared.showBattery },
-                        set: { AppSettings.shared.showBattery = $0 }
-                    ))
-                    Toggle("页面间距", isOn: Binding(
-                        get: { AppSettings.shared.showPageInterval },
-                        set: { AppSettings.shared.showPageInterval = $0 }
-                    ))
-                }
-
-                // Android dialog_gallery_menu.xml 里有而我们缺的三项：
-                // 屏幕方向、音量键翻页、护眼滤镜。前两项一直没有入口，
-                // 护眼滤镜的开关此前只在底栏那排模式块里。
-                Section("屏幕方向") {
-                    Picker("方向", selection: Binding(
-                        get: { AppSettings.shared.screenRotation },
-                        set: {
-                            AppSettings.shared.screenRotation = $0
-                            applyScreenRotation($0)
+                    #if os(iOS)
+                    Toggle("显示系统状态栏", isOn: Binding(
+                        get: { draftShowClock || draftShowBattery },
+                        set: { value in
+                            draftShowClock = value
+                            draftShowBattery = value
+                            guard hasLoadedDrafts else { return }
+                            showClock = value
+                            showBattery = value
+                            AppSettings.shared.showClock = value
+                            AppSettings.shared.showBattery = value
                         }
-                    )) {
-                        Text("跟随系统").tag(0)
-                        Text("锁定竖屏").tag(1)
-                        Text("锁定横屏").tag(2)
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                Section("护眼滤镜") {
-                    Toggle("启用", isOn: Binding(
-                        get: { AppSettings.shared.colorFilter },
-                        set: { AppSettings.shared.colorFilter = $0 }
                     ))
-                    if AppSettings.shared.colorFilter {
-                        // 存的是 ARGB，这里只让调不透明度——色相固定为暖黄，
-                        // 和 Android 默认的 0x20000000 语义一致
-                        HStack {
-                            Text("强度").font(EhFont.caption)
-                            Slider(value: Binding(
-                                get: {
-                                    Double((AppSettings.shared.colorFilterColor >> 24) & 0xFF)
-                                },
-                                set: { alpha in
-                                    let rgb = AppSettings.shared.colorFilterColor & 0x00FFFFFF
-                                    AppSettings.shared.colorFilterColor = (Int(alpha) << 24) | rgb
-                                }
-                            ), in: 0...128)
+                    #else
+                    Toggle("显示时钟", isOn: $draftShowClock)
+                        .onChange(of: draftShowClock) { _, value in
+                            guard hasLoadedDrafts else { return }
+                            showClock = value
+                            AppSettings.shared.showClock = value
                         }
-                    }
+                    #endif
+                    Toggle("显示进度", isOn: $draftShowProgress)
+                        .onChange(of: draftShowProgress) { _, value in
+                            guard hasLoadedDrafts else { return }
+                            showProgress = value
+                            AppSettings.shared.showProgress = value
+                        }
+                    Toggle("页面间距", isOn: $draftShowPageInterval)
+                        .onChange(of: draftShowPageInterval) { _, value in
+                            guard hasLoadedDrafts else { return }
+                            showPageInterval = value
+                            AppSettings.shared.showPageInterval = value
+                        }
                 }
 
                 Section("行为") {
-                    #if os(iOS)
-                    Toggle("音量键翻页", isOn: Binding(
-                        get: { AppSettings.shared.volumePage },
-                        set: { AppSettings.shared.volumePage = $0 }
-                    ))
-                    if AppSettings.shared.volumePage {
-                        Toggle("反转音量键方向", isOn: Binding(
-                            get: { AppSettings.shared.reverseVolumePage },
-                            set: { AppSettings.shared.reverseVolumePage = $0 }
-                        ))
-                    }
-                    #endif
-                    Toggle("屏幕常亮", isOn: Binding(
-                        get: { AppSettings.shared.keepScreenOn },
-                        set: { AppSettings.shared.keepScreenOn = $0 }
-                    ))
+                    #if os(macOS)
+                    Toggle("全屏模式", isOn: $draftFullscreen)
+                        .onChange(of: draftFullscreen) { _, desiredState in
+                            guard hasLoadedDrafts, desiredState != isFullScreen else { return }
+                            isFullScreen = desiredState
+                            AppSettings.shared.readingFullscreen = desiredState
+                            onToggleFullscreen()
+                        }
+                    #else
+                    Toggle("屏幕常亮", isOn: $keepScreenOn)
+                        .onChange(of: keepScreenOn) { _, value in
+                            AppSettings.shared.keepScreenOn = value
+                            UIApplication.shared.isIdleTimerDisabled = value
+                        }
                     Toggle("全屏模式", isOn: Binding(
                         get: { AppSettings.shared.readingFullscreen },
                         set: { AppSettings.shared.readingFullscreen = $0 }
                     ))
+                    #endif
 
                     #if os(iOS)
                     Toggle("自定义亮度", isOn: Binding(
@@ -1737,22 +2234,45 @@ struct ReaderSettingsSheet: View {
 
                 Section("自动翻页") {
                     Stepper(
-                        "间隔: \(AppSettings.shared.autoPageInterval) 秒",
-                        value: Binding(
-                            get: { AppSettings.shared.autoPageInterval },
-                            set: { AppSettings.shared.autoPageInterval = $0 }
-                        ),
+                        "间隔: \(autoPageInterval) 秒",
+                        value: $autoPageInterval,
                         in: 1...60
                     )
+                    .onChange(of: autoPageInterval) { _, value in
+                        AppSettings.shared.autoPageInterval = value
+                    }
                 }
             }
+            #if os(macOS)
+            .toggleStyle(.switch)
+            .formStyle(.grouped)
+            #endif
             .navigationTitle("阅读设置")
+            .onAppear {
+                draftShowClock = showClock
+                draftShowProgress = showProgress
+                draftShowBattery = showBattery
+                draftShowPageInterval = showPageInterval
+                draftPageAnimation = pageAnimationEnabled
+                #if os(macOS)
+                draftFullscreen = isFullScreen
+                #else
+                draftFullscreen = AppSettings.shared.readingFullscreen
+                #endif
+                hasLoadedDrafts = true
+            }
+            #if os(macOS)
+            .onChange(of: isFullScreen) { _, value in
+                if draftFullscreen != value { draftFullscreen = value }
+            }
+            #endif
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
+                        .buttonStyle(.glassProminent)
                 }
             }
         }
@@ -1766,237 +2286,6 @@ struct ReaderSettingsSheet: View {
 // Perf P0-2: PageOffsetPreferenceKey 已移除 — 改用 .scrollPosition(id:) 追踪页码
 
 // MARK: - Edge Swipe Dismiss (iOS fullScreenCover 边缘侧滑返回)
-
-// MARK: - SwiftUI Zoomable Image (纯 SwiftUI 缩放)
-
-/// PreferenceKey: 向父视图传递子视图尺寸
-private struct ViewSizePreferenceKey: PreferenceKey {
-    static var defaultValue: CGSize = .zero
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-        value = nextValue()
-    }
-}
-
-/// 纯 SwiftUI 可缩放图片 — 不使用 UIScrollView，彻底避免与父 ScrollView 的手势冲突
-///
-/// 手势架构:
-/// 1. 单击/双击: 统一用 SpatialTapGesture(count:1) + 手动 300ms 延时检测
-///    解决 TapGesture(count:2) 与 SpatialTapGesture(count:1) 类型不匹配导致双击无法触发的问题
-/// 2. 双指缩放 (MagnifyGesture): 始终以 .simultaneousGesture 挂载，不阻塞父 ScrollView
-/// 3. 拖动平移 (DragGesture): 通过 overlay + allowsHitTesting(isZoomed) 控制
-///    - 1x 时 overlay 不接收触摸 → 父 ScrollView 自由滚动/翻页
-///    - >1x 时 overlay 拦截触摸 → 拖动平移图片，阻止父 ScrollView 滚动
-///    - overlay 上同时挂载 tap + pinch 手势，防止被 overlay 遮挡
-#if os(iOS)
-private struct SwiftUIZoomableImage: View {
-    let image: PlatformImage
-    /// 全屏页模式 (翻页阅读器) vs 流式模式 (垂直滚动)
-    var isFullPage: Bool = false
-    var onSingleTap: ((CGPoint, CGSize) -> Void)?
-    var onZoomChanged: ((Bool) -> Void)?
-
-    @State private var scale: CGFloat = 1.0
-    @State private var lastScale: CGFloat = 1.0
-    @State private var offset: CGSize = .zero
-    @State private var lastOffset: CGSize = .zero
-    @State private var viewSize: CGSize = .zero
-    /// 手动双击检测
-    @State private var lastTapTime: Date = .distantPast
-    @State private var pendingSingleTap: Task<Void, Never>?
-    /// 防止双指缩放时触发拖动平移
-    @State private var isPinching: Bool = false
-
-    private var isZoomed: Bool { scale > 1.01 }
-
-    var body: some View {
-        let imgSize = image.size
-        let ratio = imgSize.width > 0 ? imgSize.height / imgSize.width : 1.0
-
-        imageContent(ratio: ratio)
-            .background {
-                GeometryReader { geo in
-                    Color.clear
-                        .preference(key: ViewSizePreferenceKey.self, value: geo.size)
-                }
-            }
-            .onPreferenceChange(ViewSizePreferenceKey.self) { viewSize = $0 }
-            // ── 非缩放时的手势 (overlay 不拦截, 这些生效) ──
-            // 单击/双击: 统一 SpatialTapGesture + 300ms 手动检测
-            .gesture(
-                SpatialTapGesture(count: 1)
-                    .onEnded { value in
-                        handleTap(at: value.location)
-                    }
-            )
-            // 双指缩放: simultaneousGesture 不阻塞父 ScrollView
-            .simultaneousGesture(magnifyGesture)
-            // ── 缩放后的拖动 overlay ──
-            // allowsHitTesting: 1x 时不拦截 → 父 ScrollView 正常; >1x 时拦截 → 拖动平移
-            .overlay {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .allowsHitTesting(isZoomed)
-                    // overlay 上也需要 tap + pinch，否则会被 overlay 吞掉
-                    .gesture(
-                        SpatialTapGesture(count: 1)
-                            .onEnded { value in
-                                handleTap(at: value.location)
-                            }
-                    )
-                    .simultaneousGesture(magnifyGesture)
-                    // 拖动平移 (simultaneousGesture: 不阻塞同层 tap/pinch)
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 5)
-                            .onChanged { value in
-                                guard !isPinching else { return }
-                                let proposed = CGSize(
-                                    width: lastOffset.width + value.translation.width,
-                                    height: lastOffset.height + value.translation.height
-                                )
-                                offset = clampOffset(proposed)
-                            }
-                            .onEnded { _ in
-                                if isPinching {
-                                    // 双指缩放期间的误触拖动 → 还原
-                                    offset = lastOffset
-                                } else {
-                                    lastOffset = offset
-                                }
-                            }
-                    )
-            }
-    }
-
-    // MARK: - Gesture Definitions
-
-    /// 双指缩放手势 (抽取为计算属性, base 和 overlay 复用)
-    private var magnifyGesture: some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
-                isPinching = true
-                scale = max(1.0, min(3.0, lastScale * value.magnification))
-            }
-            .onEnded { _ in
-                isPinching = false
-                lastScale = scale
-                if scale < 1.1 {
-                    withAnimation(.spring()) { resetZoom() }
-                } else {
-                    onZoomChanged?(true)
-                }
-            }
-    }
-
-    /// 手动双击/单击检测: 300ms 窗口
-    /// - 第二次点击在 300ms 内 → 双击 (缩放切换)
-    /// - 超过 300ms 无第二次 → 单击 (工具栏/翻页)
-    private func handleTap(at location: CGPoint) {
-        let now = Date()
-        let interval = now.timeIntervalSince(lastTapTime)
-        lastTapTime = now
-
-        if interval < 0.3 {
-            // ── 双击 ──
-            pendingSingleTap?.cancel()
-            pendingSingleTap = nil
-            withAnimation(.spring(duration: 0.3)) {
-                if scale < 1.5 {
-                    scale = 2.0
-                    lastScale = 2.0
-                    onZoomChanged?(true)
-                } else {
-                    resetZoom()
-                }
-            }
-        } else {
-            // ── 可能是单击 — 等 300ms 确认不是双击 ──
-            pendingSingleTap?.cancel()
-            let size = viewSize
-            pendingSingleTap = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(300))
-                guard !Task.isCancelled else { return }
-                onSingleTap?(location, size)
-            }
-        }
-    }
-
-    // MARK: - Image Content
-
-    @ViewBuilder
-    private func imageContent(ratio: CGFloat) -> some View {
-        if isFullPage {
-            if image.isAnimated {
-                #if os(macOS)
-                AnimatedImageView(image: image, contentMode: .scaleProportionallyUpOrDown)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-                #else
-                AnimatedImageView(image: image, contentMode: .scaleAspectFit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-                #endif
-            } else {
-                nativeImage(image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-            }
-        } else {
-            if image.isAnimated {
-                #if os(macOS)
-                AnimatedImageView(image: image, contentMode: .scaleProportionallyUpOrDown)
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(1.0 / ratio, contentMode: .fit)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-                #else
-                AnimatedImageView(image: image, contentMode: .scaleAspectFit)
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(1.0 / ratio, contentMode: .fit)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-                #endif
-            } else {
-                nativeImage(image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(1.0 / ratio, contentMode: .fit)
-                    .scaleEffect(scale)
-                    .offset(offset)
-                    .clipped()
-            }
-        }
-    }
-
-    private func resetZoom() {
-        scale = 1.0
-        lastScale = 1.0
-        offset = .zero
-        lastOffset = .zero
-        onZoomChanged?(false)
-    }
-
-    /// 限制平移范围: 不允许超过缩放后多出的可视区域
-    private func clampOffset(_ proposed: CGSize) -> CGSize {
-        let maxX = max(0, viewSize.width * (scale - 1) / 2)
-        let maxY = max(0, viewSize.height * (scale - 1) / 2)
-        return CGSize(
-            width: min(maxX, max(-maxX, proposed.width)),
-            height: min(maxY, max(-maxY, proposed.height))
-        )
-    }
-}
-#endif
 
 #if os(iOS)
 /// UIScreenEdgePanGestureRecognizer — 在 fullScreenCover 中实现原生边缘右滑返回
@@ -2069,12 +2358,18 @@ struct EdgeSwipeDismissView: UIViewRepresentable {
 struct ScrollWheelPageNavigator: NSViewRepresentable {
     let onNext: () -> Void
     let onPrevious: () -> Void
+    let onSwipeLeft: () -> Void
+    let onSwipeRight: () -> Void
+    let onSingleTap: (CGPoint, CGSize) -> Void
     let isZoomed: Bool
 
     func makeNSView(context: Context) -> ScrollWheelCaptureView {
         let view = ScrollWheelCaptureView()
         view.onNext = onNext
         view.onPrevious = onPrevious
+        view.onSwipeLeft = onSwipeLeft
+        view.onSwipeRight = onSwipeRight
+        view.onSingleTap = onSingleTap
         view.isZoomed = isZoomed
         return view
     }
@@ -2082,16 +2377,24 @@ struct ScrollWheelPageNavigator: NSViewRepresentable {
     func updateNSView(_ nsView: ScrollWheelCaptureView, context: Context) {
         nsView.onNext = onNext
         nsView.onPrevious = onPrevious
+        nsView.onSwipeLeft = onSwipeLeft
+        nsView.onSwipeRight = onSwipeRight
+        nsView.onSingleTap = onSingleTap
         nsView.isZoomed = isZoomed
     }
 
     class ScrollWheelCaptureView: NSView {
         var onNext: (() -> Void)?
         var onPrevious: (() -> Void)?
+        var onSwipeLeft: (() -> Void)?
+        var onSwipeRight: (() -> Void)?
+        var onSingleTap: ((CGPoint, CGSize) -> Void)?
         var isZoomed: Bool = false
-        private var accumulatedDelta: CGFloat = 0
-        private let threshold: CGFloat = 40
+        private var accumulatedVerticalDelta: CGFloat = 0
+        private var accumulatedHorizontalDelta: CGFloat = 0
+        private let threshold: CGFloat = 70
         private var lastScrollTime: Date = .distantPast
+        private var hasTurnedPageInCurrentGesture = false
 
         override func scrollWheel(with event: NSEvent) {
             guard !isZoomed else {
@@ -2100,21 +2403,70 @@ struct ScrollWheelPageNavigator: NSViewRepresentable {
             }
 
             let delta = event.scrollingDeltaY
+            let horizontalDelta = event.scrollingDeltaX
             let now = Date()
-            if now.timeIntervalSince(lastScrollTime) > 0.5 {
-                accumulatedDelta = 0
+            if event.phase.contains(.began) || now.timeIntervalSince(lastScrollTime) > 0.45 {
+                accumulatedVerticalDelta = 0
+                accumulatedHorizontalDelta = 0
+                hasTurnedPageInCurrentGesture = false
             }
             lastScrollTime = now
 
-            accumulatedDelta += delta
+            // Trackpad momentum emits many scroll events after the finger has
+            // left the surface. One physical gesture must never turn more than
+            // one page.
+            guard !hasTurnedPageInCurrentGesture else { return }
 
-            if accumulatedDelta > threshold {
-                accumulatedDelta = 0
+            // Trackpad horizontal swipes follow the physical movement of the
+            // content; semantic next/previous mapping is supplied by the view.
+            if abs(horizontalDelta) > abs(delta) {
+                accumulatedHorizontalDelta += horizontalDelta
+                if accumulatedHorizontalDelta > threshold {
+                    hasTurnedPageInCurrentGesture = true
+                    onSwipeRight?()
+                } else if accumulatedHorizontalDelta < -threshold {
+                    hasTurnedPageInCurrentGesture = true
+                    onSwipeLeft?()
+                }
+                return
+            }
+
+            accumulatedVerticalDelta += delta
+
+            if accumulatedVerticalDelta > threshold {
+                hasTurnedPageInCurrentGesture = true
                 onPrevious?()
-            } else if accumulatedDelta < -threshold {
-                accumulatedDelta = 0
+            } else if accumulatedVerticalDelta < -threshold {
+                hasTurnedPageInCurrentGesture = true
                 onNext?()
             }
+        }
+
+        override func swipe(with event: NSEvent) {
+            let now = Date()
+            if event.phase.contains(.began) || now.timeIntervalSince(lastScrollTime) > 0.45 {
+                hasTurnedPageInCurrentGesture = false
+            }
+            lastScrollTime = now
+            guard !hasTurnedPageInCurrentGesture else { return }
+            hasTurnedPageInCurrentGesture = true
+            if event.deltaX > 0 {
+                onSwipeRight?()
+            } else if event.deltaX < 0 {
+                onSwipeLeft?()
+            }
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            guard event.clickCount == 1 else {
+                super.mouseDown(with: event)
+                return
+            }
+            let location = convert(event.locationInWindow, from: nil)
+            onSingleTap?(
+                CGPoint(x: location.x, y: bounds.height - location.y),
+                bounds.size
+            )
         }
 
         override var acceptsFirstResponder: Bool { true }
@@ -2138,67 +2490,3 @@ private func setScreenBrightness(_ brightness: CGFloat) {
     }
 }
 #endif
-
-// MARK: - 页面网格（目录）
-
-/// 跳页网格。对齐 Android 阅读器里的页码目录：
-/// 底部那条 slider 在两百页的本子上根本定位不到具体页，
-/// 而「回到第 87 页」是阅读时的常见需求。
-struct ReaderPageGrid: View {
-    let total: Int
-    let current: Int
-    let onSelect: (Int) -> Void
-
-    @Environment(\.dismiss) private var dismiss
-
-    private let columns = [GridItem(.adaptive(minimum: 54), spacing: 10)]
-
-    var body: some View {
-        NavigationStack {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVGrid(columns: columns, spacing: 10) {
-                        ForEach(0..<max(total, 0), id: \.self) { index in
-                            Button {
-                                onSelect(index)
-                            } label: {
-                                Text("\(index + 1)")
-                                    .font(EhFont.mono(15, weight: index == current ? .bold : .regular))
-                                    .foregroundStyle(index == current
-                                                     ? EhColor.onAccentFill : EhColor.label)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 44)
-                                    .background {
-                                        RoundedRectangle(cornerRadius: EhRadius.smallControl,
-                                                         style: .continuous)
-                                            .fill(index == current ? EhColor.accentFill : EhColor.fill)
-                                    }
-                            }
-                            .buttonStyle(.plain)
-                            .id(index)
-                        }
-                    }
-                    .padding(EhSpacing.page)
-                }
-                .onAppear {
-                    // 打开就停在当前页上，而不是从第 1 页开始滚
-                    proxy.scrollTo(current, anchor: .center)
-                }
-            }
-            .background(EhColor.background)
-            .navigationTitle("跳转到第 \(current + 1) 页")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
-                }
-            }
-        }
-        #if os(iOS)
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
-        #endif
-    }
-}

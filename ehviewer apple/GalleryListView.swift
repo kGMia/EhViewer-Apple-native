@@ -16,40 +16,68 @@ import AppKit
 import UIKit
 #endif
 
+/// Routes full-site searches into MainTabView's persistent Search section.
+/// Favorites keeps its own server-side filtering and intentionally does not use this action.
+struct GallerySearchNavigationAction {
+    /// Move focus into the persistent Search tab without briefly activating
+    /// an expendable source-page text field.
+    let focusSearch: @MainActor () -> Void
+    let search: @MainActor (_ query: String, _ advancedSearch: AdvancedSearchState?) -> Void
+    /// Search initiated from gallery metadata (tag/uploader). Keeping this
+    /// separate from typed searches lets the Search page offer a route back
+    /// to the originating gallery.
+    let searchFromGallery: @MainActor (_ query: String, _ gallery: GalleryInfo) -> Void
+    let quickSearch: @MainActor (_ record: QuickSearchRecord) -> Void
+}
+
+private struct GallerySearchNavigationActionKey: EnvironmentKey {
+    static let defaultValue: GallerySearchNavigationAction? = nil
+}
+
+extension EnvironmentValues {
+    var gallerySearchNavigationAction: GallerySearchNavigationAction? {
+        get { self[GallerySearchNavigationActionKey.self] }
+        set { self[GallerySearchNavigationActionKey.self] = newValue }
+    }
+}
+
 struct GalleryListView: View {
     let mode: ListMode
 
-    enum ListMode {
+    private enum PrimaryFeed: String {
         case home
-        /// 订阅标签列表 (/watched) —— 对齐 Android SubscriptionsScene
-        case subscription
         case popular
-        /// 排行榜。period 就是 toplist.php 的 tl 参数：
-        /// 15 全部时间 / 13 过去一年 / 12 过去一个月 / 11 昨天
-        case toplist(period: Int)
-        case search(keyword: String)
-        case tag(keyword: String)
-        case favorites(slot: Int)
 
-        var isSubscription: Bool {
-            if case .subscription = self { return true }
-            return false
+        var listMode: ListMode {
+            switch self {
+            case .home: return .home
+            case .popular: return .popular
+            }
         }
     }
 
+    enum ListMode {
+        case home
+        case subscription
+        case popular
+        case search(keyword: String)
+        case tag(keyword: String)
+        case favorites(slot: Int)
+    }
+
     @State private var viewModel = GalleryListViewModel()
-    @State private var showQuickSearch = false
     @State private var showAdvancedSearch = false
-    @State private var showTagSelector = false
     @State private var advancedSearch = AdvancedSearchState()
     @State private var selectedQuickSearch: QuickSearchRecord?
+    @State private var favoritePickerGallery: GalleryInfo?
+    @State private var searchPanelKeyboardCommand: SearchPanelKeyboardCommand?
     @State private var selectedGallery: GalleryInfo?
-    /// 搜索框聚焦态。用 @State 而非 @FocusState：焦点实际由
-    /// UISearchTextField 持有，这里只是把它的状态镜像出来供布局使用。
-    @State private var isSearchFocused: Bool = false
+    @State private var primaryFeed: PrimaryFeed
+    @FocusState private var isSearchFocused: Bool
+    @Environment(\.contentRouteBackAction) private var contentRouteBackAction
+    @Environment(\.gallerySearchNavigationAction) private var gallerySearchNavigationAction
     /// 跳页模式切换 (对齐 Android JumpDateSelector: DATE_PICKER_TYPE / DATE_NODE_TYPE)
-    /// 跳页模式: 0 = 快捷跳转, 1 = 日期选择, 2 = 页码跳转
-    @State private var jumpMode: Int = 0
+    @State private var jumpUseQuickNode = true
 
     /// 标签导航路径 — iPad 双栏布局中支持标签推入左侧
     @State private var sidebarPath = NavigationPath()
@@ -63,40 +91,33 @@ struct GalleryListView: View {
 
     /// 收藏夹搜索关键字 (对齐 Android FavoritesScene 搜索)
     private var favSearchKeyword: String?
-
-    /// 嵌在别的页面里时隐藏自带的搜索栏。
-    ///
-    /// 收藏页自己已经有页头和搜索按钮，内嵌列表再画一条搜索栏就成了两个搜索入口，
-    /// 上下叠在一起。
-    private var hidesOwnSearchBar = false
-    /// 由父视图接管空状态。
-    ///
-    /// 收藏页的「全部」把本地收藏区块和这个在线列表叠在一起：没登录时在线
-    /// 列表永远是空的，于是本地收藏下面永远吊着一句「这个收藏夹是空的」。
-    private var hidesEmptyState = false
-    /// 多选模式。由父视图（收藏页）驱动：云端收藏夹此前完全没有批量操作，
-    /// 想从收藏夹里删掉一本只能一本本进详情页。
-    private var selectionBindings: (isSelecting: Binding<Bool>, selected: Binding<Set<Int64>>)?
-    /// 把当前列表内容回传给父视图。
-    /// 批量操作需要 token，而 gid 是查不到 token 的：GalleryCache 里只有
-    /// 用户点开过的那几本，靠它去解析会静默跳过绝大多数选中项。
-    private var visibleGalleries: Binding<[GalleryInfo]>?
-
-    /// 顶部横向切页的选中项。非 nil 时在搜索栏下方渲染「首页/订阅/热门/排行」切页条。
-    /// 只有作为浏览容器的根列表才传入；标签列表、搜索结果等推入的列表不显示切页条。
-    private var browseSource: Binding<BrowseSource>?
-    /// 排行榜的时间范围（toplist.php 的 tl 参数）。非排行榜模式为 nil。
-    private var toplistPeriod: Binding<Int>?
-    /// 提交搜索时交给父容器处理（切到独立的搜索页），而不是就地把
-    /// 当前数据源变成搜索结果。只有浏览容器会传它。
-    private var onSearchSubmit: ((String) -> Void)?
-
-    static let toplistPeriods: [(tl: Int, title: String)] = [
-        (15, "全部时间"), (13, "过去一年"), (12, "过去一月"), (11, "昨天"),
-    ]
-
+    /// 父容器（例如收藏页）已经提供搜索框时，隐藏列表自己的搜索控件。
+    private var showsSearchControls = true
+    /// The dedicated Search tab executes queries locally instead of routing back to itself.
+    private var isDedicatedSearchPage = false
+    /// Monotonic request supplied by MainTabView after the Search tab becomes active.
+    private var searchFocusRequest = 0
+    /// A new metadata search must also dismiss any GalleryDetailView currently
+    /// pushed inside the compact Search tab's private NavigationStack.
+    private var searchNavigationResetRequest = 0
+    /// 父容器悬浮控件所需的初始滚动避让空间。
+    private var externalTopInset: CGFloat = 0
     private var selectionBinding: Binding<GalleryInfo?> {
         externalSelection ?? $selectedGallery
+    }
+
+    /// 对服务器返回了 simpleTags 的列表执行本地屏蔽；没有标签摘要的
+    /// 列表样式保持原样，避免在信息不足时误删画廊。
+    private var displayedGalleries: [GalleryInfo] {
+        let blocked = Set(AppSettings.shared.blockedTags)
+        let visible = viewModel.galleries.filter { gallery in
+            guard !blocked.isEmpty,
+                  let tags = gallery.simpleTags,
+                  !tags.isEmpty
+            else { return true }
+            return tags.allSatisfy { !blocked.contains($0.lowercased()) }
+        }
+        return visible
     }
 
     #if os(iOS)
@@ -112,16 +133,7 @@ struct GalleryListView: View {
     init(mode: ListMode) {
         self.mode = mode
         self.externalSelection = nil
-    }
-
-    /// 浏览容器的根列表 — 在搜索栏下方带出顶部切页条
-    init(mode: ListMode, browseSource: Binding<BrowseSource>, toplistPeriod: Binding<Int>? = nil,
-         onSearchSubmit: ((String) -> Void)? = nil) {
-        self.toplistPeriod = toplistPeriod
-        self.onSearchSubmit = onSearchSubmit
-        self.mode = mode
-        self.externalSelection = nil
-        self.browseSource = browseSource
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
     }
 
     /// 作为导航目标推入时使用，不创建自己的 NavigationStack/SplitView
@@ -129,65 +141,204 @@ struct GalleryListView: View {
         self.mode = mode
         self.isPushed = isPushed
         self.externalSelection = nil
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
     }
 
     init(mode: ListMode, selection: Binding<GalleryInfo?>) {
         self.mode = mode
         self.externalSelection = selection
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
+    }
+
+    /// 主栏目由 MainTabView 持有 ViewModel。布局在单栏/双栏间切换或用户
+    /// 离开后返回时，不重新解析缓存、发起网络请求或丢失滚动位置。
+    init(mode: ListMode, persistentViewModel: GalleryListViewModel) {
+        self.mode = mode
+        self.externalSelection = nil
+        _viewModel = State(initialValue: persistentViewModel)
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
+    }
+
+    init(
+        mode: ListMode,
+        selection: Binding<GalleryInfo?>,
+        persistentViewModel: GalleryListViewModel
+    ) {
+        self.mode = mode
+        self.externalSelection = selection
+        _viewModel = State(initialValue: persistentViewModel)
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
+    }
+
+    /// Search tab initializer. The owner keeps both reference-type states alive while the
+    /// user switches sections, so results, pagination, filters and scroll position survive.
+    init(
+        mode: ListMode,
+        selection: Binding<GalleryInfo?>,
+        persistentViewModel: GalleryListViewModel,
+        persistentAdvancedSearch: AdvancedSearchState,
+        searchFocusRequest: Int = 0,
+        searchNavigationResetRequest: Int = 0
+    ) {
+        self.mode = mode
+        self.externalSelection = selection
+        self.isDedicatedSearchPage = true
+        self.searchFocusRequest = searchFocusRequest
+        self.searchNavigationResetRequest = searchNavigationResetRequest
+        _viewModel = State(initialValue: persistentViewModel)
+        _advancedSearch = State(initialValue: persistentAdvancedSearch)
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
+    }
+
+    /// Compact Search tab initializer. It preserves the shared search model,
+    /// but owns its selection so it uses the same NavigationStack/list style
+    /// as Home instead of the wide embedded-column presentation.
+    init(
+        mode: ListMode,
+        persistentViewModel: GalleryListViewModel,
+        persistentAdvancedSearch: AdvancedSearchState,
+        searchFocusRequest: Int = 0,
+        searchNavigationResetRequest: Int = 0
+    ) {
+        self.mode = mode
+        self.externalSelection = nil
+        self.isDedicatedSearchPage = true
+        self.searchFocusRequest = searchFocusRequest
+        self.searchNavigationResetRequest = searchNavigationResetRequest
+        _viewModel = State(initialValue: persistentViewModel)
+        _advancedSearch = State(initialValue: persistentAdvancedSearch)
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
     }
 
     /// 收藏搜索模式
-    init(mode: ListMode, searchKeyword: String?, hidesOwnSearchBar: Bool = false,
-         hidesEmptyState: Bool = false,
-         isSelecting: Binding<Bool>? = nil,
-         selectedGids: Binding<Set<Int64>>? = nil,
-         visibleGalleries: Binding<[GalleryInfo]>? = nil) {
+    init(
+        mode: ListMode,
+        searchKeyword: String?,
+        showsSearchControls: Bool = true,
+        contentTopInset: CGFloat = 0,
+        persistentViewModel: GalleryListViewModel? = nil
+    ) {
         self.mode = mode
         self.favSearchKeyword = searchKeyword
+        self.showsSearchControls = showsSearchControls
+        self.externalTopInset = contentTopInset
         self.externalSelection = nil
-        self.hidesOwnSearchBar = hidesOwnSearchBar
-        self.hidesEmptyState = hidesEmptyState
-        self.visibleGalleries = visibleGalleries
-        if let isSelecting, let selectedGids {
-            self.selectionBindings = (isSelecting, selectedGids)
+        if let persistentViewModel {
+            _viewModel = State(initialValue: persistentViewModel)
         }
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
     }
 
     /// 收藏搜索模式 (嵌入)
-    init(mode: ListMode, selection: Binding<GalleryInfo?>, searchKeyword: String?,
-         hidesOwnSearchBar: Bool = false, hidesEmptyState: Bool = false) {
+    init(
+        mode: ListMode,
+        selection: Binding<GalleryInfo?>,
+        searchKeyword: String?,
+        showsSearchControls: Bool = true,
+        contentTopInset: CGFloat = 0,
+        persistentViewModel: GalleryListViewModel? = nil
+    ) {
         self.mode = mode
         self.externalSelection = selection
         self.favSearchKeyword = searchKeyword
-        self.hidesOwnSearchBar = hidesOwnSearchBar
-        self.hidesEmptyState = hidesEmptyState
+        self.showsSearchControls = showsSearchControls
+        self.externalTopInset = contentTopInset
+        if let persistentViewModel {
+            _viewModel = State(initialValue: persistentViewModel)
+        }
+        _primaryFeed = State(initialValue: Self.initialPrimaryFeed(for: mode))
+    }
+
+    private static func initialPrimaryFeed(for mode: ListMode) -> PrimaryFeed {
+        if case .popular = mode { return .popular }
+        return .home
+    }
+
+    private var supportsPrimaryFeedSwitching: Bool {
+        switch mode {
+        case .home, .popular: return true
+        default: return false
+        }
+    }
+
+    private var selectedBaseMode: ListMode {
+        supportsPrimaryFeedSwitching ? primaryFeed.listMode : mode
     }
 
     /// 当前实际运行模式 — 如果搜索框有内容，则为搜索模式
     /// 但收藏夹模式下搜索应保持在收藏夹内 (对齐 Android: 收藏夹搜索只搜收藏内容)
     private var effectiveMode: ListMode {
         if !viewModel.searchText.isEmpty {
-            if case .favorites = mode {
+            if case .favorites = selectedBaseMode {
                 // 收藏夹下搜索保持在收藏夹模式，搜索关键词通过 searchText 传递给 API
-                return mode
+                return selectedBaseMode
             }
-            // 浏览容器里由父视图把搜索切成独立的一页（见 onSearchSubmit），
-            // 这里不能再就地把「订阅」「热门」「排行」偷偷变成搜索结果 ——
-            // 那正是「顶部还高亮着订阅、内容却是全站搜索」的来源。
-            if onSearchSubmit != nil { return mode }
             return .search(keyword: viewModel.searchText)
         }
-        return mode
+        return selectedBaseMode
+    }
+
+    /// EH 的收藏响应有时不提供 pages，但设置中有登录后同步的各收藏夹计数。
+    /// 使用该计数作为只读后备，让页码/最后一页在 pages=0 时仍能执行。
+    private var maximumJumpPage: Int {
+        var pageCount = viewModel.totalPages
+        guard case .favorites(let slot) = effectiveMode else { return pageCount }
+
+        let favoriteCount: Int
+        if slot >= 0 {
+            favoriteCount = AppSettings.shared.favCount(slot)
+        } else {
+            favoriteCount = (0..<10).reduce(into: 0) { result, index in
+                result += AppSettings.shared.favCount(index)
+            }
+        }
+        pageCount = max(pageCount, (favoriteCount + 49) / 50)
+        if !viewModel.galleries.isEmpty { pageCount = max(pageCount, 1) }
+        return pageCount
+    }
+
+    private var isEmptyDedicatedSearch: Bool {
+        isDedicatedSearchPage
+            && viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && viewModel.galleries.isEmpty
+    }
+
+    private var keepsSearchInCurrentPage: Bool {
+        if isDedicatedSearchPage { return true }
+        if case .favorites = mode { return true }
+        return gallerySearchNavigationAction == nil
+    }
+
+    private func submitSearch() {
+        let query = viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        isSearchFocused = false
+        if keepsSearchInCurrentPage {
+            viewModel.searchWithAdvanced(advancedSearch)
+        } else {
+            gallerySearchNavigationAction?.search(query, advancedSearch)
+        }
+    }
+
+    private func clearSearchText() {
+        if isDedicatedSearchPage {
+            viewModel.clearDedicatedSearch()
+        } else {
+            viewModel.searchText = ""
+            viewModel.updateSuggestions()
+        }
+    }
+
+    private func activateQuickSearch(_ record: QuickSearchRecord) {
+        if keepsSearchInCurrentPage {
+            viewModel.applyQuickSearch(record)
+        } else {
+            gallerySearchNavigationAction?.quickSearch(record)
+        }
     }
 
 
 
     var body: some View {
-        // 诊断: 确认 body 是否被无限重渲染 (NSLog 不受缓冲影响，崩溃前也能看到)
-        #if DEBUG
-        let _ = Self._printChanges()  // ★ 精确显示触发源: @self/@identity/_property
-        #endif
-        let _ = NSLog("[RENDER] GalleryListView body, mode=%@, galleries=%d", String(describing: mode), viewModel.galleries.count)
         Group {
             if isEmbedded {
                 // 嵌入模式: 仅展示列表，由父视图管理导航
@@ -205,6 +356,9 @@ struct GalleryListView: View {
                             // 标签点击推入的画廊列表 (对齐 Android: onTagClick → 叠加新列表)
                             GalleryListView(mode: .tag(keyword: dest.tag), selection: $selectedGallery)
                         }
+                        .navigationDestination(for: UploaderSearchDestination.self) { dest in
+                            GalleryListView(mode: .search(keyword: dest.keyword), selection: $selectedGallery)
+                        }
                 }
                 .navigationSplitViewColumnWidth(min: 350, ideal: 400, max: 500)
             } detail: {
@@ -212,13 +366,15 @@ struct GalleryListView: View {
                 NavigationStack {
                     if let gallery = selectedGallery {
                         GalleryDetailView(gallery: gallery)
-                            .id(gallery.gid)  // 强制在选择变更时重新创建视图，修复封面不刷新问题
                     } else {
                         ContentUnavailableView("选择画廊", systemImage: "photo.stack", description: Text("从左侧列表选择一个画廊"))
                     }
                 }
                 .environment(\.tagNavigationAction, TagNavigationAction { tag in
                     sidebarPath.append(TagSearchDestination(tag: tag))
+                })
+                .environment(\.uploaderSearchNavigationAction, UploaderSearchNavigationAction { keyword in
+                    sidebarPath.append(UploaderSearchDestination(keyword: keyword))
                 })
             }
         } else {
@@ -227,32 +383,40 @@ struct GalleryListView: View {
         }
         }
         .task {
-            print("[EhView] body .task fired, mode=\(mode), galleries=\(viewModel.galleries.count), isLoading=\(viewModel.isLoading)")
             // 异步执行 ViewModel 初始化 — 避免 .onAppear 同步变更 @Observable 导致 NavigationStack 多次更新
             viewModel.favSearchKeyword = favSearchKeyword
             viewModel.loadSearchHistory()
-            // 已下载标记要有数据才画得出来
-            if !GalleryStatusCache.shared.isLoaded {
-                await GalleryStatusCache.shared.reload()
+            if isDedicatedSearchPage {
+                viewModel.restoreDedicatedSearchSession(into: advancedSearch)
             }
             if case .tag(let keyword) = mode, viewModel.searchText.isEmpty {
                 viewModel.searchText = keyword
             }
-            // 搜索页刚建好时，把查询摆回输入框——否则搜索页的输入框是空的，
-            // 用户看不到自己搜的是什么，也没法在此基础上增删条件
-            if case .search(let keyword) = mode, searchTokens.isEmpty, !keyword.isEmpty {
-                syncField(from: keyword)
-            }
-
             // 安全兜底: 确保数据加载在任何分支下都能触发
-            if viewModel.galleries.isEmpty && !viewModel.isLoading {
-                // effectiveMode：上面几行刚把 favSearchKeyword 写进 searchText，
-                // 用 mode 会忽略它，首次进入收藏搜索页会加载成整个收藏夹
-                viewModel.loadGalleries(mode: effectiveMode)
+            if viewModel.galleries.isEmpty && !viewModel.isLoading && !isEmptyDedicatedSearch {
+                viewModel.loadGalleries(mode: selectedBaseMode)
             }
         }
-        .onChange(of: viewModel.galleries) { _, list in
-            visibleGalleries?.wrappedValue = list
+        .task(id: favSearchKeyword) {
+            guard case .favorites = mode,
+                  viewModel.favSearchKeyword != favSearchKeyword
+            else { return }
+
+            // 收藏搜索由父级唯一搜索框驱动；短暂防抖并让 SwiftUI 在
+            // 关键字继续变化时自动取消旧任务。
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            viewModel.favSearchKeyword = favSearchKeyword
+            await viewModel.refreshAsync(mode: mode)
+        }
+        .onChange(of: AppSettings.shared.gallerySite) { _, _ in
+            viewModel.refresh(mode: selectedBaseMode)
+        }
+        .onChange(of: primaryFeed) { _, newFeed in
+            guard supportsPrimaryFeedSwitching else { return }
+            isSearchFocused = false
+            viewModel.scrollPosition = nil
+            viewModel.refresh(mode: newFeed.listMode)
         }
         .onChange(of: showAdvancedSearch) { _, isShowing in
             if !isShowing {
@@ -261,20 +425,67 @@ struct GalleryListView: View {
                 viewModel.syncAdvancedSettings(advancedSearch)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .galleryFavoriteChanged)) { notification in
-            // 收藏状态同步: 详情页收藏/取消收藏后，列表内对应画廊的收藏标记实时更新，无需刷新
-            guard let userInfo = notification.userInfo,
-                  let gid = userInfo["gid"] as? Int64 else { return }
-            let favorited = userInfo["favorited"] as? Bool ?? false
-            let slot = userInfo["slot"] as? Int ?? -1
-            if let index = viewModel.galleries.firstIndex(where: { $0.gid == gid }) {
-                viewModel.galleries[index].favoriteSlot = favorited ? slot : -1
+        .onChange(of: isSearchFocused) { _, focused in
+            if focused {
+                viewModel.updateSuggestions()
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: GalleryActionService.siteChangedNotification)) { _ in
-            // 站点切换后清除缓存并重新加载 (对齐 Android: 切换站点 → 刷新列表)
-            // 同样用 effectiveMode，否则切站点会把用户正在看的搜索结果换成首页
-            viewModel.refresh(mode: effectiveMode)
+        .onChange(of: viewModel.scrollPosition) { _, _ in
+            if isDedicatedSearchPage {
+                viewModel.scheduleDedicatedSearchPersistence()
+            }
+        }
+        .task(id: searchFocusRequest) {
+            guard isDedicatedSearchPage, searchFocusRequest != 0 else { return }
+            guard searchFocusRequest > 0 else {
+                isSearchFocused = false
+                return
+            }
+            // Wait until TabView has committed the destination hierarchy;
+            // otherwise UIKit immediately resigns the new text field.
+            await Task.yield()
+            await Task.yield()
+            isSearchFocused = true
+        }
+        .onChange(of: searchFocusRequest, initial: true) { _, request in
+            guard isDedicatedSearchPage, request < 0 else { return }
+            // Resigning focus must not wait for a `.task` hidden underneath a
+            // pushed GalleryDetailView. Otherwise the history/suggestion layer
+            // can remain above the newly loaded deep-search results.
+            isSearchFocused = false
+            searchPanelKeyboardCommand = nil
+        }
+        .onChange(of: searchNavigationResetRequest, initial: true) { _, request in
+            guard isDedicatedSearchPage, request != 0 else { return }
+            // `task(id:)` may be deferred while NavigationStack is presenting
+            // a detail destination. An observation callback is delivered to
+            // the mounted root immediately, so the new result set can never
+            // remain hidden behind the gallery that initiated it.
+            withAnimation(.smooth(duration: 0.24)) {
+                // In an embedded wide layout the visible detail is owned by
+                // MainTabView, not this view's private state. Reset through the
+                // effective binding so both compact and split layouts pop it.
+                selectionBinding.wrappedValue = nil
+                sidebarPath = NavigationPath()
+            }
+        }
+        .focusedSceneValue(\.browserCommandActions, BrowserCommandActions(
+            refresh: { viewModel.refresh(mode: effectiveMode) },
+            focusSearch: focusSearchFromCommand,
+            toggleDisplayMode: toggleGalleryDisplayMode
+        ))
+        .sheet(item: $favoritePickerGallery) { gallery in
+            FavoriteSlotPicker(
+                onSelect: { slot in
+                    favoritePickerGallery = nil
+                    addFavorite(gallery, to: slot)
+                },
+                onCancel: { favoritePickerGallery = nil }
+            )
+            #if os(iOS)
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+            #endif
         }
     }
 
@@ -282,127 +493,37 @@ struct GalleryListView: View {
     private var compactContent: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // 搜索栏 (全宽，置于内容顶部)
-                if !hidesOwnSearchBar {
-                    searchBarView
-                }
-
-                // 聚焦搜索时由面板接管搜索框以下的区域——此时列表内容与用户无关。
-                // 搜索框本身留在上面，否则用户看不到自己正在打什么。
-                if isSearchFocused {
-                    searchSuggestionsOverlay
-                } else {
-                    // 顶部横向切页 — 首页/订阅/热门/排行。
-                    // 这四者是同一类内容的不同数据源，放在同一层级横向切换；
-                    // 此前热门与排行要经「更多」标签页二级跳转才能到达。
-                    if let browseSource {
-                        EhTopTabs(
-                            items: BrowseSource.allCases.map { ($0, $0.title) },
-                            selection: browseSource
-                        )
-                    }
-
-                    // 排行榜的时间范围。挂在切页条下面而不是另起一屏，
-                    // 是因为它和「首页/订阅/热门」是同一层级的数据源筛选。
-                    if let toplistPeriod {
-                        EhFilterPills(
-                            items: Self.toplistPeriods.map { ($0.tl, $0.title) },
-                            selection: toplistPeriod
-                        )
-                        .padding(.bottom, 6)
-                    }
-
-                    Group {
-                        if viewModel.galleries.isEmpty && viewModel.errorMessage != nil && !viewModel.isLoading {
-                            errorView
-                        } else if viewModel.galleries.isEmpty && !viewModel.isLoading {
-                            // 加载完但一条都没有：此前直接渲染空 List，屏幕一片白，
-                            // 用户分不清是没结果、没登录，还是界面坏了
-                            if !hidesEmptyState { emptyStateView }
-                        } else {
-                            // 离线可用: 始终显示列表结构，加载指示器为内联行，不阻塞界面
-                            galleryList
-                        }
+                Group {
+                    if viewModel.galleries.isEmpty && viewModel.errorMessage != nil && !viewModel.isLoading {
+                        errorView
+                    } else {
+                        // 离线可用: 始终显示列表结构，加载指示器为内联行，不阻塞界面
+                        galleryList
                     }
                 }
-            }
-            // ★ navigationDestination 只在 NavigationStack 顶层注册一次，避免 pushedContent 重复注册导致未定义行为
-            .navigationDestination(for: GalleryInfo.self) { gallery in
-                GalleryDetailView(gallery: gallery)
-                    .id(gallery.gid)
-            }
-            // 标签点击推入的画廊列表 (对齐 Android: onTagClick → 叠加新列表)
-            .navigationDestination(for: TagSearchDestination.self) { dest in
-                GalleryListView(mode: .tag(keyword: dest.tag), isPushed: true)
             }
             .navigationTitle(navigationTitle)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            // 作为浏览容器的根列表时隐藏系统导航栏——设计稿里这一屏
-            // 从搜索胶囊开始，标题栏只是重复了顶部切页已经表达的信息。
-            // 推入的列表（标签、搜索结果）仍需要标题与返回按钮，故只在根列表隐藏。
-            .toolbar(browseSource != nil ? .hidden : .visible, for: .navigationBar)
             #endif
-            .toolbar { galleryToolbar }
-            #if os(iOS)
-            .toolbar {
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("完成") { isSearchFocused = false }
+            .overlay(alignment: .top) {
+                ZStack(alignment: .top) {
+                    searchDismissBackdrop(topInset: 54)
+                    floatingSearchControls
+                        .padding(.horizontal, 10)
+                        .padding(.top, 8)
+                        .zIndex(3)
+                    searchAuxiliaryOverlay
+                        .padding(.top, 58)
+                        .zIndex(4)
                 }
-            }
-            #endif
-            // 整屏覆盖而不是贴在搜索栏下方的小浮层：
-            // 聚焦时列表内容与用户无关，让面板完全接管
-
-            .rightDrawer(isOpen: $showQuickSearch) {
-                QuickSearchDrawerContent(
-                    selectedSearch: $selectedQuickSearch,
-                    currentKeyword: viewModel.searchText,
-                    onDismiss: { showQuickSearch = false }
-                )
             }
             .sheet(isPresented: $showAdvancedSearch) {
                 AdvancedSearchView(state: advancedSearch)
             }
-            .sheet(item: $pendingDownload) { gallery in
-                DownloadLabelPicker(
-                    onSelect: { label in
-                        pendingDownload = nil
-                        Task { await GalleryActionService.shared.startDownload(gallery: gallery, label: label) }
-                    },
-                    onCancel: { pendingDownload = nil }
-                )
-            }
-            .sheet(item: $pendingFavorite) { gallery in
-                FavoriteSlotPicker(
-                    onSelect: { slot in
-                        pendingFavorite = nil
-                        Task {
-                            if slot == -1 {
-                                GalleryActionService.shared.addLocalFavorite(gallery: gallery)
-                            } else {
-                                try? await GalleryActionService.shared.addFavorite(
-                                    gid: gallery.gid, token: gallery.token, slot: slot
-                                )
-                            }
-                        }
-                    },
-                    onCancel: { pendingFavorite = nil }
-                )
-            }
-            .sheet(isPresented: $showTagSelector) {
-                TagSelectorView { keyword in
-                    // 选中的标签直接进搜索框成为一枚 token，
-                    // 而不是在选择器里另画一条「预览」——预览是同一信息说两遍
-                    if !searchTokens.contains(keyword) {
-                        searchTokens.append(keyword)
-                    }
-                }
-            }
             .onChange(of: selectedQuickSearch) { _, newValue in
                 if let search = newValue {
-                    applyQuickSearch(search)
+                    activateQuickSearch(search)
                     selectedQuickSearch = nil
                 }
             }
@@ -419,22 +540,23 @@ struct GalleryListView: View {
             Button("取消", role: .cancel) { viewModel.goToPageInput = "" }
             Button("确定") {
                 if let page = Int(viewModel.goToPageInput), page >= 1,
-                   page <= viewModel.totalPages {
-                    viewModel.goToPage(page - 1, mode: effectiveMode)
+                   page <= maximumJumpPage {
+                    viewModel.goToPage(
+                        page - 1,
+                        mode: effectiveMode,
+                        knownTotalPages: maximumJumpPage
+                    )
                 }
                 viewModel.goToPageInput = ""
             }
         } message: {
-            Text("输入页码 (1-\(viewModel.totalPages))")
+            Text("输入页码 (1-\(maximumJumpPage))")
         }
     }
 
     /// 被推入导航栈时的内容 — 不包装 NavigationStack，避免嵌套
     private var pushedContent: some View {
         VStack(spacing: 0) {
-            // 搜索栏 (全宽，置于内容顶部)
-            searchBarView
-
             Group {
                 if viewModel.galleries.isEmpty && viewModel.errorMessage != nil && !viewModel.isLoading {
                     errorView
@@ -447,42 +569,30 @@ struct GalleryListView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .toolbar { galleryToolbar }
-        #if os(iOS)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("完成") { isSearchFocused = false }
+        .overlay(alignment: .top) {
+            ZStack(alignment: .top) {
+                searchDismissBackdrop(topInset: 54)
+                floatingSearchControls
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+                    .zIndex(3)
+                searchAuxiliaryOverlay
+                    .padding(.top, 58)
+                    .zIndex(4)
             }
-        }
-        #endif
-
-        .rightDrawer(isOpen: $showQuickSearch) {
-            QuickSearchDrawerContent(
-                selectedSearch: $selectedQuickSearch,
-                currentKeyword: viewModel.searchText,
-                onDismiss: { showQuickSearch = false }
-            )
         }
         .sheet(isPresented: $showAdvancedSearch) {
             AdvancedSearchView(state: advancedSearch)
         }
-        .sheet(isPresented: $showTagSelector) {
-            TagSelectorView { keyword in
-                if !searchTokens.contains(keyword) {
-                    searchTokens.append(keyword)
-                }
-            }
-        }
         .onChange(of: selectedQuickSearch) { _, newValue in
             if let search = newValue {
-                applyQuickSearch(search)
+                activateQuickSearch(search)
                 selectedQuickSearch = nil
             }
         }
         .task {
-            if viewModel.galleries.isEmpty {
-                viewModel.loadGalleries(mode: effectiveMode)
+            if viewModel.galleries.isEmpty && !isEmptyDedicatedSearch {
+                viewModel.loadGalleries(mode: selectedBaseMode)
             }
         }
         .sheet(isPresented: $viewModel.showJumpDialog) {
@@ -496,35 +606,107 @@ struct GalleryListView: View {
             Button("取消", role: .cancel) { viewModel.goToPageInput = "" }
             Button("确定") {
                 if let page = Int(viewModel.goToPageInput), page >= 1,
-                   page <= viewModel.totalPages {
-                    viewModel.goToPage(page - 1, mode: effectiveMode)
+                   page <= maximumJumpPage {
+                    viewModel.goToPage(
+                        page - 1,
+                        mode: effectiveMode,
+                        knownTotalPages: maximumJumpPage
+                    )
                 }
                 viewModel.goToPageInput = ""
             }
         } message: {
-            Text("输入页码 (1-\(viewModel.totalPages))")
+            Text("输入页码 (1-\(maximumJumpPage))")
         }
     }
 
     private var navigationTitle: String {
-        switch mode {
+        switch selectedBaseMode {
         case .home: return AppSettings.shared.gallerySite == .exHentai ? "ExHentai" : "E-Hentai"
-        case .subscription: return "订阅"
-        case .popular: return "热门"
-        case .toplist: return "排行"
-        case .search(let kw): return "搜索: \(kw)"
-        case .tag: return "标签搜索"  // 对齐 Android: 标签关键字显示在搜索框而非标题
-        case .favorites: return "收藏"
+        case .subscription: return AppLocalization.localized("订阅")
+        case .popular: return AppLocalization.localized("热门")
+        case .search(let kw): return kw.isEmpty
+            ? AppLocalization.localized("搜索")
+            : AppLocalization.format("搜索: %@", kw)
+        case .tag: return AppLocalization.localized("标签搜索")  // 对齐 Android: 标签关键字显示在搜索框而非标题
+        case .favorites: return AppLocalization.localized("收藏")
         }
     }
 
     private var galleryList: some View {
+        Group {
+            if isEmptyDedicatedSearch {
+                dedicatedSearchLanding
+            } else if galleryDisplayMode == .grid {
+                navigationWaterfall
+            } else {
+                standardGalleryList
+            }
+        }
+        .navigationDestination(for: GalleryInfo.self) { gallery in
+            GalleryDetailView(gallery: gallery)
+        }
+        .navigationDestination(isPresented: Binding(
+            get: { selectedGallery != nil },
+            set: { if !$0 { selectedGallery = nil } }
+        )) {
+            if let selectedGallery {
+                GalleryDetailView(gallery: selectedGallery)
+                    .id(selectedGallery.gid)
+            }
+        }
+    }
+
+    private var navigationWaterfall: some View {
+        let showJpn = AppSettings.shared.showJpnTitle
+        let fixThumb = AppSettings.shared.fixThumbUrl
+        let showRating = AppSettings.shared.showGalleryRating
+        let showPages = AppSettings.shared.showGalleryPages
+        return GalleryWaterfallView(
+            galleries: displayedGalleries,
+            topInset: (showsSearchControls ? 72 : 0) + externalTopInset,
+            scrollPosition: $viewModel.scrollPosition,
+            showsContinueReading: {
+                if case .home = selectedBaseMode { return true }
+                return false
+            }(),
+            isLoading: viewModel.isLoading,
+            hasMore: viewModel.hasMore,
+            onRefresh: { await viewModel.refreshOrLoadPrevious(mode: effectiveMode) },
+            onLoadMore: { await viewModel.loadMore(mode: effectiveMode) }
+        ) { gallery in
+            NavigationLink(value: gallery) {
+                GalleryWaterfallCard(
+                    gallery: gallery,
+                    showJpnTitle: showJpn,
+                    fixThumbUrl: fixThumb,
+                    showRating: showRating,
+                    showPages: showPages,
+                    isSelected: false
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var standardGalleryList: some View {
         // Perf P0-3: 一次性读取配置，避免每个 Row 重复读 UserDefaults
         let showJpn = AppSettings.shared.showJpnTitle
         let fixThumb = AppSettings.shared.fixThumbUrl
+        let showRating = AppSettings.shared.showGalleryRating
+        let showPages = AppSettings.shared.showGalleryPages
         return List {
+            if showsSearchControls || externalTopInset > 0 {
+                Color.clear
+                    .frame(height: (showsSearchControls ? 72 : 0) + externalTopInset)
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.hidden)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+
             // Fix F2-1: \u9996\u9875\u9876\u90e8\u663e\u793a\u201c\u7ee7\u7eed\u9605\u8bfb\u201d\u5361\u7247
-            if case .home = mode {
+            if case .home = selectedBaseMode {
                 ContinueReadingCard()
                     .listRowInsets(EdgeInsets())
                     .listRowSeparator(.hidden)
@@ -543,67 +725,50 @@ struct GalleryListView: View {
                 .listRowSeparator(.hidden)
             }
 
-            ForEach(viewModel.galleries, id: \.gid) { gallery in
-                // NavigationLink 在 List 里会自动补一个 disclosure 箭头，设计稿没有它，
-                // 而且每行右侧多出的 20pt 会挤压元信息行。把链接藏成零透明的底层，
-                // 行本身画在它上面——点按仍由链接接收。
-                Group {
-                    if let sel = selectionBindings, sel.isSelecting.wrappedValue {
-                        // 多选中：整行点按切换选中，不再进详情
-                        HStack(spacing: 0) {
-                            Image(systemName: sel.selected.wrappedValue.contains(gallery.gid)
-                                  ? "checkmark.circle.fill" : "circle")
-                                .font(.system(size: 20))
-                                .foregroundStyle(sel.selected.wrappedValue.contains(gallery.gid)
-                                                 ? EhColor.accent : EhColor.tertiaryLabel)
-                                .padding(.leading, EhSpacing.page)
-                            GalleryRow(
-                                gallery: gallery, showJpnTitle: showJpn, fixThumbUrl: fixThumb
-                            )
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            Haptics.tap()
-                            if sel.selected.wrappedValue.contains(gallery.gid) {
-                                sel.selected.wrappedValue.remove(gallery.gid)
-                            } else {
-                                sel.selected.wrappedValue.insert(gallery.gid)
-                            }
-                        }
-                    } else {
-                        ZStack {
-                            NavigationLink(value: gallery) { EmptyView() }
-                                .opacity(0)
-                            GalleryRow(
-                                gallery: gallery, showJpnTitle: showJpn, fixThumbUrl: fixThumb,
-                                onRequestDownload: requestDownload,
-                                onRequestFavorite: toggleFavorite,
-                                onTagTap: searchTag,
-                                highlightedTags: activeSearchTags
-                            )
-                        }
-                    }
+            ForEach(displayedGalleries, id: \.gid) { gallery in
+                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
+                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                Button {
+                    selectedGallery = gallery
+                } label: {
+                    GalleryRow(
+                        gallery: gallery,
+                        showJpnTitle: showJpn,
+                        fixThumbUrl: fixThumb,
+                        showRating: showRating,
+                        showPages: showPages,
+                        isSelected: false
+                    )
                 }
-                .overlay(alignment: .bottom) { EhHairline(inset: EhSpacing.page) }
+                .buttonStyle(.plain)
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    // 下载 (对齐 Android onItemLongClick: Download)
                     Button {
-                        requestDownload(gallery)
+                        performFavoriteToggle(gallery)
                     } label: {
-                        Label("下载", systemImage: "arrow.down.circle")
+                        Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
                     }
-                    .tint(.blue)
+                    .tint(isFavorited ? .gray : .red)
 
-                    // 收藏 / 取消收藏 (对齐 Android onItemLongClick)
-                    Button {
-                        toggleFavorite(gallery)
-                    } label: {
-                        Label(isFavorited(gallery) ? "取消收藏" : "收藏",
-                              systemImage: isFavorited(gallery) ? "heart.slash" : "heart")
+                    if !isWatchLater {
+                        Button {
+                            Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                        } label: {
+                            Label("稍后再看", systemImage: "bookmark")
+                        }
+                        .tint(.orange)
                     }
-                    .tint(isFavorited(gallery) ? .gray : .red)
                 }
-                .listRowInsets(EdgeInsets())
+                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                    if isWatchLater {
+                        Button {
+                            Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                        } label: {
+                            Label("移除稍后再看", systemImage: "bookmark.slash")
+                        }
+                        .tint(.orange)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
                 .listRowSeparator(.hidden)
             }
 
@@ -619,15 +784,12 @@ struct GalleryListView: View {
             }
         }
         .listStyle(.plain)
-        #if os(iOS)
-        // 向下滚收起底部导航条，向上滚放出来
-        .ehTabBarAutoHide()
-        #endif
+        .scrollPosition(id: $viewModel.scrollPosition)
         #if os(iOS)
         .scrollDismissesKeyboard(.immediately)
         #endif
         .refreshable {
-            await viewModel.refreshAsync(mode: effectiveMode)
+            await viewModel.refreshOrLoadPrevious(mode: effectiveMode)
         }
     }
 
@@ -636,8 +798,8 @@ struct GalleryListView: View {
         sidebarContent
             .navigationTitle(navigationTitle)
             .task {
-                if viewModel.galleries.isEmpty {
-                    viewModel.loadGalleries(mode: effectiveMode)
+                if viewModel.galleries.isEmpty && !isEmptyDedicatedSearch {
+                    viewModel.loadGalleries(mode: selectedBaseMode)
                 }
             }
     }
@@ -647,15 +809,55 @@ struct GalleryListView: View {
         // Perf P0-3: 一次性读取配置
         let showJpn = AppSettings.shared.showJpnTitle
         let fixThumb = AppSettings.shared.fixThumbUrl
+        let showRating = AppSettings.shared.showGalleryRating
+        let showPages = AppSettings.shared.showGalleryPages
+        let waterfallTopInset: CGFloat = (showsSearchControls ? 72 : 0) + externalTopInset
         return VStack(spacing: 0) {
-            // 搜索栏 (全宽，置于内容顶部)
-            searchBarView
-
             Group {
-                if viewModel.galleries.isEmpty && viewModel.errorMessage != nil && !viewModel.isLoading {
+                if isEmptyDedicatedSearch {
+                    dedicatedSearchLanding
+                } else if viewModel.galleries.isEmpty && viewModel.errorMessage != nil && !viewModel.isLoading {
                     errorView
+                } else if galleryDisplayMode == .grid {
+                    GalleryWaterfallView(
+                        galleries: displayedGalleries,
+                        topInset: waterfallTopInset,
+                        scrollPosition: $viewModel.scrollPosition,
+                        showsContinueReading: false,
+                        isLoading: viewModel.isLoading,
+                        hasMore: viewModel.hasMore,
+                        onRefresh: { await viewModel.refreshOrLoadPrevious(mode: effectiveMode) },
+                        onLoadMore: { await viewModel.loadMore(mode: effectiveMode) }
+                    ) { gallery in
+                        Button {
+                            selectionBinding.wrappedValue = gallery
+                        } label: {
+                            GalleryWaterfallCard(
+                                gallery: gallery,
+                                showJpnTitle: showJpn,
+                                fixThumbUrl: fixThumb,
+                                showRating: showRating,
+                                showPages: showPages,
+                                isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
                 } else {
                     List(selection: selectionBinding) {
+                        // A real row is used instead of contentMargins because
+                        // List may ignore scroll-content top margins. It
+                        // keeps the first gallery clear of the floating search
+                        // controls and naturally scrolls away with the feed.
+                        if showsSearchControls || externalTopInset > 0 {
+                            Color.clear
+                                .frame(height: (showsSearchControls ? 72 : 0) + externalTopInset)
+                                .listRowInsets(EdgeInsets())
+                                .listRowSeparator(.hidden)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
+
                         // 内联加载指示器 (不阻塞界面)
                         if viewModel.isLoading && viewModel.galleries.isEmpty {
                             VStack(spacing: 8) {
@@ -669,15 +871,66 @@ struct GalleryListView: View {
                             .listRowSeparator(.hidden)
                         }
 
-                        ForEach(viewModel.galleries, id: \.gid) { gallery in
+                        ForEach(displayedGalleries, id: \.gid) { gallery in
+                            let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
+                            let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                            #if os(macOS)
+                            Button {
+                                selectionBinding.wrappedValue = gallery
+                            } label: {
+                                GalleryRow(
+                                    gallery: gallery,
+                                    showJpnTitle: showJpn,
+                                    fixThumbUrl: fixThumb,
+                                    showRating: showRating,
+                                    showPages: showPages,
+                                    isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                            .listRowSeparator(.hidden)
+                            #else
                             GalleryRow(
-                        gallery: gallery, showJpnTitle: showJpn, fixThumbUrl: fixThumb,
-                        onRequestDownload: requestDownload,
-                        onRequestFavorite: toggleFavorite,
-                        onTagTap: searchTag,
-                        highlightedTags: activeSearchTags
-                    )
+                                gallery: gallery,
+                                showJpnTitle: showJpn,
+                                fixThumbUrl: fixThumb,
+                                showRating: showRating,
+                                showPages: showPages,
+                                isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
+                            )
                                 .tag(gallery)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button {
+                                        performFavoriteToggle(gallery)
+                                    } label: {
+                                        Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
+                                    }
+                                    .tint(isFavorited ? .gray : .red)
+
+                                    if !isWatchLater {
+                                        Button {
+                                            Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                                        } label: {
+                                            Label("稍后再看", systemImage: "bookmark")
+                                        }
+                                        .tint(.orange)
+                                    }
+                                }
+                                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                    if isWatchLater {
+                                        Button {
+                                            Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                                        } label: {
+                                            Label("移除稍后再看", systemImage: "bookmark.slash")
+                                        }
+                                        .tint(.orange)
+                                    }
+                                }
+                                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                                .listRowSeparator(.hidden)
+                            #endif
                         }
 
                         if viewModel.hasMore {
@@ -689,43 +942,52 @@ struct GalleryListView: View {
                                 }
                         }
                     }
-                    .listStyle(.sidebar)
+                    .scrollPosition(id: $viewModel.scrollPosition)
+                    #if os(macOS)
+                    // This is the content/feed column, not the app sidebar.
+                    // Keep materials on navigation and controls; gallery
+                    // content uses an opaque surface for legibility.
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .scrollEdgeEffectStyle(.soft, for: .top)
+                    #else
+                    // 与首页使用相同的内容列表样式。`.sidebar` 会在 iOS
+                    // 收藏页额外注入圆角分组背景与 disclosure 外观。
+                    .listStyle(.plain)
+                    #endif
                     .refreshable {
-                        await viewModel.refreshAsync(mode: effectiveMode)
+                        await viewModel.refreshOrLoadPrevious(mode: effectiveMode)
                     }
                 }
             }
         }
-        .toolbar { galleryToolbar }
-        #if os(iOS)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("完成") { isSearchFocused = false }
-            }
-        }
+        #if os(macOS)
+        .background(Color(nsColor: .windowBackgroundColor))
         #endif
+        .overlay(alignment: .top) {
+            if showsSearchControls {
+                ZStack(alignment: .top) {
+                    searchDismissBackdrop(topInset: 54)
+                        .zIndex(1)
 
-        .rightDrawer(isOpen: $showQuickSearch) {
-            QuickSearchDrawerContent(
-                selectedSearch: $selectedQuickSearch,
-                currentKeyword: viewModel.searchText,
-                onDismiss: { showQuickSearch = false }
-            )
+                    floatingSearchControls
+                        .padding(.horizontal, 10)
+                        .padding(.top, 8)
+                        .zIndex(3)
+
+                    searchAuxiliaryOverlay
+                        .padding(.top, 58)
+                        .zIndex(4)
+                }
+            }
         }
         .sheet(isPresented: $showAdvancedSearch) {
             AdvancedSearchView(state: advancedSearch)
         }
-        .sheet(isPresented: $showTagSelector) {
-            TagSelectorView { keyword in
-                if !searchTokens.contains(keyword) {
-                    searchTokens.append(keyword)
-                }
-            }
-        }
         .onChange(of: selectedQuickSearch) { _, newValue in
             if let search = newValue {
-                applyQuickSearch(search)
+                activateQuickSearch(search)
                 selectedQuickSearch = nil
             }
         }
@@ -740,313 +1002,315 @@ struct GalleryListView: View {
             Button("取消", role: .cancel) { viewModel.goToPageInput = "" }
             Button("确定") {
                 if let page = Int(viewModel.goToPageInput), page >= 1,
-                   page <= viewModel.totalPages {
-                    viewModel.goToPage(page - 1, mode: effectiveMode)
+                   page <= maximumJumpPage {
+                    viewModel.goToPage(
+                        page - 1,
+                        mode: effectiveMode,
+                        knownTotalPages: maximumJumpPage
+                    )
                 }
                 viewModel.goToPageInput = ""
             }
         } message: {
-            Text("输入页码 (1-\(viewModel.totalPages))")
+            Text("输入页码 (1-\(maximumJumpPage))")
         }
     }
 
-    // MARK: - 搜索栏 (对齐 Android SearchBar，从 toolbar 移到 body header 以获得完整宽度)
-
-    /// 已确定的标签 token。文字与 token 在同一个输入框里混排：
-    /// 点 token 上的叉删掉整个标签，光标在文字里时退格照常改字。
-    @State private var searchTokens: [String] = []
-
-    /// 输入框里**正在打的文字**，只含自由文本。
-    ///
-    /// 不能直接绑 `viewModel.searchText`：那里保存的是提交给服务端的完整查询，
-    /// 提交时会把 token 合并进去；绑在一起就会出现「token 胶囊后面还跟着
-    /// 同一个标签的文字」的重复显示。
-    @State private var searchFieldText = ""
-
-    /// 正在把外部查询回填进输入框。回填期间要挡住 token 变化触发的重搜，
-    /// 否则会把快速搜索自带的分类/评分条件冲掉，还白跑一次网络。
-    @State private var isSyncingField = false
-
-    /// 等待选择收藏夹的画廊（没有设默认收藏夹时）
-    @State private var pendingFavorite: GalleryInfo?
-    /// 待选下载标签的画廊（对齐 Android 的下载标签对话框）
-    @State private var pendingDownload: GalleryInfo?
-
-
-    private var searchBarView: some View {
-        EhSearchBar(
-            text: $searchFieldText,
-            tokens: $searchTokens,
-            placeholder: "搜索标签或标题",
-            isFocused: $isSearchFocused,
-            // 右侧不再放小图标：15pt 的点按目标远低于 HIG 的 44pt，手机上按不中。
-            // 标签选择器、高级搜索、快速搜索都移进聚焦面板，那里有整行宽度。
-            trailingButtons: [],
-            onSubmit: { submitSearch() }
-        )
-        .onChange(of: searchFieldText) { _, text in
-            viewModel.updateSuggestions(for: text)
-        }
-        .onChange(of: searchTokens) { _, _ in
-            guard !isSyncingField else { return }
-            // token 变了就重搜：删掉一个标签本身就是一次条件变更
-            submitSearch()
-        }
-        // 外部改了查询就回填到输入框。
-        //
-        // 输入框显示的是 searchTokens + searchFieldText，而不是
-        // viewModel.searchText（两者当初为了修「同一标签既是 token 又是文字」
-        // 的重复显示而解耦）。于是任何只写 viewModel.searchText 的路径
-        // ——快速搜索、收藏夹内搜索、从详情页点标签进来——输入框都是空的。
-        // 与其逐条去补，不如在这里统一回填：新增路径也自动生效。
-        .onChange(of: viewModel.searchText) { _, newValue in
-            guard newValue != fieldQuery else { return }
-            syncField(from: newValue)
-        }
-    }
-
-    /// 当前搜索里用到的标签。用于把命中的 chip 排到前面并高亮——
-    /// 搜某个标签时，最想确认的就是「这本是因为哪个标签被搜出来的」，
-    /// 而它常常排在第五个之后，根本看不见。
-    private var activeSearchTags: Set<String> {
-        Set(searchTokens)
-    }
-
-    /// 输入框当前表达的查询（token + 正在打的字）
-    private var fieldQuery: String {
-        let typed = searchFieldText.trimmingCharacters(in: .whitespaces)
-        return (searchTokens + (typed.isEmpty ? [] : [typed])).joined(separator: " ")
-    }
-
-    /// 把一条查询摆进输入框，拆成 token 显示
-    private func syncField(from query: String) {
-        isSyncingField = true
-        searchTokens = Self.splitQuery(query)
-        searchFieldText = ""
-        // 下一个 runloop 再解锁：onChange(searchTokens) 是在本次更新之后才跑的
-        DispatchQueue.main.async { isSyncingField = false }
-    }
-
-    /// 按空格拆查询，但引号内的空格不拆。
-    /// `female:"big ass$" translated` → [`female:"big ass$"`, `translated`]
-    static func splitQuery(_ query: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-        var inQuotes = false
-        for ch in query {
-            if ch == "\"" {
-                inQuotes.toggle()
-                current.append(ch)
-            } else if ch == " " && !inQuotes {
-                if !current.isEmpty { tokens.append(current); current = "" }
-            } else {
-                current.append(ch)
-            }
-        }
-        if !current.isEmpty { tokens.append(current) }
-        return tokens
-    }
-
-    /// 这一本收藏过没有。云端收藏夹或本地收藏都算。
-    private func isFavorited(_ gallery: GalleryInfo) -> Bool {
-        GalleryStatusCache.shared.isFavorited(gallery)
-    }
-
-    /// 收藏 / 取消收藏。
-    ///
-    /// 此前无论已收藏与否都只调 quickFavorite（只会「加」）：侧滑出来的按钮
-    /// 明明写着「取消收藏」，按下去却是再收藏一次。云端收藏夹里想删掉一本，
-    /// 只能进详情页——列表页那个按钮是个谎。
-    private func toggleFavorite(_ gallery: GalleryInfo) {
-        if isFavorited(gallery) {
-            Task {
-                try? await GalleryActionService.shared.removeFavorite(
-                    gid: gallery.gid, token: gallery.token)
-            }
-        } else {
-            requestFavorite(gallery)
-        }
-    }
-
-    /// 收藏。没设默认收藏夹时弹选择器——此前这里直接丢掉了
-    /// `quickFavorite` 的返回值，于是没设默认的用户点侧滑/长按收藏毫无反应。
-    /// 成功与失败的提示由 GalleryActionService 统一发出。
-    private func requestFavorite(_ gallery: GalleryInfo) {
-        Task {
-            if await GalleryActionService.shared.quickFavorite(gallery: gallery) == .needsPicker {
-                pendingFavorite = gallery
-            }
-        }
-    }
-
-    /// 点列表行里的标签 chip：把它收成一枚 token 并立刻搜。
-    /// 标签在列表里一直只是装饰，看到感兴趣的还得自己回搜索框打一遍。
-    /// 快速搜索。在浏览容器里同样要切到搜索页，
-    /// 而不是把当前这一页原地变成搜索结果。
-    private func applyQuickSearch(_ search: QuickSearchRecord) {
-        if let onSearchSubmit, let keyword = search.keyword, !keyword.isEmpty {
-            onSearchSubmit(keyword)
-        } else {
-            viewModel.applyQuickSearch(search)
-        }
-    }
-
-    private func searchTag(_ tag: String) {
-        let quoted = Self.exactTagQuery(for: tag)
-        searchTokens = [quoted]
-        searchFieldText = ""
-        isSearchFocused = false
-        // 和手动提交走同一条路：在浏览容器里要切到搜索页，
-        // 否则点个标签就把「热门」变成了搜索结果
-        if let onSearchSubmit {
-            onSearchSubmit(quoted)
-        } else {
-            viewModel.performSearch(query: quoted, advanced: advancedSearch)
-        }
-    }
-
-    /// 把一个标签变成精确匹配的搜索式。
-    ///
-    /// 值那一半必须带引号，命名空间不能进引号里：
-    ///   `big ass`         → `"big ass$"`
-    ///   `female:big ass`  → `female:"big ass$"`
-    ///
-    /// 此前带命名空间的标签是原样透传的，于是 `female:big ass` 里的空格
-    /// 把它拆成了 `female:big` 和 `ass` 两个词——点这类标签永远搜不到东西，
-    /// 而不含空格的标签（`parody:haikyuu!!`）恰好又是好的，所以很容易漏掉。
-    static func exactTagQuery(for tag: String) -> String {
-        guard let colon = tag.firstIndex(of: ":") else { return "\"\(tag)$\"" }
-        let namespace = String(tag[tag.startIndex..<colon])
-        let value = String(tag[tag.index(after: colon)...])
-        guard !namespace.isEmpty, !value.isEmpty else { return "\"\(tag)$\"" }
-        return "\(namespace):\"\(value)$\""
-    }
-
-    /// 下载。建过下载标签且没设默认时先问放哪个标签——
-    /// 对齐 Android CommonOperations.startDownload。
-    private func requestDownload(_ gallery: GalleryInfo) {
-        if GalleryActionService.shared.downloadLabelChoiceNeeded() {
-            pendingDownload = gallery
-        } else {
-            Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
-        }
-    }
-
-    /// 提交搜索。
-    ///
-    /// token 与自由文本在**提交时**才合并，不写回 viewModel.searchText——
-    /// 写回去会让同一个标签既显示为 token 又显示为文字（搜索框里出现
-    /// 「bdsm」胶囊后面还跟着 f:bdsm$ 这样的重复）。
-    private func submitSearch() {
-        isSearchFocused = false
-        let typed = searchFieldText.trimmingCharacters(in: .whitespaces)
-
-        // 打出来的自由文本若本身就是一个标签，收成 token；
-        // 提交后 token 留在输入框里，这样从列表回来仍能看到当前搜索条件，
-        // 也能逐个删掉某一条重搜，而不必整串清空重打。
-        if !typed.isEmpty, !searchTokens.contains(typed) {
-            searchTokens.append(typed)
-        }
-        searchFieldText = ""
-
-        let query = searchTokens.joined(separator: " ")
-        if let onSearchSubmit {
-            // 交给浏览容器切到搜索页；这一份列表随之被重建
-            onSearchSubmit(query)
-        } else {
-            viewModel.performSearch(query: query, advanced: advancedSearch)
-        }
-    }
-
-    // MARK: - 统一工具栏 (对齐 Android FAB secondaryButtons)
-
-    @ToolbarContentBuilder
-    private var galleryToolbar: some ToolbarContent {
-        // 其余按钮 (对齐 Android FAB secondaryButtons)
-        ToolbarItem(placement: .automatic) {
-            HStack(spacing: 4) {
-                // 快速搜索 (对齐 Android QuickSearch)
-                Button { showQuickSearch = true } label: {
-                    Image(systemName: "bookmark")
+    /// Search and feed navigation float over the scrolling content on every
+    /// platform. Liquid Glass keeps the field visually separate without
+    /// introducing a fixed header band.
+    private var floatingSearchControls: some View {
+        HStack(spacing: 8) {
+            if let contentRouteBackAction {
+                Button(action: contentRouteBackAction.perform) {
+                    Image(systemName: "chevron.left")
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .help("返回")
+                .accessibilityIdentifier("gallery.search.back")
+            }
 
-                // 跳页 (对齐 Android showGoToDialog: 统一使用跳页 Sheet，支持页码/日期/快捷跳转)
+            if supportsPrimaryFeedSwitching {
+                Menu {
+                    Button {
+                        primaryFeed = .home
+                    } label: {
+                        Label("首页", systemImage: primaryFeed == .home ? "checkmark" : "house")
+                    }
+
+                    Button {
+                        primaryFeed = .popular
+                    } label: {
+                        Label("热门", systemImage: primaryFeed == .popular ? "checkmark" : "flame")
+                    }
+                } label: {
+                    Image(systemName: primaryFeed == .home ? "house" : "flame")
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .help(AppLocalization.localized(primaryFeed == .home ? "切换到热门" : "切换到首页"))
+                .accessibilityLabel("切换首页与热门")
+            }
+
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+
+                searchFieldControl
+
                 Button {
-                    viewModel.showJumpDialog = true
+                    if viewModel.searchText.isEmpty {
+                        isSearchFocused = false
+                        showAdvancedSearch = true
+                    } else {
+                        clearSearchText()
+                    }
+                } label: {
+                    Image(systemName: viewModel.searchText.isEmpty
+                          ? (advancedSearch.isEnabled ? "plus.circle.fill" : "plus.circle")
+                          : "xmark.circle.fill")
+                        .foregroundStyle(viewModel.searchText.isEmpty ? .primary : .secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 38)
+            .frame(maxWidth: .infinity)
+            // The text field is the interactive control. Applying an
+            // interactive glass container here can take first-responder taps
+            // away from UIKit's text input bridge on iOS/Simulator.
+            .glassEffect(.regular, in: .capsule)
+
+            if isSearchFocused {
+                Button {
+                    isSearchFocused = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .help("结束搜索输入")
+                .accessibilityLabel("结束搜索输入")
+                .accessibilityIdentifier("gallery.search.dismiss")
+                .transition(.scale.combined(with: .opacity))
+            } else {
+                Button { toggleGalleryDisplayMode() } label: {
+                    Image(systemName: galleryDisplayMode == .list ? "rectangle.grid.2x2" : "list.bullet")
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
+                .help(AppLocalization.localized(galleryDisplayMode == .list ? "切换到瀑布流" : "切换到列表"))
+                .accessibilityIdentifier("gallery.display.toggle")
+
+                Button {
+                    if maximumJumpPage > 0 {
+                        viewModel.showGoToDialog = true
+                    } else {
+                        viewModel.showJumpDialog = true
+                    }
                 } label: {
                     Image(systemName: "arrow.up.arrow.down")
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
                 }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: .circle)
                 .disabled(viewModel.galleries.isEmpty)
+                .help("跳页")
+                .accessibilityIdentifier("gallery.search.jump")
+                .transition(.scale.combined(with: .opacity))
             }
+        }
+        .animation(.snappy(duration: 0.2), value: isSearchFocused)
+    }
+
+    private var searchRecordsPanel: some View {
+        SearchRecordsPanelContent(
+            selectedSearch: $selectedQuickSearch,
+            searchHistory: viewModel.searchHistory,
+            currentSearch: viewModel.currentQuickSearchRecord(),
+            searchText: viewModel.searchText,
+            suggestions: viewModel.suggestions,
+            onSelectHistory: { term in
+                viewModel.searchText = term
+                submitSearch()
+            },
+            onDeleteHistory: viewModel.removeSearchHistory,
+            onSelectSuggestion: { suggestion in
+                viewModel.applySuggestion(suggestion)
+            },
+            onSubmitCurrentSearch: {
+                submitSearch()
+            },
+            onDismiss: { isSearchFocused = false },
+            keyboardCommand: searchPanelKeyboardCommand
+        )
+    }
+
+    @ViewBuilder
+    private var searchFieldControl: some View {
+        #if os(iOS)
+        if keepsSearchInCurrentPage {
+            interactiveSearchField
+        } else {
+            Button(action: focusSearchFromCommand) {
+                Text(viewModel.searchText.isEmpty ? "搜索" : viewModel.searchText)
+                    .foregroundStyle(viewModel.searchText.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("打开搜索")
+            .accessibilityIdentifier("gallery.search.field")
+        }
+        #else
+        interactiveSearchField
+        #endif
+    }
+
+    private var interactiveSearchField: some View {
+        TextField("搜索", text: $viewModel.searchText)
+            .textFieldStyle(.plain)
+            .focused($isSearchFocused)
+            .onSubmit { submitSearch() }
+            .onChange(of: viewModel.searchText) { _, _ in
+                viewModel.updateSuggestions()
+            }
+            #if os(macOS)
+            .onKeyPress(.downArrow) {
+                sendSearchPanelCommand(.next)
+                return .handled
+            }
+            .onKeyPress(.upArrow) {
+                sendSearchPanelCommand(.previous)
+                return .handled
+            }
+            .onKeyPress(.return) {
+                sendSearchPanelCommand(.confirm)
+                return .handled
+            }
+            .onKeyPress(.escape) {
+                isSearchFocused = false
+                return .handled
+            }
+            #else
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            #endif
+            .accessibilityIdentifier("gallery.search.field")
+    }
+
+    private func focusSearchFromCommand() {
+        if keepsSearchInCurrentPage {
+            isSearchFocused = true
+        } else {
+            isSearchFocused = false
+            gallerySearchNavigationAction?.focusSearch()
         }
     }
 
-    // MARK: - 搜索建议浮层 (对齐 Android SearchBar.updateSuggestions 下拉列表)
+    /// 空搜索页承载排行榜；聚焦搜索框时，统一的历史与候选面板覆盖在其上。
+    private var dedicatedSearchLanding: some View {
+        TopListView(selection: selectionBinding)
+            .padding(.top, showsSearchControls ? 64 : 0)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-    /// 搜索聚焦面板 —— 设计稿第 2 屏。
-    ///
-    /// 此前是个 300pt 高的下拉浮层，只放了历史与建议；标签选择器、高级搜索、
-    /// 快速搜索被塞进搜索胶囊右侧的三个 15pt 图标里，手机上点不中，
-    /// 「快速搜索」还在改版时整个丢了。整屏接管后这些都有整行的落点。
     @ViewBuilder
-    private var searchSuggestionsOverlay: some View {
+    private var searchAuxiliaryOverlay: some View {
+        ZStack(alignment: .top) {
+            if isSearchFocused {
+                // 聚焦时右侧只有一个 38pt 关闭按钮。46pt 同时包含按钮与
+                // 间距；面板自身 10pt 外边距与搜索栏的外边距完全一致。
+                searchRecordsPanel
+                    .padding(
+                        .leading,
+                        (contentRouteBackAction == nil ? 0 : 46)
+                            + (supportsPrimaryFeedSwitching ? 46 : 0)
+                    )
+                    .padding(.trailing, 46)
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .offset(y: -7)),
+                            removal: .opacity.combined(with: .scale(scale: 0.985, anchor: .top))
+                        )
+                    )
+            }
+        }
+        .animation(.snappy(duration: 0.24, extraBounce: 0.05), value: isSearchFocused)
+    }
+
+    private var galleryDisplayMode: EhSettings.ListMode {
+        AppSettings.shared.listMode
+    }
+
+    private func toggleGalleryDisplayMode() {
+        isSearchFocused = false
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            AppSettings.shared.listMode = galleryDisplayMode == .list ? .grid : .list
+        }
+    }
+
+    @ViewBuilder
+    private func searchDismissBackdrop(topInset: CGFloat) -> some View {
         if isSearchFocused {
-            SearchFocusPanel(
-                text: searchFieldText,
-                tokens: $searchTokens,
-                suggestions: viewModel.suggestions,
-                history: viewModel.searchHistory,
-                onPickSuggestion: { tag in
-                    // 建议取代了正在打的那段文字：清掉它，否则提交时它会再变成
-                    // 一个 token，同一个标签就出现两遍
-                    searchFieldText = ""
-                    if !searchTokens.contains(tag) { searchTokens.append(tag) }
-                },
-                onClearHistory: { viewModel.clearSearchHistory() },
-                onPickHistory: { term in
-                    // 历史条目本身就是一条完整查询，直接提交，
-                    // 不塞进输入框再拼一次
-                    searchFieldText = ""
-                    searchTokens = []
-                    isSearchFocused = false
-                    viewModel.performSearch(query: term, advanced: advancedSearch)
-                },
-                onOpenTagSelector: { showTagSelector = true },
-                onOpenAdvancedSearch: { showAdvancedSearch = true },
-                onOpenQuickSearch: { showQuickSearch = true },
-                isAdvancedActive: advancedSearch.isEnabled
-            )
-            .transition(.opacity)
+            VStack(spacing: 0) {
+                Color.clear
+                    .frame(height: topInset)
+                    .contentShape(Rectangle())
+                    .onTapGesture { isSearchFocused = false }
+
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { isSearchFocused = false }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    // MARK: - 统一搜索建议 (已废弃，保留兼容)
+    private func sendSearchPanelCommand(_ action: SearchPanelKeyboardAction) {
+        searchPanelKeyboardCommand = SearchPanelKeyboardCommand(action: action)
+    }
 
-    @ViewBuilder
-    private var searchSuggestionsBlock: some View {
-        // 搜索历史 (搜索框为空时显示)
-        if viewModel.searchText.isEmpty && !viewModel.searchHistory.isEmpty {
-            Section {
-                ForEach(viewModel.searchHistory, id: \.self) { term in
-                    Button {
-                        viewModel.searchText = term
-                        viewModel.searchWithAdvanced(advancedSearch)
-                    } label: {
-                        Label(term, systemImage: "clock")
-                    }
-                }
-                Button(role: .destructive) {
-                    viewModel.clearSearchHistory()
-                } label: {
-                    Label("清除搜索历史", systemImage: "trash")
-                }
-            } header: {
-                Text("搜索历史")
-            }
+    /// 列表收藏与详情页保持相同语义：“每次询问”会先展示收藏夹，
+    /// 已设置默认收藏夹时才直接执行。这样滑动操作不会静默失败。
+    private func performFavoriteToggle(_ gallery: GalleryInfo) {
+        let service = GalleryActionService.shared
+        if !service.isFavorited(gallery), AppSettings.shared.defaultFavSlot == -2 {
+            favoritePickerGallery = gallery
+            return
         }
-        // 标签建议
-        if !viewModel.suggestions.isEmpty {
-            searchSuggestionsContent
+        Task { await service.toggleFavorite(gallery) }
+    }
+
+    private func addFavorite(_ gallery: GalleryInfo, to slot: Int) {
+        Task {
+            do {
+                if slot == -1 {
+                    try await GalleryActionService.shared.addLocalFavorite(gallery: gallery)
+                } else {
+                    try await GalleryActionService.shared.addFavorite(
+                        gid: gallery.gid,
+                        token: gallery.token,
+                        slot: slot
+                    )
+                }
+                Haptics.success()
+            } catch {
+                ErrorHandler.shared.handle(error, context: "ListFavorite")
+            }
         }
     }
 
@@ -1061,39 +1325,20 @@ struct GalleryListView: View {
     ]
     @State private var selectedJumpNode: String = "1d"
 
-    /// 把 "2w" 这样的相对跨度换算成实际日期，显示在快捷项下面
-    private static func targetDateHint(for node: String) -> String {
-        guard let unit = node.last,
-              let amount = Int(node.dropLast()) else { return "" }
-        var component = DateComponents()
-        switch unit {
-        case "d": component.day = -amount
-        case "w": component.day = -amount * 7
-        case "m": component.month = -amount
-        case "y": component.year = -amount
-        default: return ""
-        }
-        guard let date = Calendar.current.date(byAdding: component, to: Date()) else { return "" }
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd"
-        return f.string(from: date)
-    }
-
     private var jumpSheet: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     // 模式切换 (对齐 Android JumpDateSelector 的 toggle 按钮)
-                    EhSegmented(
-                        items: viewModel.totalPages > 0
-                            ? [(0, "快捷"), (1, "按日期"), (2, "按页码")]
-                            : [(0, "快捷"), (1, "按日期")],
-                        selection: $jumpMode
-                    )
-                    .padding(.horizontal, EhSpacing.page)
+                    Picker("跳页模式", selection: $jumpUseQuickNode) {
+                        Text("快捷跳转").tag(true)
+                        Text("日期选择").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
                     .padding(.top, 8)
 
-                    if jumpMode == 0 {
+                    if jumpUseQuickNode {
                         // 快捷节点 (对齐 Android JumpDateSelector RadioGroup)
                         VStack(spacing: 12) {
                             Text("选择时间范围快速跳转")
@@ -1108,26 +1353,19 @@ struct GalleryListView: View {
                                     Button {
                                         selectedJumpNode = node.value
                                     } label: {
-                                        VStack(spacing: 2) {
-                                            Text(node.label)
-                                                .font(EhFont.body)
-                                            // 「1 周」不如「跳到 08-21」直观：
-                                            // 用户脑子里想的是日期，不是相对天数
-                                            Text(Self.targetDateHint(for: node.value))
-                                                .font(EhFont.mono(11))
-                                                .foregroundStyle(EhColor.tertiaryLabel)
-                                        }
+                                        Text(node.label)
+                                            .font(.body)
                                             .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 10)
+                                            .padding(.vertical, 12)
                                             .background(
                                                 selectedJumpNode == node.value
-                                                    ? EhColor.accentWash
-                                                    : EhColor.fill
+                                                    ? Color.accentColor.opacity(0.15)
+                                                    : Color.secondary.opacity(0.08)
                                             )
                                             .foregroundStyle(
                                                 selectedJumpNode == node.value
-                                                    ? EhColor.accent
-                                                    : EhColor.label
+                                                    ? Color.accentColor
+                                                    : .primary
                                             )
                                             .clipShape(RoundedRectangle(cornerRadius: 8))
                                             .overlay(
@@ -1145,7 +1383,7 @@ struct GalleryListView: View {
                             }
                             .padding(.horizontal)
                         }
-                    } else if jumpMode == 1 {
+                    } else {
                         // 日期选择器 (对齐 Android JumpDateSelector DATE_PICKER_TYPE)
                         Text("选择日期跳转到对应时间的画廊")
                             .font(.subheadline)
@@ -1159,22 +1397,6 @@ struct GalleryListView: View {
                         )
                         .datePickerStyle(.graphical)
                         .padding(.horizontal)
-                    } else if jumpMode == 2 {
-                        // 页码跳转
-                        VStack(spacing: 12) {
-                            Text("输入页码跳转 (1-\(viewModel.totalPages))")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-
-                            TextField("页码", text: $viewModel.goToPageInput)
-                                #if os(iOS)
-                                .keyboardType(.numberPad)
-                                #endif
-                                .textFieldStyle(.roundedBorder)
-                                .frame(maxWidth: 200)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal)
-                        }
                     }
 
                     // 前/后页快捷按钮 (仅收藏模式)
@@ -1214,16 +1436,10 @@ struct GalleryListView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("跳转") {
                         viewModel.showJumpDialog = false
-                        if jumpMode == 0 {
+                        if jumpUseQuickNode {
                             viewModel.goToJump("jump=\(selectedJumpNode)", mode: effectiveMode)
-                        } else if jumpMode == 1 {
+                        } else {
                             viewModel.goToDate(viewModel.jumpDate, mode: effectiveMode)
-                        } else if jumpMode == 2 {
-                            if let page = Int(viewModel.goToPageInput), page >= 1,
-                               page <= viewModel.totalPages {
-                                viewModel.goToPage(page - 1, mode: effectiveMode)
-                            }
-                            viewModel.goToPageInput = ""
                         }
                     }
                 }
@@ -1232,109 +1448,18 @@ struct GalleryListView: View {
         .presentationDetents([.medium, .large])
     }
 
-    // MARK: - 搜索建议内容 (对齐 Android SearchBar.updateSuggestions)
-
-    @ViewBuilder
-    private var searchSuggestionsContent: some View {
-        ForEach(viewModel.suggestions) { suggestion in
-            Button {
-                viewModel.applySuggestion(suggestion.english)
-            } label: {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(suggestion.chinese)
-                            .font(.body)
-                            .foregroundStyle(.primary)
-                        Text(suggestion.english)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            Divider().padding(.leading, 16)
-        }
-    }
-
-    /// 当前错误是不是 IP 封禁 (issue #1: 以前这种情况只显示一片空白)
-    private var isIPBanned: Bool {
-        viewModel.errorMessage?.contains("临时封禁") == true
-    }
-
-    /// 空结果态。按当前模式给出对应的下一步，而不是一句笼统的「暂无内容」。
-    @ViewBuilder
-    private var emptyStateView: some View {
-        switch mode {
-        case .favorites:
-            EhStateView(kind: .empty(
-                symbol: "heart",
-                title: "这个收藏夹是空的",
-                message: "在画廊详情页点 ♡ 就能加进来；云收藏夹需要登录后才会同步"
-            ))
-        case .subscription:
-            EhStateView(kind: .empty(
-                symbol: "bell",
-                title: "订阅里还没有内容",
-                message: "在「我的 → 订阅标签」里加几个标签，符合的画廊会出现在这里"
-            ))
-        case .search, .tag:
-            EhStateView(
-                kind: .empty(
-                    symbol: "magnifyingglass",
-                    title: "没有符合条件的画廊",
-                    message: "换个关键词，或放宽高级搜索里的筛选条件"
-                ),
-                primaryAction: advancedSearch.isEnabled
-                    ? ("清除筛选条件", {
-                        advancedSearch = AdvancedSearchState()
-                        viewModel.searchWithAdvanced(advancedSearch)
-                    })
-                    : nil
-            )
-        default:
-            EhStateView(
-                kind: .empty(
-                    symbol: "tray",
-                    title: "这里暂时没有内容",
-                    message: "下拉可以重新加载"
-                ),
-                // effectiveMode 而不是 mode：有搜索词时用 mode 会悄悄把搜索丢掉，
-                // 按钮写着「重新加载」，实际做的是「退回首页列表」。
-                // 隔壁 errorView 的「重试」一直是对的，这里漏了。
-                primaryAction: ("重新加载", { viewModel.refresh(mode: effectiveMode) })
-            )
-        }
-    }
-
     private var errorView: some View {
         VStack(spacing: 16) {
-            Image(systemName: isIPBanned ? "hand.raised.slash" : "wifi.exclamationmark")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(isIPBanned ? EhColor.warning : EhColor.danger)
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
             Text(viewModel.errorMessage ?? "加载失败")
-                .font(EhFont.caption)
-                .foregroundStyle(EhColor.secondaryLabel)
+                .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
 
-            // IP 封禁 —— 换节点是唯一有效动作，单独给一组提示
-            if isIPBanned {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("这是 E-Hentai 的限制，与 App 无关", systemImage: "info.circle")
-                    Label("换一个 VPN 节点通常立即恢复", systemImage: "arrow.triangle.2.circlepath")
-                    Label("同一节点被多人共用时最容易触发", systemImage: "person.2")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 32)
-            }
-
             // 网络提示
-            if let msg = viewModel.errorMessage, !isIPBanned,
+            if let msg = viewModel.errorMessage,
                msg.contains("超时") || msg.contains("timed out") || msg.contains("连接") || msg.contains("域名") || msg.contains("DNS") {
                 VStack(alignment: .leading, spacing: 6) {
                     Label("请确认 VPN / 代理已开启", systemImage: "lock.shield")
@@ -1388,60 +1513,196 @@ struct GalleryRow: View {
     let gallery: GalleryInfo
     let showJpnTitle: Bool
     let fixThumbUrl: Bool
-    /// 由父视图处理：收藏可能需要弹收藏夹选择器，下载需要移动网络确认，
-    /// 这些都不是一行自己能决定的。
-    var onRequestDownload: (GalleryInfo) -> Void = { _ in }
-    var onRequestFavorite: (GalleryInfo) -> Void = { _ in }
-    /// 点标签直接按这个标签搜
-    var onTagTap: ((String) -> Void)? = nil
-    /// 当前搜索用到的标签，命中的 chip 会排前并高亮
-    var highlightedTags: Set<String> = []
+    let showRating: Bool
+    let showPages: Bool
+    let isSelected: Bool
 
-    /// 行的显示全部交给 EhGalleryRow(gallery:)，这里只负责把封面 URL 修正好。
-    /// 显示开关、缩略图缩放、已下载/已收藏都在那个组件里统一处理——
-    /// 放在调用方就会出现「首页有、别的页没有」。
-    private var displayGallery: GalleryInfo {
-        guard let fixed = thumbURL?.absoluteString, fixed != gallery.thumb else { return gallery }
-        var copy = gallery
-        copy.thumb = fixed
-        return copy
+    @Environment(\.responsiveLayout) private var layout
+    @State private var isCoverHovered = false
+    @State private var favoritePickerGallery: GalleryInfo?
+
+    private var usesTabletContentMargins: Bool {
+        layout.horizontalSizeClass == .regular
+            && (layout.height > layout.width || AppSettings.shared.wideScreenListMode == 1)
+    }
+
+    private var drawsCustomSelectionHighlight: Bool {
+        #if os(macOS)
+        true
+        #else
+        // Regular-width iPad List already supplies the native selection
+        // material. Drawing another blue rounded rectangle causes a double
+        // highlight, while compact iPhone lists still benefit from this cue.
+        layout.horizontalSizeClass != .regular
+        #endif
     }
 
     /// 对齐 Android EhUrl.getFixedThumbUrl: 修复缩略图 CDN 域名不可达问题
-    /// 开启时将 ehgt.org / gt0-3.ehgt.org 替换为当前站点的缩略图前缀
     private var thumbURL: URL? {
-        guard var urlStr = gallery.thumb, !urlStr.isEmpty else { return nil }
-        if fixThumbUrl {
-            // 替换 ehgt.org 变体 (gt0.ehgt.org, gt1.ehgt.org ...)
-            let site = AppSettings.shared.gallerySite
-            let fixedPrefix = EhURL.thumbPrefix(for: site)
-            // 匹配 https://ehgt.org/ 或 https://gt[0-3].ehgt.org/
-            if let range = urlStr.range(of: "https://(?:gt\\d\\.)?ehgt\\.org/", options: .regularExpression) {
-                urlStr.replaceSubrange(range, with: fixedPrefix)
-            }
-        }
-        return URL(string: urlStr)
+        ThumbnailURLResolver.url(
+            for: gallery.thumb,
+            fixLegacy: fixThumbUrl,
+            site: AppSettings.shared.gallerySite
+        )
     }
 
     var body: some View {
-        EhGalleryRow(gallery: displayGallery, onTagTap: onTagTap,
-                     highlightedTags: highlightedTags)
-            .contentShape(Rectangle())
+        HStack(alignment: .top, spacing: 12) {
+            // 缩略图 (对齐 Android @id/thumb) - 使用响应式尺寸
+            #if os(macOS)
+            galleryCover
+                .scaleEffect(isCoverHovered ? 1.065 : 1)
+                .shadow(
+                    color: .black.opacity(isCoverHovered ? 0.28 : 0.08),
+                    radius: isCoverHovered ? 10 : 2,
+                    y: isCoverHovered ? 6 : 1
+                )
+                .zIndex(isCoverHovered ? 2 : 0)
+                .animation(.spring(response: 0.24, dampingFraction: 0.78), value: isCoverHovered)
+                .onHover { isCoverHovered = $0 }
+            #else
+            galleryCover
+            #endif
+
+            // 信息区 (对齐 Android RelativeLayout 右侧元素)
+            VStack(alignment: .leading, spacing: 0) {
+                // 标题 (对齐 Android @id/title: alignParentTop, toRightOf thumb)
+                Text(gallery.suitableTitle(preferJpn: showJpnTitle))
+                    .font(.subheadline)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.primary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    if let uploader = gallery.uploader, !uploader.isEmpty {
+                        Label(uploader, systemImage: "person")
+                            .lineLimit(1)
+                    }
+                    if !gallery.authorNames.isEmpty {
+                        Label(gallery.authorNames.joined(separator: "、"), systemImage: "paintbrush")
+                            .lineLimit(1)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+
+                Spacer(minLength: 4)
+
+                // 底部区域 — 评分 + 图标行 (对齐 Android rating + LinearLayout)
+                HStack {
+                    // 评分星星 (对齐 Android SimpleRatingView: above category)
+                    if showRating {
+                        SimpleRatingView(rating: gallery.rating)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    // 右侧图标 (对齐 Android LinearLayout: downloaded, favourited, simple_language, pages)
+                    HStack(spacing: 6) {
+                        if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                            Image(systemName: "bookmark.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .accessibilityLabel("已加入稍后再看")
+                        }
+                        if GalleryActionService.shared.isFavorited(gallery) {
+                            Image(systemName: "heart.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        }
+                        if let lang = gallery.simpleLanguage, !lang.isEmpty {
+                            Label(localizedLanguageName(lang), systemImage: "globe")
+                                .labelStyle(.titleAndIcon)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        if showPages {
+                            Text("\(gallery.pages)P")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                // 分类 + 发布时间 (对齐 Android category + posted)
+                HStack {
+                    // 分类标签 (对齐 Android @id/category: alignBottom thumb)
+                    Text(gallery.category.name)
+                        .font(.caption2.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(gallery.category.color)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+
+                    Spacer(minLength: 4)
+
+                    // 发布时间 (对齐 Android @id/posted: alignBottom thumb, alignParentRight)
+                    if let posted = gallery.posted, !posted.isEmpty {
+                        Text(GalleryTimestamp.localizedString(fromServerText: posted))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(.horizontal, usesTabletContentMargins ? 28 : 16)
+        #if os(macOS)
+        // Reserve enough row canvas for the scaled cover and its lower shadow.
+        // List rows clip drawing outside their layout bounds even when their
+        // separators are hidden.
+        .padding(.vertical, 14)
+        #else
+        .padding(.vertical, 8)
+        #endif
+        .background {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(
+                    isSelected && drawsCustomSelectionHighlight
+                        ? Color.accentColor.opacity(0.16)
+                        : Color.clear
+                )
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+        }
+        .contentShape(Rectangle())
+        #if os(iOS)
+        .contentShape(
+            .contextMenuPreview,
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
+        #endif
         .contextMenu {
+            Button {
+                if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                    Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                } else {
+                    Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                }
+            } label: {
+                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
+                Label(
+                    AppLocalization.localized(isWatchLater ? "从稍后再看移除" : "稍后再看"),
+                    systemImage: isWatchLater ? "bookmark.slash" : "bookmark"
+                )
+            }
+
             // 下载
             Button {
-                onRequestDownload(gallery)
+                Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
             } label: {
                 Label("下载", systemImage: "arrow.down.circle")
             }
 
-            // 收藏 / 取消收藏
+            // 收藏
             Button {
-                onRequestFavorite(gallery)
+                performFavoriteToggle(gallery)
             } label: {
-                let favorited = GalleryStatusCache.shared.isFavorited(gallery)
-                Label(favorited ? "取消收藏" : "收藏",
-                      systemImage: favorited ? "heart.slash" : "heart")
+                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
             }
 
             Divider()
@@ -1460,6 +1721,576 @@ struct GalleryRow: View {
             }
             #endif
         }
+        .sheet(item: $favoritePickerGallery) { selectedGallery in
+            listFavoritePicker(for: selectedGallery)
+        }
+    }
+
+    private func performFavoriteToggle(_ selectedGallery: GalleryInfo) {
+        let service = GalleryActionService.shared
+        if !service.isFavorited(selectedGallery), AppSettings.shared.defaultFavSlot == -2 {
+            favoritePickerGallery = selectedGallery
+        } else {
+            Task { await service.toggleFavorite(selectedGallery) }
+        }
+    }
+
+    private func listFavoritePicker(for selectedGallery: GalleryInfo) -> some View {
+        FavoriteSlotPicker(
+            onSelect: { slot in
+                favoritePickerGallery = nil
+                addFavorite(selectedGallery, to: slot)
+            },
+            onCancel: { favoritePickerGallery = nil }
+        )
+        #if os(iOS)
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
+        #endif
+    }
+
+    private func addFavorite(_ selectedGallery: GalleryInfo, to slot: Int) {
+        Task {
+            do {
+                if slot == -1 {
+                    try await GalleryActionService.shared.addLocalFavorite(gallery: selectedGallery)
+                } else {
+                    try await GalleryActionService.shared.addFavorite(
+                        gid: selectedGallery.gid,
+                        token: selectedGallery.token,
+                        slot: slot
+                    )
+                }
+                Haptics.success()
+            } catch {
+                ErrorHandler.shared.handle(error, context: "RowFavorite")
+            }
+        }
+    }
+
+    private var galleryCover: some View {
+        CachedAsyncImage(url: thumbURL) { image in
+            image
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+        } placeholder: {
+            Color(.secondarySystemBackground)
+        }
+        .frame(width: layout.galleryThumbnailSize.width, height: layout.galleryThumbnailSize.height)
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+
+    private func localizedLanguageName(_ code: String) -> String {
+        switch code.uppercased() {
+        case "ZH": return AppLocalization.localized("中文")
+        case "EN": return AppLocalization.localized("英语")
+        case "JA": return AppLocalization.localized("日语")
+        case "KO": return AppLocalization.localized("韩语")
+        case "FR": return AppLocalization.localized("法语")
+        case "DE": return AppLocalization.localized("德语")
+        case "ES": return AppLocalization.localized("西班牙语")
+        case "IT": return AppLocalization.localized("意大利语")
+        case "RU": return AppLocalization.localized("俄语")
+        default: return code.uppercased()
+        }
+    }
+}
+
+// MARK: - Adaptive Waterfall Feed
+
+private struct GalleryWaterfallLayoutKey: Hashable, Sendable {
+    let columnCount: Int
+    let itemCount: Int
+    let revision: Int
+    let firstGID: Int64?
+    let middleGID: Int64?
+    let lastGID: Int64?
+}
+
+private enum GalleryWaterfallLayoutBuilder {
+    nonisolated static func columns(
+        for galleries: [GalleryInfo],
+        columnCount: Int
+    ) -> [[GalleryInfo]] {
+        guard columnCount > 0 else { return [] }
+        var result = Array(repeating: [GalleryInfo](), count: columnCount)
+        var estimatedHeights = Array(repeating: CGFloat.zero, count: columnCount)
+
+        for gallery in galleries {
+            let targetColumn = estimatedHeights.indices.min {
+                estimatedHeights[$0] < estimatedHeights[$1]
+            } ?? 0
+            result[targetColumn].append(gallery)
+            // All columns have the same width. The metadata row contributes a
+            // small fixed normalized height below the image.
+            estimatedHeights[targetColumn] += (1 / gallery.waterfallAspectRatio) + 0.18
+        }
+        return result
+    }
+}
+
+/// 使用 SwiftUI 原生 ScrollView + LazyVStack 构成的自适应瀑布流。
+/// 项目按照缩略图宽高比依次放入当前最短列。
+struct GalleryWaterfallView<ItemContent: View>: View {
+    let galleries: [GalleryInfo]
+    let topInset: CGFloat
+    @Binding var scrollPosition: Int64?
+    let showsContinueReading: Bool
+    let isLoading: Bool
+    let hasMore: Bool
+    var layoutRevision: Int = 0
+    let onRefresh: () async -> Void
+    let onLoadMore: () async -> Void
+    @ViewBuilder let itemContent: (GalleryInfo) -> ItemContent
+
+    @Environment(\.responsiveLayout) private var layout
+    @State private var preparedLayoutKey: GalleryWaterfallLayoutKey?
+    @State private var preparedColumns: [[GalleryInfo]] = []
+
+    private let spacing: CGFloat = 12
+    private let minimumColumnWidth: CGFloat = 164
+    private let synchronousLayoutLimit = 128
+
+    var body: some View {
+        GeometryReader { proxy in
+            let horizontalInset: CGFloat = layout.horizontalSizeClass == .regular
+                && (layout.height > layout.width || AppSettings.shared.wideScreenListMode == 1)
+                ? 28 : 10
+            // Never inflate the content width to the preferred card width.
+            // Doing so made a one-column waterfall wider than a narrow window.
+            let availableWidth = max(proxy.size.width - horizontalInset * 2, 1)
+            let columnCount = max(
+                1,
+                Int((availableWidth + spacing) / (minimumColumnWidth + spacing))
+            )
+            let columnWidth = max(
+                1,
+                (availableWidth - CGFloat(columnCount - 1) * spacing) / CGFloat(columnCount)
+            )
+            let layoutKey = GalleryWaterfallLayoutKey(
+                columnCount: columnCount,
+                itemCount: galleries.count,
+                revision: layoutRevision,
+                firstGID: galleries.first?.gid,
+                middleGID: galleries.isEmpty ? nil : galleries[galleries.count / 2].gid,
+                lastGID: galleries.last?.gid
+            )
+            let columns = galleries.count <= synchronousLayoutLimit
+                ? GalleryWaterfallLayoutBuilder.columns(
+                    for: galleries,
+                    columnCount: columnCount
+                )
+                // While a new page is being distributed, keep the preceding
+                // complete layout visible instead of flashing an empty feed.
+                : (preparedLayoutKey?.columnCount == columnCount ? preparedColumns : [])
+
+            ScrollView {
+                LazyVStack(spacing: 14) {
+                    if topInset > 0 {
+                        Color.clear
+                            .frame(height: topInset)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+
+                    if showsContinueReading {
+                        ContinueReadingCard()
+                    }
+
+                    if isLoading && galleries.isEmpty {
+                        VStack(spacing: 8) {
+                            ProgressView()
+                            Text("正在加载…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                    }
+
+                    if galleries.count > synchronousLayoutLimit && columns.isEmpty {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 40)
+                    }
+
+                    if !columns.isEmpty {
+                        HStack(alignment: .top, spacing: spacing) {
+                            ForEach(columns.indices, id: \.self) { columnIndex in
+                                VStack(spacing: spacing) {
+                                    ForEach(columns[columnIndex], id: \.gid) { gallery in
+                                        itemContent(gallery)
+                                            .frame(width: columnWidth)
+                                            .id(gallery.gid)
+                                    }
+                                }
+                                .scrollTargetLayout()
+                                .frame(width: columnWidth, alignment: .top)
+                            }
+                        }
+                        .frame(width: availableWidth, alignment: .leading)
+                        .transaction { transaction in
+                            if layoutRevision != 0 {
+                                transaction.animation = nil
+                                transaction.disablesAnimations = true
+                            }
+                        }
+                    }
+
+                    if hasMore {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .task { await onLoadMore() }
+                    }
+                }
+                .padding(.horizontal, horizontalInset)
+                .padding(.bottom, 16)
+            }
+            .scrollPosition(id: $scrollPosition)
+            #if os(macOS)
+            .scrollEdgeEffectStyle(.soft, for: .top)
+            #else
+            .scrollDismissesKeyboard(.immediately)
+            #endif
+            .refreshable { await onRefresh() }
+            .task(id: layoutKey) {
+                guard galleries.count > synchronousLayoutLimit else {
+                    preparedLayoutKey = nil
+                    preparedColumns = []
+                    return
+                }
+
+                let source = galleries
+                let computed = await Task.detached(priority: .userInitiated) {
+                    GalleryWaterfallLayoutBuilder.columns(
+                        for: source,
+                        columnCount: columnCount
+                    )
+                }.value
+                guard !Task.isCancelled else { return }
+
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    preparedColumns = computed
+                    preparedLayoutKey = layoutKey
+                }
+            }
+        }
+        #if os(macOS)
+        .background(Color(nsColor: .windowBackgroundColor))
+        #endif
+    }
+
+}
+
+struct GalleryWaterfallCard: View {
+    let gallery: GalleryInfo
+    let showJpnTitle: Bool
+    let fixThumbUrl: Bool
+    let showRating: Bool
+    let showPages: Bool
+    let isSelected: Bool
+
+    @State private var isHovered = false
+    @State private var favoritePickerGallery: GalleryInfo?
+
+    private var thumbURL: URL? {
+        ThumbnailURLResolver.url(
+            for: gallery.thumb,
+            fixLegacy: fixThumbUrl,
+            site: AppSettings.shared.gallerySite
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            CachedAsyncImage(url: thumbURL, showProgress: false) { image in
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } placeholder: {
+                Color(.secondarySystemBackground)
+                    .overlay {
+                        Image(systemName: "photo")
+                            .foregroundStyle(.tertiary)
+                    }
+            }
+            .aspectRatio(gallery.waterfallAspectRatio, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(gallery.category.color)
+                    .frame(width: 8, height: 8)
+                    .accessibilityLabel("类型：\(gallery.category.name)")
+                    .help(gallery.category.name)
+
+                if let languageEmoji {
+                    Text(languageEmoji)
+                        .font(.caption2)
+                        .accessibilityLabel("语言：\(gallery.simpleLanguage ?? "")")
+                }
+
+                if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                    Image(systemName: "bookmark.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("已加入稍后再看")
+                }
+
+                HoverMarqueeTitle(
+                    title: gallery.suitableTitle(preferJpn: showJpnTitle),
+                    isHovering: isHovered
+                )
+                .frame(maxWidth: .infinity)
+
+                if showPages {
+                    Text("\(gallery.pages)P")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                if showRating {
+                    Text(gallery.rating.formatted(.number.precision(.fractionLength(1))))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("评分 \(gallery.rating.formatted(.number.precision(.fractionLength(1))))")
+                }
+            }
+            .padding(.horizontal, 3)
+            .padding(.bottom, 2)
+        }
+        .padding(5)
+        .background {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+        }
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .stroke(Color.accentColor.opacity(0.28), lineWidth: 1)
+            }
+        }
+        #if os(macOS)
+        .scaleEffect(isHovered ? 1.018 : 1)
+        .offset(y: isHovered ? -3 : 0)
+        .shadow(
+            color: .black.opacity(isHovered ? 0.2 : 0.05),
+            radius: isHovered ? 10 : 2,
+            y: isHovered ? 6 : 1
+        )
+        .animation(.snappy(duration: 0.2), value: isHovered)
+        .onHover { isHovered = $0 }
+        #else
+        // iPad 指针悬浮时使用与 macOS 相同的标题跑马灯；触控长按仍交给
+        // 系统 context menu，避免自定义长按手势抢走列表点击/滚动。
+        .hoverEffect(.lift)
+        .onHover { isHovered = $0 }
+        #endif
+        .contentShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .help(gallery.suitableTitle(preferJpn: showJpnTitle))
+        #if os(iOS)
+        .contentShape(
+            .contextMenuPreview,
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
+        #endif
+        .contextMenu {
+            Button {
+                if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                    Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                } else {
+                    Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                }
+            } label: {
+                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
+                Label(
+                    AppLocalization.localized(isWatchLater ? "从稍后再看移除" : "稍后再看"),
+                    systemImage: isWatchLater ? "bookmark.slash" : "bookmark"
+                )
+            }
+
+            Button {
+                Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
+            } label: {
+                Label("下载", systemImage: "arrow.down.circle")
+            }
+
+            Button {
+                performFavoriteToggle(gallery)
+            } label: {
+                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
+            }
+
+            Divider()
+
+            Button {
+                GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+            } label: {
+                Label("复制链接", systemImage: "doc.on.doc")
+            }
+        }
+        .sheet(item: $favoritePickerGallery) { selectedGallery in
+            listFavoritePicker(for: selectedGallery)
+        }
+    }
+
+    private func performFavoriteToggle(_ selectedGallery: GalleryInfo) {
+        let service = GalleryActionService.shared
+        if !service.isFavorited(selectedGallery), AppSettings.shared.defaultFavSlot == -2 {
+            favoritePickerGallery = selectedGallery
+        } else {
+            Task { await service.toggleFavorite(selectedGallery) }
+        }
+    }
+
+    private func listFavoritePicker(for selectedGallery: GalleryInfo) -> some View {
+        FavoriteSlotPicker(
+            onSelect: { slot in
+                favoritePickerGallery = nil
+                addFavorite(selectedGallery, to: slot)
+            },
+            onCancel: { favoritePickerGallery = nil }
+        )
+        #if os(iOS)
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
+        #endif
+    }
+
+    private func addFavorite(_ selectedGallery: GalleryInfo, to slot: Int) {
+        Task {
+            do {
+                if slot == -1 {
+                    try await GalleryActionService.shared.addLocalFavorite(gallery: selectedGallery)
+                } else {
+                    try await GalleryActionService.shared.addFavorite(
+                        gid: selectedGallery.gid,
+                        token: selectedGallery.token,
+                        slot: slot
+                    )
+                }
+                Haptics.success()
+            } catch {
+                ErrorHandler.shared.handle(error, context: "WaterfallFavorite")
+            }
+        }
+    }
+
+    private var languageEmoji: String? {
+        switch gallery.simpleLanguage?.uppercased() {
+        case "ZH": return "🇨🇳"
+        case "EN": return "🇬🇧"
+        case "JA": return "🇯🇵"
+        case "KO": return "🇰🇷"
+        case "FR": return "🇫🇷"
+        case "DE": return "🇩🇪"
+        case "ES": return "🇪🇸"
+        case "IT": return "🇮🇹"
+        case "RU": return "🇷🇺"
+        case "PT": return "🇵🇹"
+        case "PL": return "🇵🇱"
+        case "NL": return "🇳🇱"
+        case "HU": return "🇭🇺"
+        case "VI": return "🇻🇳"
+        case "CS": return "🇨🇿"
+        case "ID": return "🇮🇩"
+        case "TH": return "🇹🇭"
+        case "AR": return "🇸🇦"
+        case "TR": return "🇹🇷"
+        default: return nil
+        }
+    }
+}
+
+private struct HoverMarqueeTitle: View {
+    let title: String
+    let isHovering: Bool
+
+    @State private var textWidth: CGFloat = 0
+    @State private var containerWidth: CGFloat = 0
+    @State private var offset: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { proxy in
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .onGeometryChange(for: CGFloat.self) { textProxy in
+                    textProxy.size.width
+                } action: { width in
+                    textWidth = width
+                    updateAnimation(containerWidth: proxy.size.width)
+                }
+                .offset(x: offset)
+                .frame(height: proxy.size.height, alignment: .leading)
+                .mask(alignment: .leading) {
+                    titleMask(isOverflowing: textWidth > proxy.size.width + 1)
+                        .frame(width: proxy.size.width)
+                }
+                .onAppear {
+                    containerWidth = proxy.size.width
+                    updateAnimation()
+                }
+                .onChange(of: proxy.size.width) { _, width in
+                    containerWidth = width
+                    updateAnimation()
+                }
+        }
+            .frame(minWidth: 0, maxWidth: .infinity)
+            .frame(height: 16)
+            .clipped()
+            .accessibilityLabel(title)
+            .onChange(of: isHovering) { _, _ in updateAnimation() }
+            .onChange(of: title) { _, _ in
+                offset = 0
+                updateAnimation()
+            }
+    }
+
+    @ViewBuilder
+    private func titleMask(isOverflowing: Bool) -> some View {
+        if isOverflowing && !isHovering {
+            LinearGradient(
+                stops: [
+                    .init(color: .black, location: 0),
+                    .init(color: .black, location: 0.78),
+                    .init(color: .clear, location: 1)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        } else {
+            Rectangle().fill(.black)
+        }
+    }
+
+    private func updateAnimation(containerWidth: CGFloat) {
+        self.containerWidth = containerWidth
+        updateAnimation()
+    }
+
+    private func updateAnimation() {
+        let distance = max(textWidth - containerWidth, 0)
+        guard isHovering, distance > 1 else {
+            withAnimation(.snappy(duration: 0.18)) { offset = 0 }
+            return
+        }
+        withAnimation(.linear(duration: max(1.2, distance / 28)).delay(0.28)) {
+            offset = -distance
+        }
+    }
+}
+
+private extension GalleryInfo {
+    nonisolated var waterfallAspectRatio: CGFloat {
+        guard thumbWidth > 0, thumbHeight > 0 else { return 0.72 }
+        return CGFloat(thumbWidth) / CGFloat(thumbHeight)
     }
 }
 
@@ -1468,38 +2299,26 @@ struct GalleryRow: View {
 @MainActor
 @Observable
 class GalleryListViewModel {
-    /// 列表内容。**写进来的东西会先过一遍过滤器。**
-    ///
-    /// 过滤在 didSet 里做，而不是在那 8 处赋值点上分别调一次：
-    /// 分散写就意味着以后新增一条取数路径必然会漏掉，而「漏掉」的表现
-    /// 是屏蔽悄悄失效——用户根本看不出来是哪一页没生效。
-    var galleries: [GalleryInfo] = [] {
-        didSet {
-            // 里面还会再写一次 galleries，靠这个标记挡住重入
-            guard !isApplyingFilters else { return }
-            isApplyingFilters = true
-            defer { isApplyingFilters = false }
-            let hidden = GalleryFilterEngine.shared.apply(to: &galleries)
-            filteredOutCount = hidden
-        }
-    }
-
-    @ObservationIgnored private var isApplyingFilters = false
-    /// 最近一次加载被过滤器挡掉的条数，用来在列表底部说明「少了几本」
-    var filteredOutCount = 0
+    var galleries: [GalleryInfo] = []
     var isLoading = false
     var errorMessage: String?
     var searchText = ""
-    var hasMore = false
-    var totalPages = 0 // 总页数 (对齐 Android mHelper.mPages)
+    /// Native scroll views update this anchor as the visible result changes. Keeping it in
+    /// the persistent Search model restores the user's position after switching sections.
+    var scrollPosition: Int64?
+    private var pagination = GalleryPaginationState()
+    var hasMore: Bool { pagination.hasMore }
+    var totalPages: Int { pagination.totalPages }
     var showGoToDialog = false // 跳页对话框 (页码模式，仅 TopList 使用)
     var goToPageInput: String = "" // 跳页输入
     var showJumpDialog = false // 跳页对话框 (日期模式，对齐 Android GoToDialog)
     var jumpDate = Date() // 跳页日期
 
-    /// 收藏夹分页导航链接 (searchnav 模式: prev/next)
-    var prevHref: String?
-    var nextHref: String?
+    /// searchnav 模式下的导航链接，由统一分页状态持有。
+    var prevHref: String? { pagination.prevHref }
+    var nextHref: String? { pagination.nextHref }
+    var lastHref: String? { pagination.lastHref }
+    var nextPage: Int? { pagination.nextPage }
     /// 是否为收藏模式 (使用 seek 跳页而非整数页码)
     var isFavoritesMode: Bool {
         if case .favorites = currentMode { return true }
@@ -1513,20 +2332,26 @@ class GalleryListViewModel {
     var searchHistory: [String] = []
 
     private static let searchHistoryKey = "ehSearchHistory"
-    private static let maxHistoryCount = 50
+    /// Only five rows are shown by QuickSearchView, but retaining a larger
+    /// history lets older entries move into view as the visible ones are
+    /// deleted. The bounded store prevents UserDefaults from growing forever.
+    private static let maxStoredHistoryCount = 50
 
     func loadSearchHistory() {
-        searchHistory = UserDefaults.standard.stringArray(forKey: Self.searchHistoryKey) ?? []
+        let stored = UserDefaults.standard.stringArray(forKey: Self.searchHistoryKey) ?? []
+        searchHistory = Array(stored.prefix(Self.maxStoredHistoryCount))
+        if stored.count > Self.maxStoredHistoryCount {
+            UserDefaults.standard.set(searchHistory, forKey: Self.searchHistoryKey)
+        }
     }
 
-    func addSearchToHistory(_ rawText: String) {
-        let text = ListUrlBuilder.sanitizeKeyword(rawText)
-        guard !text.isEmpty else { return }
+    func addSearchToHistory(_ text: String) {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         var history = UserDefaults.standard.stringArray(forKey: Self.searchHistoryKey) ?? []
         history.removeAll { $0 == text }
         history.insert(text, at: 0)
-        if history.count > Self.maxHistoryCount {
-            history = Array(history.prefix(Self.maxHistoryCount))
+        if history.count > Self.maxStoredHistoryCount {
+            history = Array(history.prefix(Self.maxStoredHistoryCount))
         }
         UserDefaults.standard.set(history, forKey: Self.searchHistoryKey)
         searchHistory = history
@@ -1545,54 +2370,47 @@ class GalleryListViewModel {
     }
 
     // MARK: - 搜索建议 (对齐 Android SearchBar.updateSuggestions)
-    struct TagSuggestionItem: Identifiable {
-        let chinese: String
-        let english: String
-        var id: String { english }
-    }
-    var suggestions: [TagSuggestionItem] = []
+    var suggestions: [(chinese: String, english: String)] = []
     private var suggestionTask: Task<Void, Never>?
 
     /// 更新搜索建议 (对齐 Android SearchBar.updateSuggestions)
-    /// 按输入框里正在打的文字更新建议。
-    ///
-    /// 参数取自输入框而非 `searchText`：后者保存的是「已提交的完整查询」，
-    /// 包含已经变成 token 的标签，拿它算建议会一直命中已选过的标签。
-    func updateSuggestions(for text: String) {
+    func updateSuggestions() {
         suggestionTask?.cancel()
         suggestionTask = Task { @MainActor in
             // 防抖 200ms
             try? await Task.sleep(nanoseconds: 200_000_000)
             guard !Task.isCancelled else { return }
 
-            guard let extracted = EhTagDatabase.extractLastKeyword(from: text) else {
+            guard let extracted = EhTagDatabase.extractLastKeyword(from: searchText) else {
                 suggestions = []
                 return
             }
-            let results = EhTagDatabase.shared.suggest(extracted.keyword)
-            if !Task.isCancelled {
-                suggestions = results.map { TagSuggestionItem(chinese: $0.chinese, english: $0.english) }
-            }
+            let keyword = extracted.keyword
+            // 中文/子串候选可能线性扫描整个标签库。放到 utility 任务，避免
+            // 它与键盘、搜索面板或页面切换动画争用主线程。
+            let results = await Task.detached(priority: .utility) {
+                EhTagDatabase.shared.suggest(keyword, limit: 8)
+            }.value
+            guard !Task.isCancelled else { return }
+            suggestions = results
         }
     }
 
     /// 应用搜索建议到搜索文本
-    /// 把标签选择器选中的关键词接到搜索框末尾
-    func appendSearchKeyword(_ keyword: String) {
-        let trimmed = searchText.trimmingCharacters(in: .whitespaces)
-        // 已经有这个标签就不重复追加
-        guard !trimmed.contains(keyword) else { return }
-        searchText = trimmed.isEmpty ? keyword : trimmed + " " + keyword
-    }
-
     func applySuggestion(_ suggestion: String) {
         searchText = EhTagDatabase.applySuggestion(to: searchText, suggestion: suggestion)
         suggestions = []
     }
 
-    private var currentPage = 0
     private var currentCacheKey: String?
     private var currentMode: GalleryListView.ListMode?
+    /// 与 EhPanda cancellable Effect 相同的语义：新的导航/搜索请求会取消旧请求，
+    /// 防止较慢的旧响应覆盖用户刚选择的新页面。
+    private var requestTask: Task<Void, Never>?
+    /// 收藏列表使用服务器生成的游标而非稳定页码。缓存已经走过的游标，
+    /// 让重复跳页不必每次都从第一页重新请求，同时不触发界面观察更新。
+    @ObservationIgnored
+    private var favoriteCursorURLs: [String: [Int: String]] = [:]
     /// 高级搜索参数 (对齐 Android AdvanceSearchTable 状态持久化)
     private var currentAdvanceSearch: Int = -1
     private var currentMinRating: Int = -1
@@ -1600,67 +2418,196 @@ class GalleryListViewModel {
     private var currentPageTo: Int = -1
     private var currentCategory: Int = 0
     private var currentSearchMode: SearchMode = .normal
+    @ObservationIgnored
+    private var persistsDedicatedSearchSession = false
+    @ObservationIgnored
+    private var didRestoreDedicatedSearchSession = false
+    @ObservationIgnored
+    private var searchPersistenceTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var searchRestorationTask: Task<Void, Never>?
+    /// In-memory navigation history for searches opened from a result's tag,
+    /// uploader, or another metadata link. Keeping complete snapshots (including
+    /// opaque EH cursors and the visible anchor) makes Back restore the prior
+    /// result set immediately instead of issuing a new request.
+    private var dedicatedSearchBackStack: [DedicatedSearchSession] = []
+    /// Changes only when a previous result layer is restored. Views use this
+    /// generation to re-apply the saved visible anchor after lazy layout.
+    var dedicatedSearchRestorationGeneration = 0
+    private(set) var dedicatedSearchRestorationAnchor: Int64?
 
-    /// 云收藏夹拉取成功时记下时刻，供收藏页显示「云端同步 · N 分钟前」。
-    ///
-    /// 只记 slot >= 0 的云收藏夹：本地收藏与「全部」不经网络同步，
-    /// 给它们盖一个同步时间是误导。
-    func recordFavoriteSyncIfNeeded(mode: GalleryListView.ListMode) {
-        guard case .favorites(let slot) = mode, slot >= 0 else { return }
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "fav_last_sync")
+    private struct DedicatedSearchSession: Codable {
+        let site: Int
+        let search: QuickSearchRecord
+        let galleries: [GalleryInfo]
+        let scrollPosition: Int64?
+        let pagination: GalleryPaginationState.Snapshot
+        let savedAt: Date
+    }
+
+    private static let dedicatedSearchSessionKey = "ehDedicatedSearchSession.v1"
+
+    var canRestorePreviousDedicatedSearch: Bool {
+        !dedicatedSearchBackStack.isEmpty
+    }
+
+    /// Save the currently visible Search page before following a metadata link.
+    /// Consecutive requests for the same query do not create duplicate levels.
+    func pushDedicatedSearchStateIfNeeded(replacingWith rawQuery: String) {
+        let currentKeyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextKeyword = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !currentKeyword.isEmpty,
+              currentKeyword.localizedCaseInsensitiveCompare(nextKeyword) != .orderedSame
+        else { return }
+
+        dedicatedSearchBackStack.append(makeDedicatedSearchSession())
+        if dedicatedSearchBackStack.count > 20 {
+            dedicatedSearchBackStack.removeFirst(dedicatedSearchBackStack.count - 20)
+        }
+    }
+
+    func discardDedicatedSearchNavigationHistory() {
+        dedicatedSearchBackStack.removeAll(keepingCapacity: true)
+        dedicatedSearchRestorationAnchor = nil
+    }
+
+    @discardableResult
+    func restorePreviousDedicatedSearch(into advancedState: AdvancedSearchState) -> Bool {
+        guard let session = dedicatedSearchBackStack.popLast() else { return false }
+        requestTask?.cancel()
+        suggestionTask?.cancel()
+        searchRestorationTask?.cancel()
+        applyDedicatedSearchSession(session, into: advancedState)
+        dedicatedSearchRestorationAnchor = session.scrollPosition
+        dedicatedSearchRestorationGeneration &+= 1
+        let restorationGeneration = dedicatedSearchRestorationGeneration
+        let restorationAnchor = session.scrollPosition
+        // Re-applying the anchor on the next layout pass is sufficient; forcing
+        // a new identity on the entire list decoded all visible thumbnails and
+        // was the main source of stutter during Back.
+        scrollPosition = nil
+        searchRestorationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  !Task.isCancelled,
+                  self.dedicatedSearchRestorationGeneration == restorationGeneration
+            else { return }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                self.scrollPosition = restorationAnchor
+            }
+        }
+        isLoading = false
+        errorMessage = nil
+        scheduleDedicatedSearchPersistence()
+        return true
+    }
+
+    /// Restore the persistent Search tab once per scene-owned model. Results and
+    /// opaque EH cursors are restored together, so returning to Search does not
+    /// silently restart from page one or lose bidirectional pagination.
+    func restoreDedicatedSearchSession(into advancedState: AdvancedSearchState) {
+        persistsDedicatedSearchSession = true
+        guard !didRestoreDedicatedSearchSession else { return }
+        didRestoreDedicatedSearchSession = true
+        guard searchText.isEmpty, galleries.isEmpty,
+              let data = UserDefaults.standard.data(forKey: Self.dedicatedSearchSessionKey),
+              let session = try? JSONDecoder().decode(DedicatedSearchSession.self, from: data),
+              session.site == AppSettings.shared.gallerySite.rawValue,
+              let keyword = session.search.keyword,
+              !keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+
+        applyDedicatedSearchSession(session, into: advancedState)
+    }
+
+    func scheduleDedicatedSearchPersistence() {
+        guard persistsDedicatedSearchSession else { return }
+        searchPersistenceTask?.cancel()
+        searchPersistenceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            self?.persistDedicatedSearchSession()
+        }
+    }
+
+    private func persistDedicatedSearchSession() {
+        guard persistsDedicatedSearchSession else { return }
+        let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !keyword.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: Self.dedicatedSearchSessionKey)
+            return
+        }
+        let session = makeDedicatedSearchSession()
+        guard let data = try? JSONEncoder().encode(session) else { return }
+        UserDefaults.standard.set(data, forKey: Self.dedicatedSearchSessionKey)
+    }
+
+    private func makeDedicatedSearchSession() -> DedicatedSearchSession {
+        DedicatedSearchSession(
+            site: AppSettings.shared.gallerySite.rawValue,
+            search: currentQuickSearchRecord(),
+            galleries: galleries,
+            scrollPosition: scrollPosition,
+            pagination: pagination.snapshot,
+            savedAt: Date()
+        )
+    }
+
+    private func applyDedicatedSearchSession(
+        _ session: DedicatedSearchSession,
+        into advancedState: AdvancedSearchState
+    ) {
+        guard let keyword = session.search.keyword else { return }
+        searchText = keyword
+        galleries = session.galleries
+        scrollPosition = session.scrollPosition
+        currentMode = .search(keyword: keyword)
+        advancedState.copyValues(from: session.search)
+        syncAdvancedSettings(advancedState)
+        pagination.restore(session.pagination, galleries: galleries)
+        GalleryCache.shared.putMetadata(galleries)
     }
 
     func loadGalleries(mode: GalleryListView.ListMode) {
         guard !isLoading else {
-            print("[EhVM] loadGalleries: SKIPPED (already loading)")
             return
         }
-        print("[EhVM] loadGalleries: START mode=\(mode)")
 
         currentMode = mode
-
-        // ★ 换模式/换筛选条件时必须丢弃上一次的分页游标，
-        //   否则"加载更多"会用别的列表的 nextHref 继续翻页 (issue #8 问题一)
-        prevHref = nil
-        nextHref = nil
-        currentPage = 0
+        if case .home = mode {
+            currentCategory = AppSettings.shared.defaultCategories
+        } else if case .subscription = mode {
+            currentCategory = AppSettings.shared.defaultCategories
+        }
 
         // 先查缓存 (空结果不视为有效缓存 — 可能是之前网络失败)
-        let cacheKey = self.cacheKey(for: mode, page: 0)
+        let cacheKey = Self.cacheKey(for: mode, page: 0)
         if let cached = GalleryCache.shared.getListResult(forKey: cacheKey),
-           !cached.galleries.isEmpty {
-            print("[EhVM] loadGalleries: CACHE HIT \(cached.galleries.count) galleries")
-            galleries = cached.galleries
-            hasMore = cached.hasMore
-            totalPages = cached.totalPages ?? 0
-            // 游标随缓存一起恢复，保证继续翻页接的是这一页的下一页
-            prevHref = cached.prevHref
-            nextHref = cached.nextHref
+           !cached.galleries.isEmpty,
+           cached.galleries.allSatisfy({ !GalleryCache.shared.needsMetadataHydration($0) }) {
+            galleries = GalleryCache.shared.mergeCachedMetadata(into: cached.galleries)
+            pagination.restore(
+                nextPage: cached.nextPage,
+                nextHref: cached.nextHref,
+                firstHref: cached.firstHref,
+                lastHref: cached.lastHref,
+                totalPages: cached.totalPages ?? 0,
+                hasMore: cached.hasMore
+            )
+            _ = pagination.merge(cached.galleries, replacing: true)
             currentCacheKey = cacheKey
             return
         }
 
         isLoading = true
         errorMessage = nil
+        pagination.reset()
         currentCacheKey = cacheKey
 
-        Task {
-            // 超时保护: 如果网络请求超过 20 秒仍未完成，显示错误让用户可以重试
-            let fetchTask = Task {
-                await fetchPage(mode: mode, page: 0)
-            }
-            let timeoutTask = Task {
-                try? await Task.sleep(for: .seconds(20))
-                // 仅在仍处于加载状态且画廊为空时触发超时
-                if self.isLoading && self.galleries.isEmpty {
-                    fetchTask.cancel()
-                    self.isLoading = false
-                    self.errorMessage = "网络请求超时，请检查网络连接或 VPN 设置后重试"
-                    print("[EhVM] loadGalleries: TIMEOUT after 20s")
-                }
-            }
-            await fetchTask.value
-            timeoutTask.cancel()
+        startReplacingRequest {
+            await self.fetchFirstPageWithTimeout(mode: mode)
         }
     }
 
@@ -1685,51 +2632,56 @@ class GalleryListViewModel {
         //   从而取消 .refreshable 的结构化并发任务
         currentMode = mode
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
-        let cacheKey = self.cacheKey(for: mode, page: 0)
+        pagination.reset()
+        let cacheKey = Self.cacheKey(for: mode, page: 0)
         currentCacheKey = cacheKey
         await fetchPage(mode: mode, page: 0)
     }
 
     func search() {
-        // 粘贴进来的搜索词常带 \r\n，会把 `artist:foo` 之类的语法拆断
-        // (对齐上游 2026-03-02 / 03-14「搜索时过滤文本中的换行符」)
-        searchText = ListUrlBuilder.sanitizeKeyword(searchText)
         guard !searchText.isEmpty else { return }
+        scrollPosition = nil
         addSearchToHistory(searchText)
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
+        pagination.reset()
         // 清除高级搜索参数
         currentAdvanceSearch = -1
         currentMinRating = -1
         currentPageFrom = -1
         currentPageTo = -1
-        currentCategory = 0
+        currentCategory = AppSettings.shared.defaultCategories
         currentSearchMode = .normal
 
-        Task {
-            await fetchPage(mode: .search(keyword: searchText), page: 0)
+        let keyword = searchText
+        startReplacingRequest {
+            await self.fetchPage(mode: .search(keyword: keyword), page: 0)
         }
+        scheduleDedicatedSearchPersistence()
+    }
+
+    func clearDedicatedSearch() {
+        suggestionTask?.cancel()
+        requestTask?.cancel()
+        searchRestorationTask?.cancel()
+        searchText = ""
+        galleries = []
+        suggestions = []
+        isLoading = false
+        errorMessage = nil
+        scrollPosition = nil
+        pagination.reset()
+        currentCacheKey = nil
+        currentMode = .search(keyword: "")
+        dedicatedSearchBackStack.removeAll(keepingCapacity: true)
+        dedicatedSearchRestorationAnchor = nil
+        UserDefaults.standard.removeObject(forKey: Self.dedicatedSearchSessionKey)
     }
 
     /// 带高级搜索参数的搜索 (对齐 Android AdvanceSearchTable → ListUrlBuilder)
-    /// 用给定的查询串搜索。
-    ///
-    /// token 与自由文本在提交时才合并成一串传进来，`searchText` 只保存用户
-    /// 正在打的那部分——这样搜索框里不会出现「token + 同一内容的文字」的重复。
-    func performSearch(query: String, advanced: AdvancedSearchState) {
-        searchText = query
-        searchWithAdvanced(advanced)
-    }
-
     func searchWithAdvanced(_ state: AdvancedSearchState) {
-        searchText = ListUrlBuilder.sanitizeKeyword(searchText)
+        scrollPosition = nil
         if !searchText.isEmpty { addSearchToHistory(searchText) }
         currentAdvanceSearch = state.advanceSearchValue
         currentMinRating = state.minRatingValue
@@ -1743,11 +2695,9 @@ class GalleryListViewModel {
             galleries = []
             isLoading = true
             errorMessage = nil
-            currentPage = 0
-            prevHref = nil
-            nextHref = nil
-            Task {
-                await fetchPage(mode: .home, page: 0)
+            pagination.reset()
+            startReplacingRequest {
+                await self.fetchPage(mode: .home, page: 0)
             }
             return
         }
@@ -1755,12 +2705,12 @@ class GalleryListViewModel {
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
-        Task {
-            await fetchPage(mode: .search(keyword: searchText), page: 0)
+        pagination.reset()
+        let keyword = searchText
+        startReplacingRequest {
+            await self.fetchPage(mode: .search(keyword: keyword), page: 0)
         }
+        scheduleDedicatedSearchPersistence()
     }
 
     /// 高级搜索面板关闭后自动应用设置 (对齐 Android GalleryListScene.onApplySearch)
@@ -1777,11 +2727,10 @@ class GalleryListViewModel {
             galleries = []
             isLoading = true
             errorMessage = nil
-            currentPage = 0
-            prevHref = nil
-            nextHref = nil
-            Task {
-                await fetchPage(mode: .search(keyword: searchText), page: 0)
+            pagination.reset()
+            let keyword = searchText
+            startReplacingRequest {
+                await self.fetchPage(mode: .search(keyword: keyword), page: 0)
             }
             return
         }
@@ -1791,11 +2740,9 @@ class GalleryListViewModel {
             galleries = []
             isLoading = true
             errorMessage = nil
-            currentPage = 0
-            prevHref = nil
-            nextHref = nil
-            Task {
-                await fetchPage(mode: .home, page: 0)
+            pagination.reset()
+            startReplacingRequest {
+                await self.fetchPage(mode: .home, page: 0)
             }
         }
     }
@@ -1810,145 +2757,351 @@ class GalleryListViewModel {
         currentPageTo = state.pageToValue
     }
 
+    func currentQuickSearchRecord() -> QuickSearchRecord {
+        var record = QuickSearchRecord(
+            name: nil,
+            mode: currentSearchMode.listMode,
+            category: currentCategory,
+            keyword: searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        record.advanceSearch = currentAdvanceSearch
+        record.minRating = currentMinRating
+        record.pageFrom = currentPageFrom
+        record.pageTo = currentPageTo
+        return record
+    }
+
     func applyQuickSearch(_ search: QuickSearchRecord) {
         guard let keyword = search.keyword, !keyword.isEmpty else { return }
         searchText = keyword
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
-
-        // 构建带有分类和评分过滤的搜索
-        Task {
-            await fetchQuickSearch(search)
+        pagination.reset()
+        currentMode = .search(keyword: keyword)
+        currentCategory = search.category
+        let hasAdvancedFilters = search.advanceSearch > 0
+            || search.minRating > 0
+            || search.pageFrom > 0
+            || search.pageTo > 0
+        currentAdvanceSearch = hasAdvancedFilters ? search.advanceSearch : -1
+        currentMinRating = search.minRating > 0 ? search.minRating : -1
+        currentPageFrom = search.pageFrom > 0 ? search.pageFrom : -1
+        currentPageTo = search.pageTo > 0 ? search.pageTo : -1
+        switch search.mode {
+        case ListUrlBuilder.Mode.subscription.rawValue:
+            currentSearchMode = .subscription
+        case ListUrlBuilder.Mode.uploader.rawValue:
+            currentSearchMode = .uploader
+        case ListUrlBuilder.Mode.tag.rawValue:
+            currentSearchMode = .tag
+        default:
+            currentSearchMode = .normal
         }
-    }
 
-    private func fetchQuickSearch(_ search: QuickSearchRecord) async {
-        do {
-            let site = AppSettings.shared.gallerySite
-            let host = EhURL.host(for: site)
-
-            var urlComponents = URLComponents(string: host)!
-            var queryItems: [URLQueryItem] = []
-
-            // 关键词
-            if let keyword = search.keyword {
-                queryItems.append(URLQueryItem(name: "f_search", value: keyword))
-            }
-
-            // 分类过滤 (E-Hentai 使用 f_cats 参数，是要排除的分类的位掩码)
-            if search.category > 0 {
-                // category 是要包含的分类，需要计算排除的分类
-                let allCategories = 0x3FF  // 全部分类
-                let excludeCategories = allCategories ^ search.category
-                queryItems.append(URLQueryItem(name: "f_cats", value: String(excludeCategories)))
-            }
-
-            // 最低评分
-            if search.minRating > 0 {
-                queryItems.append(URLQueryItem(name: "f_srdd", value: String(search.minRating)))
-                queryItems.append(URLQueryItem(name: "f_sr", value: "on"))
-            }
-
-            // 高级搜索标记
-            if search.advanceSearch > 0 || search.minRating > 0 {
-                queryItems.append(URLQueryItem(name: "advsearch", value: "1"))
-            }
-
-            urlComponents.queryItems = queryItems.isEmpty ? nil : queryItems
-
-            let result = try await EhAPI.shared.getGalleryList(url: urlComponents.url!.absoluteString)
-
-            self.galleries = result.galleries
-            // ★ 记录分页游标: 快速搜索的 URL 是这里现拼的，
-            //   不记下来 loadMore 会退回 page=N 分页并按 mode 重新拼 URL → 加载到别的列表
-            self.prevHref = result.prevHref
-            self.nextHref = result.nextHref
-            self.totalPages = result.pages
-            // ★ 防止分页回绕: nextPage 必须 > 0 才有下一页 (E-Hentai 末页 ptt ">" 链接回 page=0)
-            if result.pages < 0 {
-                self.hasMore = result.nextHref != nil
-            } else {
-                self.hasMore = (result.nextPage ?? 0) > 0
-                if !self.hasMore { self.nextHref = nil }
-            }
-            self.isLoading = false
-        } catch {
-            if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                self.isLoading = false
-                return
-            }
-            self.errorMessage = EhError.localizedMessage(for: error)
-            self.isLoading = false
+        // 快速搜索与普通搜索共用同一条分页管线，确保筛选条件在后续页面保持一致。
+        startReplacingRequest {
+            await self.fetchPage(mode: .search(keyword: keyword), page: 0)
         }
+        scheduleDedicatedSearchPersistence()
     }
 
     func loadMore(mode: GalleryListView.ListMode) async {
-        guard !isLoading, hasMore else { return }
+        guard !isLoading, let request = pagination.nextRequest else { return }
 
-        // ★ 始终优先使用 nextHref 翻页
-        // ptt 和 searchnav 模式都会提供完整 href (包含 next=TIMESTAMP 等跳页上下文)
-        // 这确保日期跳转后能按日期顺序加载，不会因丢失上下文而循环
-        if let nextHref = nextHref {
+        switch request {
+        case .href(let nextHref):
+            await fetchCursorPage(nextHref)
+        case .page(let targetPage):
             isLoading = true
-            do {
-                let result = try await EhAPI.shared.getGalleryList(url: nextHref)
-
-                // ★ 去重保护: 如果新加载的画廊全部已在列表中，说明分页回绕了
-                let existingGids = Set(self.galleries.map { $0.gid })
-                let newGalleries = result.galleries.filter { !existingGids.contains($0.gid) }
-                if result.galleries.count > 0 && newGalleries.isEmpty {
-                    // 全重复 → 到达尽头，停止加载
-                    self.hasMore = false
-                    self.isLoading = false
-                    return
-                }
-
-                self.galleries.append(contentsOf: newGalleries)
-                self.prevHref = result.prevHref
-                self.nextHref = result.nextHref
-                self.totalPages = result.pages
-                if result.pages < 0 {
-                    // searchnav 模式: 有 #unext 才继续
-                    self.hasMore = result.nextHref != nil
-                } else {
-                    // ptt 模式: 末页的 ">" 会回绕到 page=0，nextHref 同样要丢弃
-                    self.hasMore = (result.nextPage ?? 0) > 0
-                    if !self.hasMore { self.nextHref = nil }
-                }
-                self.isLoading = false
-            } catch {
-                if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                    self.isLoading = false
-                    return
-                }
-                self.errorMessage = EhError.localizedMessage(for: error)
-                self.isLoading = false
-            }
-            return
+            await fetchPage(mode: mode, page: targetPage)
         }
+    }
 
-        // Page-based 翻页 fallback (仅在无 href 时使用)
+    private func fetchCursorPage(_ href: String) async {
         isLoading = true
-        currentPage += 1
-        await fetchPage(mode: mode, page: currentPage)
+        errorMessage = nil
+
+        do {
+            let result = try await EhAPI.shared.getGalleryList(url: resolvedListHref(href))
+            try Task.checkCancellation()
+
+            let pageGalleries = try await enrichedGalleries(result.galleries)
+
+            let appendedGalleries = pagination.merge(pageGalleries, replacing: false)
+            galleries.append(contentsOf: appendedGalleries)
+            let loadedPage = pagination.lastLoadedPage + 1
+            pagination.consume(
+                nextPage: result.nextPage,
+                firstHref: result.firstHref,
+                prevHref: result.prevHref,
+                nextHref: result.nextHref,
+                lastHref: result.lastHref,
+                totalPages: result.pages,
+                loadedPage: loadedPage,
+                appendedCount: appendedGalleries.count,
+                replacing: false
+            )
+            isLoading = false
+            scheduleDedicatedSearchPersistence()
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                return
+            }
+            errorMessage = EhError.localizedMessage(for: error)
+            isLoading = false
+            scheduleDedicatedSearchPersistence()
+        }
+    }
+
+    /// 下拉刷新在存在服务器 `prev` 游标时切换到上一页；首屏仍执行普通刷新。
+    /// 该逻辑对收藏、普通搜索和标签搜索共用，因此可以连续向前翻页。
+    func refreshOrLoadPrevious(mode: GalleryListView.ListMode) async {
+        if let previousHref = pagination.prevHref {
+            await fetchPreviousPage(previousHref)
+        } else {
+            await refreshAsync(mode: mode)
+        }
+    }
+
+    private func fetchPreviousPage(_ href: String) async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        let targetPage = max(pagination.firstLoadedPage - 1, 0)
+        // Prefer the item that is actually pinned to the scroll viewport. The
+        // first loaded item can already be well above the visible region after
+        // several page loads, and restoring to it would look like a jump to the
+        // top of the list.
+        let retainedAnchor = scrollPosition ?? galleries.first?.gid
+
+        do {
+            let result = try await EhAPI.shared.getGalleryList(url: resolvedListHref(href))
+            try Task.checkCancellation()
+            let pageGalleries = try await enrichedGalleries(result.galleries)
+            let prependedGalleries = pagination.merge(pageGalleries, replacing: false)
+            if !prependedGalleries.isEmpty {
+                galleries.insert(contentsOf: prependedGalleries, at: 0)
+            }
+            pagination.consumePrepending(
+                firstHref: result.firstHref,
+                prevHref: result.prevHref,
+                totalPages: result.pages,
+                loadedPage: targetPage,
+                prependedCount: prependedGalleries.count
+            )
+            // Keep the former first row/card stationary after inserting the
+            // previous page above it. The user can then continue scrolling
+            // upward without a visual jump.
+            if let retainedAnchor {
+                await Task.yield()
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    scrollPosition = retainedAnchor
+                }
+            }
+            isLoading = false
+            scheduleDedicatedSearchPersistence()
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            errorMessage = EhError.localizedMessage(for: error)
+            isLoading = false
+        }
+    }
+
+    private func resolvedListHref(_ href: String) -> String {
+        if let url = URL(string: href), url.scheme != nil {
+            return url.absoluteString
+        }
+        let base = URL(string: EhURL.host(for: AppSettings.shared.gallerySite))
+        return URL(string: href, relativeTo: base)?.absoluteURL.absoluteString ?? href
     }
     
     /// 跳转到指定页 (对齐 Android ContentHelper.goTo(page), 仅 TopList 使用)
-    func goToPage(_ page: Int, mode: GalleryListView.ListMode) {
-        guard page >= 0 && page < totalPages else { return }
+    func goToPage(
+        _ page: Int,
+        mode: GalleryListView.ListMode,
+        knownTotalPages: Int? = nil
+    ) {
+        if case .favorites = mode {
+            goToFavoritesPage(page, mode: mode, knownTotalPages: knownTotalPages)
+            return
+        }
+        let availablePages = max(totalPages, knownTotalPages ?? 0)
+        guard page >= 0 && page < availablePages else { return }
         
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = page
+        pagination.reset()
         currentMode = mode
         
-        Task {
-            await fetchPage(mode: mode, page: page)
+        startReplacingRequest {
+            await self.fetchPage(mode: mode, page: page)
+        }
+    }
+
+    /// 收藏页的 `searchnav` 返回不透明 next/prev URL，`?page=N` 会被部分
+    /// EH 节点忽略。沿服务器游标前进到目标页，才能保证跳转真正发生。
+    func goToFavoritesPage(
+        _ page: Int,
+        mode: GalleryListView.ListMode,
+        knownTotalPages: Int? = nil
+    ) {
+        guard case .favorites = mode, page >= 0 else { return }
+        if let knownTotalPages, knownTotalPages > 0, page >= knownTotalPages { return }
+        beginFavoritesTraversal(mode: mode, targetPage: page, seeksLastPage: false)
+    }
+
+    func goToLastFavoritesPage(
+        mode: GalleryListView.ListMode,
+        knownTotalPages: Int? = nil
+    ) {
+        guard case .favorites = mode else { return }
+        beginFavoritesTraversal(
+            mode: mode,
+            targetPage: nil,
+            seeksLastPage: true,
+            knownTotalPages: knownTotalPages
+        )
+    }
+
+    private func beginFavoritesTraversal(
+        mode: GalleryListView.ListMode,
+        targetPage: Int?,
+        seeksLastPage: Bool,
+        knownTotalPages: Int? = nil
+    ) {
+        let directLastURL = seeksLastPage ? pagination.lastHref.map(resolvedListHref) : nil
+        galleries = []
+        isLoading = true
+        errorMessage = nil
+        pagination.reset()
+        currentMode = mode
+        scrollPosition = nil
+
+        startReplacingRequest {
+            await self.traverseFavorites(
+                mode: mode,
+                targetPage: targetPage,
+                seeksLastPage: seeksLastPage,
+                directLastURL: directLastURL,
+                knownTotalPages: knownTotalPages
+            )
+        }
+    }
+
+    private func traverseFavorites(
+        mode: GalleryListView.ListMode,
+        targetPage: Int?,
+        seeksLastPage: Bool,
+        directLastURL: String?,
+        knownTotalPages: Int?
+    ) async {
+        guard case .favorites(let slot) = mode else { return }
+
+        let site = AppSettings.shared.gallerySite
+        let normalizedKeyword = favSearchKeyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cacheKey = "\(site)-\(slot)-\(normalizedKeyword ?? "")"
+        let firstURL = FavListUrlBuilder(
+            favCat: slot,
+            keyword: normalizedKeyword,
+            index: 0
+        ).build(site: site)
+
+        var cachedURLs = favoriteCursorURLs[cacheKey] ?? [0: firstURL]
+        cachedURLs[0] = firstURL
+
+        let desiredPage = targetPage ?? Int.max
+
+        // 部分 EH 节点仍接受 `page=N`。先进行一次可验证的直达请求：
+        // 目标页应当包含 prev 游标；若节点忽略 page 参数并返回首屏，则
+        // 不采用该结果，继续走下方可靠的 searchnav 游标链。
+        if !seeksLastPage,
+           let targetPage,
+           targetPage > 0,
+           cachedURLs[targetPage] == nil {
+            let optimisticURL = FavListUrlBuilder(
+                favCat: slot,
+                keyword: normalizedKeyword,
+                index: targetPage
+            ).build(site: site)
+            do {
+                var directResult = try await EhAPI.shared.getGalleryList(url: optimisticURL)
+                try Task.checkCancellation()
+                if directResult.prevHref != nil {
+                    if let previousURL = directResult.prevHref.map(resolvedListHref) {
+                        cachedURLs[targetPage - 1] = previousURL
+                    }
+                    if let nextURL = directResult.nextHref.map(resolvedListHref) {
+                        cachedURLs[targetPage + 1] = nextURL
+                    }
+                    directResult.galleries = try await enrichedGalleries(directResult.galleries)
+                    favoriteCursorURLs[cacheKey] = cachedURLs
+                    applyReplacement(directResult, loadedPage: targetPage)
+                    isLoading = false
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch let error as URLError where error.code == .cancelled {
+                return
+            } catch {
+                // 节点不支持数字页或临时失败时，继续使用可靠的游标遍历。
+            }
+        }
+
+        let cachedStart = cachedURLs.keys
+            .filter { $0 <= desiredPage }
+            .max() ?? 0
+        var pageIndex = directLastURL == nil ? cachedStart : max((knownTotalPages ?? 1) - 1, 0)
+        var pageURL = directLastURL ?? cachedURLs[cachedStart] ?? firstURL
+        // 防止异常节点循环返回同一个游标。
+        var visitedURLs: Set<String> = []
+
+        do {
+            while pageIndex < 2_000, visitedURLs.insert(pageURL).inserted {
+                try Task.checkCancellation()
+                var result = try await EhAPI.shared.getGalleryList(url: pageURL)
+                try Task.checkCancellation()
+
+                let nextURL = result.nextHref.map(resolvedListHref)
+                if let nextURL {
+                    cachedURLs[pageIndex + 1] = nextURL
+                }
+
+                if seeksLastPage,
+                   nextURL != nil,
+                   let lastURL = result.lastHref.map(resolvedListHref),
+                   !visitedURLs.contains(lastURL) {
+                    pageIndex = max((knownTotalPages ?? pageIndex + 2) - 1, pageIndex + 1)
+                    pageURL = lastURL
+                    continue
+                }
+
+                let reachedRequestedPage = !seeksLastPage && pageIndex >= desiredPage
+                let reachedLastPage = nextURL == nil
+                if reachedRequestedPage || reachedLastPage {
+                    result.galleries = try await enrichedGalleries(result.galleries)
+                    favoriteCursorURLs[cacheKey] = cachedURLs
+                    applyReplacement(result, loadedPage: pageIndex)
+                    isLoading = false
+                    return
+                }
+
+                guard let nextURL else { break }
+                pageIndex += 1
+                pageURL = nextURL
+            }
+
+            throw URLError(.cannotParseResponse)
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                return
+            }
+            isLoading = false
+            errorMessage = EhError.localizedMessage(for: error)
         }
     }
 
@@ -1968,13 +3121,11 @@ class GalleryListViewModel {
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
+        pagination.reset()
         currentMode = mode
         
-        Task {
-            await fetchNormalSeek(date: date, mode: mode)
+        startReplacingRequest {
+            await self.fetchNormalSeek(date: date, mode: mode)
         }
     }
 
@@ -1985,36 +3136,37 @@ class GalleryListViewModel {
         galleries = []
         isLoading = true
         errorMessage = nil
-        currentPage = 0
-        prevHref = nil
-        nextHref = nil
+        pagination.reset()
         currentMode = mode
         
-        Task {
-            await fetchFavoritesSeek(slot: slot, date: date)
+        startReplacingRequest {
+            await self.fetchFavoritesSeek(slot: slot, date: date)
         }
     }
 
     /// 收藏通过 URL 导航 (prev/next 链接)
     func goToFavoritesHref(_ href: String, mode: GalleryListView.ListMode) {
+        let loadedPage: Int
+        if href == pagination.prevHref {
+            loadedPage = max(pagination.firstLoadedPage - 1, 0)
+        } else if href == pagination.nextHref {
+            loadedPage = pagination.lastLoadedPage + 1
+        } else {
+            loadedPage = 0
+        }
         galleries = []
         isLoading = true
         errorMessage = nil
         currentMode = mode
         
-        Task {
+        startReplacingRequest {
             do {
                 let result = try await EhAPI.shared.getGalleryList(url: href)
-                self.galleries = result.galleries
-                recordFavoriteSyncIfNeeded(mode: mode)
-                self.hasMore = result.nextHref != nil
-                self.prevHref = result.prevHref
-                self.nextHref = result.nextHref
-                self.totalPages = result.pages
+                try Task.checkCancellation()
+                self.applyReplacement(result, loadedPage: loadedPage)
                 self.isLoading = false
             } catch {
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                    self.isLoading = false
                     return
                 }
                 self.errorMessage = EhError.localizedMessage(for: error)
@@ -2031,25 +3183,15 @@ class GalleryListViewModel {
         errorMessage = nil
         currentMode = mode
 
-        Task {
-            let jumpUrl = buildJumpUrl(appendParam, mode: mode)
+        startReplacingRequest {
+            let jumpUrl = self.buildJumpUrl(appendParam, mode: mode)
             do {
                 let result = try await EhAPI.shared.getGalleryList(url: jumpUrl)
-                self.galleries = result.galleries
-                recordFavoriteSyncIfNeeded(mode: mode)
-                // ★ 防止回绕: nextHref 优先, 否则 nextPage 须 > 0
-                if result.nextHref != nil {
-                    self.hasMore = true
-                } else {
-                    self.hasMore = (result.nextPage ?? 0) > 0
-                }
-                self.prevHref = result.prevHref
-                self.nextHref = result.nextHref
-                self.totalPages = result.pages
+                try Task.checkCancellation()
+                self.applyReplacement(result)
                 self.isLoading = false
             } catch {
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                    self.isLoading = false
                     return
                 }
                 self.errorMessage = EhError.localizedMessage(for: error)
@@ -2068,16 +3210,15 @@ class GalleryListViewModel {
         } else {
             let site = AppSettings.shared.gallerySite
             switch mode {
-            case .home, .subscription:
+            case .home:
                 var builder = ListUrlBuilder()
-                builder.mode = mode.isSubscription
-                    ? .subscription
-                    : (ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal)
+                builder.mode = .normal
                 builder.category = currentCategory
-                builder.advanceSearch = currentAdvanceSearch
-                builder.minRating = currentMinRating
-                builder.pageFrom = currentPageFrom
-                builder.pageTo = currentPageTo
+                baseUrl = builder.build(site: site)
+            case .subscription:
+                var builder = ListUrlBuilder()
+                builder.mode = .subscription
+                builder.category = currentCategory
                 baseUrl = builder.build(site: site)
             case .search(let keyword):
                 var builder = ListUrlBuilder()
@@ -2100,11 +3241,6 @@ class GalleryListViewModel {
                 }
             case .popular:
                 baseUrl = EhURL.popularUrl(for: site)
-            case .toplist(let period):
-                // toplist.php 返回的就是标准的紧凑画廊列表表格 (itg gltc)，
-                // 通用解析器能直接吃（TopListParsingTests 用真实排版守着），
-                // 所以排行榜可以和其它列表走同一条路，卡片样式自然一致。
-                baseUrl = "\(EhURL.host(for: site))toplist.php?tl=\(period)"
             }
         }
 
@@ -2141,13 +3277,11 @@ class GalleryListViewModel {
         switch mode {
         case .home:
             var builder = ListUrlBuilder()
-            builder.mode = ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal
+            builder.mode = .normal
             builder.category = currentCategory
-            builder.advanceSearch = currentAdvanceSearch
-            builder.minRating = currentMinRating
-            builder.pageFrom = currentPageFrom
-            builder.pageTo = currentPageTo
             baseUrl = builder.build(site: site)
+        case .subscription:
+            return
         case .search(let keyword):
             var builder = ListUrlBuilder()
             builder.mode = ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal
@@ -2172,21 +3306,12 @@ class GalleryListViewModel {
 
         do {
             let result = try await EhAPI.shared.getGalleryList(url: seekUrl)
-            self.galleries = result.galleries
-            recordFavoriteSyncIfNeeded(mode: mode)
-            // ★ 防止回绕: nextHref 优先, 否则 nextPage 须 > 0
-            if result.nextHref != nil {
-                self.hasMore = true
-            } else {
-                self.hasMore = (result.nextPage ?? 0) > 0
-            }
-            self.prevHref = result.prevHref
-            self.nextHref = result.nextHref
-            self.totalPages = result.pages
+            try Task.checkCancellation()
+            self.applyReplacement(result)
             self.isLoading = false
+            scheduleDedicatedSearchPersistence()
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                self.isLoading = false
                 return
             }
             self.errorMessage = EhError.localizedMessage(for: error)
@@ -2215,15 +3340,11 @@ class GalleryListViewModel {
         
         do {
             let result = try await EhAPI.shared.getGalleryList(url: favUrl)
-            self.galleries = result.galleries
-            self.hasMore = result.nextHref != nil
-            self.prevHref = result.prevHref
-            self.nextHref = result.nextHref
-            self.totalPages = result.pages
+            try Task.checkCancellation()
+            self.applyReplacement(result)
             self.isLoading = false
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                self.isLoading = false
                 return
             }
             self.errorMessage = EhError.localizedMessage(for: error)
@@ -2231,45 +3352,91 @@ class GalleryListViewModel {
         }
     }
 
+    private func applyReplacement(_ result: GalleryListResult, loadedPage: Int = 0) {
+        let replacement = pagination.merge(result.galleries, replacing: true)
+        galleries = replacement
+        pagination.consume(
+            nextPage: result.nextPage,
+            firstHref: result.firstHref,
+            prevHref: result.prevHref,
+            nextHref: result.nextHref,
+            lastHref: result.lastHref,
+            totalPages: result.pages,
+            loadedPage: loadedPage,
+            appendedCount: replacement.count,
+            replacing: true
+        )
+    }
+
+    private func startReplacingRequest(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        requestTask?.cancel()
+        requestTask = Task {
+            await operation()
+        }
+    }
+
+    func cancelRequests() {
+        suggestionTask?.cancel()
+        requestTask?.cancel()
+        suggestionTask = nil
+        requestTask = nil
+        isLoading = false
+    }
+
+    /// 使用结构化任务竞争网络请求与超时；取消父任务时两者会一起取消，
+    /// 不再遗留一个稍后回写界面状态的孤立 timeout Task。
+    private func fetchFirstPageWithTimeout(mode: GalleryListView.ListMode) async {
+        let didTimeout = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+            group.addTask {
+                await self.fetchPage(mode: mode, page: 0)
+                return false
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .seconds(20))
+                    return !Task.isCancelled
+                } catch {
+                    return false
+                }
+            }
+
+            let firstResult = await group.next() ?? false
+            group.cancelAll()
+            return firstResult
+        }
+
+        if didTimeout, isLoading, galleries.isEmpty {
+            isLoading = false
+            errorMessage = AppLocalization.localized("网络请求超时，请检查网络连接或 VPN 设置后重试")
+        }
+    }
+
     private func fetchPage(mode: GalleryListView.ListMode, page: Int) async {
-        print("[EhVM] fetchPage: mode=\(mode) page=\(page)")
+        let performanceInterval = PerformanceDiagnostics.begin("GalleryListFetch")
+        defer { performanceInterval.end() }
+
         do {
             let site = AppSettings.shared.gallerySite
             let host = EhURL.host(for: site)
             let urlString: String
 
             switch mode {
+            case .home:
+                var builder = ListUrlBuilder()
+                builder.mode = .normal
+                builder.pageIndex = page
+                builder.category = currentCategory
+                urlString = builder.build(site: site)
             case .subscription:
-                // 订阅列表: /watched，只出带订阅标签的新画廊
                 var builder = ListUrlBuilder()
                 builder.mode = .subscription
                 builder.pageIndex = page
                 builder.category = currentCategory
-                builder.advanceSearch = currentAdvanceSearch
-                builder.minRating = currentMinRating
-                builder.pageFrom = currentPageFrom
-                builder.pageTo = currentPageTo
-                urlString = builder.build(site: site)
-            case .home:
-                // ★ 首页同样要带上高级搜索参数 (对齐 Android GalleryListScene:
-                //   无关键字时也用同一个 ListUrlBuilder，f_sr/f_srdd 等不会被丢弃)
-                //   之前这里只传 category，导致"最低评分 / 页数范围 / 订阅搜索"在无关键字时全部失效
-                var builder = ListUrlBuilder()
-                builder.mode = ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal
-                builder.pageIndex = page
-                builder.category = currentCategory
-                builder.advanceSearch = currentAdvanceSearch
-                builder.minRating = currentMinRating
-                builder.pageFrom = currentPageFrom
-                builder.pageTo = currentPageTo
                 urlString = builder.build(site: site)
             case .popular:
                 urlString = EhURL.popularUrl(for: site)
-            case .toplist(let period):
-                // 排行榜按 p= 分页，和普通列表一致
-                urlString = page > 0
-                    ? "\(host)toplist.php?tl=\(period)&p=\(page)"
-                    : "\(host)toplist.php?tl=\(period)"
             case .search(let keyword):
                 var builder = ListUrlBuilder()
                 builder.mode = ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal
@@ -2304,86 +3471,103 @@ class GalleryListViewModel {
                 urlString = favUrl
             }
 
-            let result = try await EhAPI.shared.getGalleryList(url: urlString)
+            // EhAPI builds several URL sessions and disk caches on first use.
+            // Resolve the singleton on a utility executor so a cold first
+            // request suspends the main actor instead of constructing it there.
+            let api = await Task.detached(priority: .utility) { EhAPI.shared }.value
+            let result = try await api.getGalleryList(url: urlString)
+            try Task.checkCancellation()
+
+            let pageGalleries = try await enrichedGalleries(result.galleries)
+
+            let appendedGalleries = pagination.merge(pageGalleries, replacing: page == 0)
 
             if page == 0 {
-                self.galleries = result.galleries
-                recordFavoriteSyncIfNeeded(mode: mode)
+                self.galleries = appendedGalleries
             } else {
-                self.galleries.append(contentsOf: result.galleries)
+                self.galleries.append(contentsOf: appendedGalleries)
             }
-            self.prevHref = result.prevHref
-            self.nextHref = result.nextHref
-            // 解析总页数 (对齐 Android: GalleryListParser 返回的 pages)
-            self.totalPages = result.pages
-
-            // ★ 防止分页循环: 根据模式正确判断 hasMore
-            if case .popular = mode {
-                // Popular 不分页
-                self.hasMore = false
-            } else if case .favorites = mode {
-                // 收藏夹使用 href-based 翻页
-                self.hasMore = result.nextHref != nil
-            } else if result.pages < 0 {
-                // searchnav 模式 (解析器置 pages = -1): 只能靠 #unext 判断
-                self.hasMore = result.nextHref != nil
-            } else {
-                // ptt 分页: nextPage 必须 > 当前 page 才有下一页
-                // E-Hentai 末页 ptt ">" 链接会回绕到 page=0，
-                // 此时 nextHref 也是回绕链接，必须一并丢弃 ——
-                // 否则 loadMore 会优先用它翻回第一页，表现为"列表从头循环" (issue #8 问题一)
-                self.hasMore = (result.nextPage ?? 0) > page
-                if !self.hasMore { self.nextHref = nil }
-            }
-            
+            pagination.consume(
+                nextPage: result.nextPage,
+                firstHref: result.firstHref,
+                prevHref: result.prevHref,
+                nextHref: result.nextHref,
+                lastHref: result.lastHref,
+                totalPages: result.pages,
+                loadedPage: page,
+                appendedCount: appendedGalleries.count,
+                replacing: page == 0
+            )
             self.isLoading = false
-            print("[EhVM] fetchPage: SUCCESS — \(self.galleries.count) galleries loaded")
+            scheduleDedicatedSearchPersistence()
 
             // 缓存第一页结果
             if page == 0 {
-                let cacheKey = self.cacheKey(for: mode, page: 0)
+                let cacheKey = Self.cacheKey(for: mode, page: 0)
                 GalleryCache.shared.putListResult(
                     CachedGalleryListResult(
                         galleries: self.galleries,
                         hasMore: self.hasMore,
                         nextPage: result.nextPage,
-                        totalPages: self.totalPages,
-                        prevHref: result.prevHref,
-                        nextHref: result.nextHref
+                        nextHref: result.nextHref,
+                        firstHref: result.firstHref,
+                        lastHref: result.lastHref,
+                        totalPages: self.totalPages
                     ),
                     forKey: cacheKey
                 )
             }
 
         } catch {
-            self.isLoading = false  // 始终重置，包括取消
-            print("[EhVM] fetchPage: ERROR \(error)")
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                print("[EhVM] fetchPage: cancelled, no errorMessage set")
                 return
             }
+            self.isLoading = false
             self.errorMessage = EhError.localizedMessage(for: error)
         }
     }
 
-    /// 当前生效的筛选条件签名 — 参与缓存 key，
-    /// 否则改了分类/最低评分后仍会命中旧的未过滤缓存
-    private var filterSignature: String {
-        "\(currentSearchMode.rawValue)|\(currentCategory)|\(currentAdvanceSearch)|\(currentMinRating)|\(currentPageFrom)-\(currentPageTo)"
+    /// 列表 HTML 信息不完整时，优先复用内存元数据，再按需通过 gdata
+    /// 补全语言、作者和标签。补全失败不阻塞列表，取消则继续向上传递。
+    private func enrichedGalleries(_ galleries: [GalleryInfo]) async throws -> [GalleryInfo] {
+        var result = GalleryCache.shared.mergeCachedMetadata(into: galleries)
+        var missing = result.filter { GalleryCache.shared.needsMetadataHydration($0) }
+
+        if !missing.isEmpty {
+            do {
+                try await EhAPI.shared.fillGalleryListByApi(galleries: &missing)
+                try Task.checkCancellation()
+                GalleryCache.shared.putMetadata(missing, markHydrated: true)
+                let hydratedByGID = Dictionary(
+                    uniqueKeysWithValues: missing.map { ($0.gid, $0) }
+                )
+                result = result.map { hydratedByGID[$0.gid] ?? $0 }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw CancellationError()
+            } catch {
+                debugLog("Gallery metadata hydration failed: \(error)")
+            }
+        }
+
+        GalleryCache.shared.putMetadata(result)
+        return result
     }
 
     /// 生成缓存 key
-    private func cacheKey(for mode: GalleryListView.ListMode, page: Int) -> String {
+    private static func cacheKey(for mode: GalleryListView.ListMode, page: Int) -> String {
+        let site = AppSettings.shared.gallerySite.rawValue
         switch mode {
-        case .home: return "home:\(filterSignature):\(page)"
-        case .subscription: return "watched:\(filterSignature):\(page)"
-        case .popular: return "popular:\(page)"
-        case .toplist(let period): return "toplist:\(period):\(page)"
-        case .search(let kw): return "search:\(kw):\(filterSignature):\(page)"
-        case .tag(let kw): return "tag:\(kw):\(page)"
-        case .favorites(let slot): return "fav:\(slot):\(favSearchKeyword ?? ""):\(page)"
+        case .home: return "\(site):home:\(page)"
+        case .subscription: return "\(site):subscription:\(page)"
+        case .popular: return "\(site):popular:\(page)"
+        case .search(let kw): return "\(site):search:\(kw):\(page)"
+        case .tag(let kw): return "\(site):tag:\(kw):\(page)"
+        case .favorites(let slot): return "\(site):fav:\(slot):\(page)"
         }
     }
+
 }
 
 #if os(iOS)
@@ -2393,135 +3577,6 @@ extension NSColor {
     static var secondarySystemBackground: NSColor { .controlBackgroundColor }
 }
 #endif
-
-// MARK: - Right Drawer Overlay (对齐 Android EhDrawerLayout 右侧抽屉)
-
-struct RightDrawerOverlay<DrawerContent: View>: View {
-    @Binding var isOpen: Bool
-    @ViewBuilder let drawerContent: () -> DrawerContent
-
-    private let drawerWidth: CGFloat = 280
-    /// 实时拖拽偏移 (正值 = 向右拖, 负值 = 向左拖)
-    @State private var dragOffset: CGFloat = 0
-    /// 边缘拖拽进度 (0 = 关闭, 1 = 完全打开)
-    @State private var edgeDragProgress: CGFloat = 0
-    private let edgeSwipeWidth: CGFloat = 30
-
-    /// 抽屉实际偏移量 (0 = 完全打开, drawerWidth = 完全关闭)
-    private var currentOffset: CGFloat {
-        if isOpen {
-            // 打开状态: 向右拖拽关闭
-            return max(0, dragOffset)
-        } else {
-            // 关闭状态: 边缘拖拽打开
-            return drawerWidth * (1 - edgeDragProgress)
-        }
-    }
-
-    /// 遮罩透明度
-    private var overlayOpacity: Double {
-        let progress = 1 - (currentOffset / drawerWidth)
-        return Double(max(0, min(0.3, progress * 0.3)))
-    }
-
-    var body: some View {
-        ZStack(alignment: .trailing) {
-            // 半透明遮罩
-            Color.black
-                .opacity(overlayOpacity)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                        isOpen = false
-                    }
-                }
-                .allowsHitTesting(isOpen || edgeDragProgress > 0)
-
-            // ★ 懒加载抽屉内容: 仅在打开或拖拽时才渲染 drawerContent，避免每次父视图重渲染时创建 QuickSearchDrawerContent
-            Group {
-                if isOpen || edgeDragProgress > 0 {
-                    drawerContent()
-                } else {
-                    Color.clear
-                }
-            }
-                .frame(width: drawerWidth)
-                .frame(maxHeight: .infinity, alignment: .top)
-                .background(.regularMaterial)
-                .clipShape(UnevenRoundedRectangle(topLeadingRadius: 12, bottomLeadingRadius: 12))
-                .shadow(color: .black.opacity(overlayOpacity > 0.05 ? 0.15 : 0), radius: 8, x: -3)
-                .offset(x: currentOffset)
-                .gesture(
-                    // 打开状态: 向右拖拽关闭
-                    isOpen ?
-                    DragGesture(minimumDistance: 8, coordinateSpace: .global)
-                        .onChanged { value in
-                            let translation = value.translation.width
-                            if translation > 0 {
-                                dragOffset = translation
-                            }
-                        }
-                        .onEnded { value in
-                            let velocity = value.predictedEndTranslation.width
-                            if dragOffset > drawerWidth * 0.3 || velocity > 200 {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                                    isOpen = false
-                                }
-                            } else {
-                                withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                    dragOffset = 0
-                                }
-                            }
-                            dragOffset = 0
-                        }
-                    : nil
-                )
-
-            // 右侧边缘滑动感应区 (关闭时: 从右向左滑动打开)
-            if !isOpen {
-                HStack {
-                    Spacer()
-                    Color.clear
-                        .frame(width: edgeSwipeWidth)
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 5, coordinateSpace: .global)
-                                .onChanged { value in
-                                    let translation = -value.translation.width  // 向左为正
-                                    if translation > 0 {
-                                        edgeDragProgress = min(1, translation / drawerWidth)
-                                    }
-                                }
-                                .onEnded { value in
-                                    let velocity = -value.predictedEndTranslation.width
-                                    if edgeDragProgress > 0.3 || velocity > 200 {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                                            isOpen = true
-                                        }
-                                    }
-                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                        edgeDragProgress = 0
-                                    }
-                                }
-                        )
-                }
-            }
-        }
-        .onChange(of: isOpen) { _, newValue in
-            dragOffset = 0
-            edgeDragProgress = 0
-        }
-    }
-}
-
-extension View {
-    /// 右侧抽屉修饰器 (对齐 Android EhDrawerLayout)
-    func rightDrawer<Content: View>(isOpen: Binding<Bool>, @ViewBuilder content: @escaping () -> Content) -> some View {
-        self.overlay {
-            RightDrawerOverlay(isOpen: isOpen, drawerContent: content)
-        }
-    }
-}
 
 #Preview {
     GalleryListView(mode: .home)

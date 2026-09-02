@@ -1,0 +1,14 @@
+"在 ${applicationName} 中打开 ${section}" = "Open ${section} in ${applicationName}";
+"用 ${applicationName} 打开 ${section}" = "Open ${section} with ${applicationName}";
+"使用 ${applicationName} 搜索画廊" = "Search galleries with ${applicationName}";
+"在 ${applicationName} 中搜索画廊" = "Search galleries in ${applicationName}";
+"在 ${applicationName} 中打开收藏" = "Open Favorites in ${applicationName}";
+"用 ${applicationName} 查看收藏" = "Show Favorites with ${applicationName}";
+"在 ${applicationName} 中打开下载" = "Open Downloads in ${applicationName}";
+"用 ${applicationName} 查看下载" = "Show Downloads with ${applicationName}";
+"在 ${applicationName} 中打开历史" = "Open History in ${applicationName}";
+"用 ${applicationName} 查看历史" = "Show History with ${applicationName}";
+"在 ${applicationName} 中打开订阅" = "Open Subscriptions in ${applicationName}";
+"用 ${applicationName} 查看订阅" = "Show Subscriptions with ${applicationName}";
+"在 ${applicationName} 中继续阅读" = "Continue reading in ${applicationName}";
+"用 ${applicationName} 继续阅读" = "Continue reading with ${applicationName}";

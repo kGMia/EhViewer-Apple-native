@@ -13,9 +13,14 @@ import EhSettings
 
 /// 继续阅读卡片 — 显示最近阅读的画廊，一键跳转阅读器
 struct ContinueReadingCard: View {
+    @Environment(\.readerPresentationAction) private var readerPresentationAction
     @State private var latestRecord: HistoryRecord?
     @State private var readingProgress: Int?
+    #if os(iOS)
     @State private var readerLaunchItem: ReaderLaunchItem?
+    #else
+    @Environment(\.openWindow) private var openWindow
+    #endif
 
     var body: some View {
         Group {
@@ -81,60 +86,89 @@ struct ContinueReadingCard: View {
     @ViewBuilder
     private func cardContent(record: HistoryRecord) -> some View {
         Button {
-            readerLaunchItem = ReaderLaunchItem(
+            #if os(iOS)
+            let item = ReaderLaunchItem(
                 gid: record.gid,
                 token: record.token,
                 pages: record.pages,
                 previewSet: nil,
                 initialPage: readingProgress
             )
+            if let readerPresentationAction {
+                readerPresentationAction.present(ReaderWindowRoute(
+                    gid: item.gid,
+                    token: item.token,
+                    pages: item.pages,
+                    previewSet: item.previewSet,
+                    initialPage: item.initialPage
+                ))
+            } else {
+                readerLaunchItem = item
+            }
+            #else
+            openWindow(value: ReaderWindowRoute(
+                gid: record.gid,
+                token: record.token,
+                pages: record.pages,
+                previewSet: nil,
+                initialPage: readingProgress
+            ))
+            #endif
         } label: {
-            HStack(spacing: EhSpacing.row) {
-                EhCoverThumbnail(
-                    url: record.thumb,
-                    size: EhSize.resumeThumbnail,
-                    cornerRadius: EhRadius.smallThumbnail
-                )
+            HStack(spacing: 12) {
+                // 封面
+                CachedAsyncImage(url: ThumbnailURLResolver.url(
+                    for: record.thumb,
+                    fixLegacy: AppSettings.shared.fixThumbUrl,
+                    site: AppSettings.shared.gallerySite
+                )) { img in
+                    img.resizable().aspectRatio(contentMode: .fill)
+                } placeholder: {
+                    Color(.tertiarySystemFill)
+                }
+                .frame(width: 48, height: 66)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("继续阅读").ehSectionHeader()
-                        .foregroundStyle(EhColor.accent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("继续阅读")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                        .fontWeight(.semibold)
 
                     Text(record.titleJpn ?? record.title)
-                        .font(EhFont.body)
-                        .lineLimit(1)
-                        .foregroundStyle(EhColor.label)
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .foregroundStyle(.primary)
 
                     if let progress = readingProgress, record.pages > 0 {
-                        let page = progress + 1
-                        let percent = Int(Double(page) / Double(record.pages) * 100)
-                        Text("\(page) / \(record.pages) 页 · \(percent)%")
-                            .font(EhFont.mono(11))
-                            .foregroundStyle(EhColor.secondaryLabel)
+                        HStack(spacing: 6) {
+                            // 进度条
+                            ProgressView(value: Double(progress + 1), total: Double(record.pages))
+                                .tint(.blue)
+                                .frame(maxWidth: 100)
+                            Text("\(progress + 1)/\(record.pages)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
                     }
                 }
 
-                Spacer(minLength: 8)
+                Spacer()
 
-                Image(systemName: "play.fill")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(EhColor.onAccentFill)
-                    .frame(width: 26, height: 26)
-                    .background(Circle().fill(EhColor.accentFill))
+                Image(systemName: "play.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
             }
-            .padding(.horizontal, EhSpacing.page)
-            .padding(.vertical, 10)
-            // 左浓右淡的琥珀渐隐：把这一条与下方的普通列表行区分开，
-            // 又不至于像一整块实心卡片那样从列表里割裂出去
+            .padding(12)
             .background(
-                LinearGradient(
-                    colors: [EhColor.accentWash, .clear],
-                    startPoint: .leading, endPoint: .trailing
-                )
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color(.secondarySystemBackground))
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .padding(.horizontal)
         .padding(.top, 8)
     }
 }

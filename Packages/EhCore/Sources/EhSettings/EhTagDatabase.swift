@@ -124,23 +124,6 @@ public final class EhTagDatabase: @unchecked Sendable {
     }
 
     /// namespace 转前缀
-    /// 这个键是不是缩写形式（`a:xxx` / `f:xxx`）。
-    /// 缩写只保留在翻译查询表里，不进建议索引。
-    static func isAbbreviatedKey(_ key: String) -> Bool {
-        guard let colon = key.firstIndex(of: ":") else { return false }
-        let prefix = String(key[key.startIndex...colon])   // 含冒号
-        return prefixToNamespace[prefix] != nil
-    }
-
-    /// 把用户打的缩写前缀换成全称，让 `f:machine` 也能命中 `female:machine`。
-    /// 建议索引里只有全称，不做这层转换的话按缩写搜索会一条都搜不到。
-    static func normalizeQueryPrefix(_ query: String) -> String {
-        guard let colon = query.firstIndex(of: ":") else { return query }
-        let prefix = String(query[query.startIndex...colon])
-        guard let namespace = prefixToNamespace[prefix] else { return query }
-        return namespace + ":" + query[query.index(after: colon)...]
-    }
-
     public static func namespaceToPrefix(_ namespace: String) -> String? {
         if let prefix = namespaceToPrefix[namespace] {
             return prefix
@@ -169,7 +152,7 @@ public final class EhTagDatabase: @unchecked Sendable {
         queue.sync {
             guard _isLoaded, !keyword.isEmpty else { return [] }
 
-            let lowered = Self.normalizeQueryPrefix(keyword.lowercased())
+            let lowered = keyword.lowercased()
             var results: [(chinese: String, english: String)] = []
             var seen = Set<String>()
 
@@ -198,41 +181,6 @@ public final class EhTagDatabase: @unchecked Sendable {
 
             return results
         }
-    }
-
-    /// 列出某个命名空间下的标签 (供标签选择器按分组浏览)
-    ///
-    /// 内部索引的 key 本来就是 `namespace:tag`，按前缀取区间即可。
-    /// - Parameters:
-    ///   - namespace: 如 "female" / "artist"
-    ///   - filter: 可选的关键词过滤，中英文都会匹配
-    public func tags(inNamespace namespace: String, filter: String = "", limit: Int = 300)
-        -> [(chinese: String, english: String)] {
-        queue.sync {
-            guard _isLoaded else { return [] }
-            let prefix = namespace.lowercased() + ":"
-            let lowered = filter.lowercased()
-
-            var results: [(chinese: String, english: String)] = []
-            let startIdx = _lowerBound(for: prefix)
-            for i in startIdx..<_sortedKeys.count {
-                guard results.count < limit else { break }
-                let key = _sortedKeys[i]
-                guard key.hasPrefix(prefix) else { break }
-                if !lowered.isEmpty {
-                    guard key.contains(lowered) || _sortedLcValues[i].contains(lowered) else { continue }
-                }
-                results.append((chinese: _sortedValues[i], english: key))
-            }
-            return results
-        }
-    }
-
-    /// 索引里实际存在标签的命名空间 (按 namespaceToPrefix 的顺序)
-    public func availableNamespaces() -> [String] {
-        let ordered = ["female", "male", "mixed", "artist", "group", "parody",
-                       "character", "cosplayer", "language", "other", "reclass", "misc"]
-        return ordered.filter { !tags(inNamespace: $0, limit: 1).isEmpty }
     }
 
     /// 将 "namespace:tag" 格式的标签转为搜索关键词格式
@@ -458,16 +406,7 @@ public final class EhTagDatabase: @unchecked Sendable {
         _translations = newTranslations
 
         // 构建预排序索引 (用于二分查找前缀匹配, V-03)
-        //
-        // 只收全称形式（artist: / female: …），不收缩写（a: / f: …）。
-        // 两种形式在 _translations 里都要留着——按任一形式查翻译都得能命中——
-        // 但建议列表里两份是同一个标签，同时出现就是「a:machine head」和
-        // 「artist:machine head」并排，用户看到的是重复项。
-        // Android 在解析阶段就把缩写规范成全称（EhTagDatabase.parseTag 里的
-        // PREFIX_TO_NAMESPACE 查表），标签表中只有一种形式。
-        let sorted = newTranslations
-            .filter { !Self.isAbbreviatedKey($0.key) }
-            .sorted { $0.key < $1.key }
+        let sorted = newTranslations.sorted { $0.key < $1.key }
         _sortedKeys = sorted.map { $0.key }
         _sortedValues = sorted.map { $0.value }
         _sortedLcValues = sorted.map { $0.value.lowercased() }

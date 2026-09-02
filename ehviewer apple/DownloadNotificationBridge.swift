@@ -8,7 +8,6 @@
 
 import Foundation
 import EhDownload
-import EhSettings
 
 /// 桥接 DownloadManager 的监听器到 Live Activity + 通知
 final class DownloadNotificationBridge: DownloadListener, @unchecked Sendable {
@@ -22,9 +21,7 @@ final class DownloadNotificationBridge: DownloadListener, @unchecked Sendable {
         await MainActor.run {
             #if os(iOS)
             // 启动灵动岛 Live Activity (替代传统通知)
-            if AppSettings.shared.showLiveActivity {
-                DownloadLiveActivityManager.shared.startActivity(gid: gid, title: title)
-            }
+            DownloadLiveActivityManager.shared.startActivity(gid: gid, title: title)
             #else
             DownloadNotificationService.shared.onDownloadStart(gid: gid, title: title)
             #endif
@@ -35,14 +32,12 @@ final class DownloadNotificationBridge: DownloadListener, @unchecked Sendable {
         await MainActor.run {
             #if os(iOS)
             // 更新灵动岛进度 (替代传统通知轮询)
-            if AppSettings.shared.showLiveActivity {
-                DownloadLiveActivityManager.shared.updateProgress(
-                    gid: gid,
-                    downloaded: downloaded,
-                    total: total,
-                    speed: speed
-                )
-            }
+            DownloadLiveActivityManager.shared.updateProgress(
+                gid: gid,
+                downloaded: downloaded,
+                total: total,
+                speed: speed
+            )
             #else
             DownloadNotificationService.shared.onDownloadProgress(
                 gid: gid,
@@ -55,19 +50,22 @@ final class DownloadNotificationBridge: DownloadListener, @unchecked Sendable {
         }
     }
 
-    func onDownloadFinish(gid: Int64, title: String, success: Bool, isBatchFinished: Bool) async {
+    func onDownloadFinish(gid: Int64, title: String, success: Bool) async {
         await MainActor.run {
             #if os(iOS)
             // 结束灵动岛 Live Activity
-            if AppSettings.shared.showLiveActivity {
-                DownloadLiveActivityManager.shared.finishActivity(success: success, title: title)
-            }
+            DownloadLiveActivityManager.shared.finishActivity(gid: gid, success: success)
             #endif
             // 完成通知仍使用传统通知 (在通知中心保留记录)
-            DownloadNotificationService.shared.onDownloadFinish(
-                gid: gid, title: title, success: success, isBatchFinished: isBatchFinished)
-            NotificationCenter.default.post(name: .galleryDownloadChanged, object: nil,
-                                            userInfo: ["gid": gid, "downloading": true])
+            DownloadNotificationService.shared.onDownloadFinish(gid: gid, title: title, success: success)
+        }
+    }
+
+    func onDownloadPause(gid: Int64, title: String) async {
+        await MainActor.run {
+            #if os(iOS)
+            DownloadLiveActivityManager.shared.endActivity(gid: gid)
+            #endif
         }
     }
 

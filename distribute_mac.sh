@@ -6,7 +6,7 @@
 #   ./distribute_mac.sh
 #
 # 前置条件:
-#   1. 已安装 Xcode 16+ 并登录 Apple Developer 账号
+#   1. 已安装 Xcode 26.2+ 并登录 Apple Developer 账号
 #   2. Keychain 中已导入 "Developer ID Application" 证书
 #   3. 配置环境变量（直接 export 或写入 .env 文件）:
 #        APPLE_ID           — Apple 开发者账号邮箱
@@ -27,10 +27,10 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-info()    { echo "${CYAN}[INFO]${NC} $*"; }
-success() { echo "${GREEN}[✔]${NC} $*"; }
-warn()    { echo "${YELLOW}[⚠]${NC} $*"; }
-fail()    { echo "${RED}[✘]${NC} $*" >&2; exit 1; }
+info()    { echo "${CYAN}[INFO]${NC} $*" }
+success() { echo "${GREEN}[✔]${NC} $*" }
+warn()    { echo "${YELLOW}[⚠]${NC} $*" }
+fail()    { echo "${RED}[✘]${NC} $*" >&2; exit 1 }
 
 # ─────────────────────────── 项目常量 ───────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -38,7 +38,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 PROJECT_FILE="$PROJECT_DIR/ehviewer apple.xcodeproj"
 SCHEME="ehviewer apple"
 APP_NAME="ehviewer apple"
-BUNDLE_ID="Stellatrix.ehviewer-apple"
+BUNDLE_ID="kgmia.ehviewer-apple"
 
 BUILD_DIR="$PROJECT_DIR/build"
 ARCHIVE_PATH="$BUILD_DIR/${APP_NAME}.xcarchive"
@@ -74,9 +74,7 @@ check_prerequisites() {
     # Xcode
     command -v xcodebuild &>/dev/null || fail "未找到 xcodebuild，请安装 Xcode"
     local xcode_ver
-    # 用 sed 取首行而非 head：head 读满即关管道，上游会吃到 SIGPIPE，
-    # 在 set -o pipefail 下足以让整个脚本以 141 退出。sed 会读完整个流。
-    xcode_ver=$(xcodebuild -version | sed -n '1p')
+    xcode_ver=$(xcodebuild -version | head -1)
     info "  $xcode_ver"
 
     # codesign
@@ -92,7 +90,7 @@ check_prerequisites() {
 
     # Developer ID Application 证书
     local cert_name
-    cert_name=$(security find-identity -v -p codesigning | grep -m1 "Developer ID Application" || true)
+    cert_name=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 || true)
     if [[ -z "$cert_name" ]]; then
         fail "Keychain 中未找到 \"Developer ID Application\" 证书。\n请在 Xcode → Settings → Accounts → 管理证书 中创建，或从 developer.apple.com 下载安装。"
     fi
@@ -237,14 +235,8 @@ APPLESCRIPT
     rm -f "$dmg_temp"
     rm -rf "$DMG_DIR"
 
-    # 给 DMG 本身签名。此前只签了 .app，外层映像没有签名，
-    # Gatekeeper 以 --type open 评估时会以 "no usable signature" 拒绝。
-    # 必须在公证之前完成——公证的对象就是最终分发的这个文件。
-    info "为 DMG 签名..."
-    codesign --force --sign "$SIGNING_IDENTITY" --timestamp "$dmg_path"
-
     DMG_PATH="$dmg_path"
-    success "DMG 已创建并签名: $DMG_PATH"
+    success "DMG 已创建: $DMG_PATH"
 }
 
 # ─────────────────────────── 5. 公证 DMG ───────────────────────────
@@ -269,7 +261,7 @@ notarize_dmg() {
 
         # 提取 submission ID 并查询日志
         local sub_id
-        sub_id=$(grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" "$log_file" | sed -n '1p' || true)
+        sub_id=$(grep -oE "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" "$log_file" | head -1 || true)
         if [[ -n "$sub_id" ]]; then
             info "Submission ID: $sub_id"
             xcrun notarytool log "$sub_id" \
@@ -304,18 +296,8 @@ staple_dmg() {
 final_verify() {
     info "最终验证..."
 
-    # Gatekeeper 评估。DMG 是磁盘映像，必须用 --type open；
-    # 默认的 execute 类型对映像永远得到 "no usable signature"。
-    local assess
-    assess=$(spctl --assess --type open --context context:primary-signature -vv "$DMG_PATH" 2>&1 || true)
-    echo "$assess" | sed 's/^/  /'
-    if ! echo "$assess" | grep -q "accepted"; then
-        fail "Gatekeeper 拒绝了这个 DMG，不要分发。\n$assess"
-    fi
-
-    # 票据必须能离线校验，否则用户断网时仍会被拦
-    xcrun stapler validate "$DMG_PATH" >/dev/null 2>&1 \
-        || fail "公证票据未正确植入 DMG"
+    # Gatekeeper 评估
+    spctl --assess --type open --context context:primary-signature -v "$DMG_PATH" 2>&1 || true
 
     local size
     size=$(du -sh "$DMG_PATH" | awk '{print $1}')

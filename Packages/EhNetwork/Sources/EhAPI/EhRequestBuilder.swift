@@ -28,10 +28,9 @@ public enum EhRequestBuilder {
     /// 构建标准 GET 请求
     public static func buildGetRequest(
         url: URL,
-        referer: String? = nil,
-        cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy
+        referer: String? = nil
     ) -> URLRequest {
-        var request = URLRequest(url: url, cachePolicy: cachePolicy)
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyCommonHeaders(&request, referer: referer)
         return request

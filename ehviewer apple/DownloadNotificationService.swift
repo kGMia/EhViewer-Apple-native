@@ -8,6 +8,7 @@
 
 import Foundation
 import UserNotifications
+import EhSettings
 #if os(iOS)
 import UIKit
 #elseif os(macOS)
@@ -119,7 +120,7 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
         )
 
         let content = UNMutableNotificationContent()
-        content.title = "正在下载"
+        content.title = AppLocalization.localized("正在下载")
         content.body = title
         content.categoryIdentifier = "DOWNLOADING"
         content.sound = nil // 静默
@@ -151,9 +152,9 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
         if total > 0 {
             let progress = downloaded * 100 / total
             content.body = "\(downloaded)/\(total) (\(progress)%) - \(speedText)"
-            content.subtitle = "\(progress)% 完成"
+            content.subtitle = AppLocalization.format("%lld%% 完成", progress)
         } else {
-            content.body = "\(downloaded) 页 - \(speedText)"
+            content.body = AppLocalization.format("%lld 页 - %@", downloaded, speedText)
         }
 
         content.userInfo = ["gid": gid]
@@ -163,7 +164,7 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
 
     // MARK: - 下载完成通知（对应 Android onFinish）
 
-    func onDownloadFinish(gid: Int64, title: String, success: Bool, isBatchFinished: Bool = true) {
+    func onDownloadFinish(gid: Int64, title: String, success: Bool) {
         // 移除下载中通知
         removeNotification(id: downloadingNotificationId)
         currentDownloadInfo = nil
@@ -183,17 +184,17 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
 
         if completedItems.count == 1 {
             // 单个下载完成
-            content.title = success ? "下载完成" : "下载失败"
+            content.title = AppLocalization.localized(success ? "下载完成" : "下载失败")
             content.body = title
         } else {
             // 多个下载完成
-            content.title = "下载完成"
+            content.title = AppLocalization.localized("下载完成")
             if finishedCount > 0 && failedCount > 0 {
-                content.body = "\(finishedCount) 个成功，\(failedCount) 个失败"
+                content.body = AppLocalization.format("%lld 个成功，%lld 个失败", finishedCount, failedCount)
             } else if finishedCount > 0 {
-                content.body = "\(finishedCount) 个画廊下载完成"
+                content.body = AppLocalization.format("%lld 个画廊下载完成", finishedCount)
             } else {
-                content.body = "\(failedCount) 个画廊下载失败"
+                content.body = AppLocalization.format("%lld 个画廊下载失败", failedCount)
             }
 
             // 使用收件箱样式显示列表
@@ -203,7 +204,7 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
                 summaryText += "\(status) \(itemTitle)\n"
             }
             if completedItems.count > 5 {
-                summaryText += "... 还有 \(completedItems.count - 5) 个"
+                summaryText += AppLocalization.format("... 还有 %lld 个", completedItems.count - 5)
             }
             content.subtitle = summaryText.trimmingCharacters(in: .newlines)
         }
@@ -211,22 +212,14 @@ final class DownloadNotificationService: NSObject, @unchecked Sendable {
         content.userInfo = ["action": "open_downloads"]
 
         sendNotificationImmediate(id: downloadedNotificationId, content: content)
-
-        // 这一批下完了就把计数清零。不清的话下次单独下一本，
-        // 通知会把历史上所有完成过的都算进去。
-        if isBatchFinished {
-            completedItems.removeAll()
-            finishedCount = 0
-            failedCount = 0
-        }
     }
 
     // MARK: - 509错误通知（对应 Android onGet509）
 
     func on509Error() {
         let content = UNMutableNotificationContent()
-        content.title = "下载限制"
-        content.body = "已达到图片浏览限制 (509)，请稍后再试或获取更多配额"
+        content.title = AppLocalization.localized("下载限制")
+        content.body = AppLocalization.localized("已达到图片浏览限制 (509)，请稍后再试或获取更多配额")
         content.categoryIdentifier = "ERROR_509"
         content.sound = .default
 

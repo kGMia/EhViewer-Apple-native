@@ -10,41 +10,15 @@ public final class EhDatabase: Sendable {
         do {
             return try EhDatabase()
         } catch {
-            print("[EhDatabase] 初始化失败: \(error)")
+            // 数据库初始化失败时备份旧数据库后重建
+            print("[EhDatabase] 初始化失败: \(error)，尝试备份并重建...")
             let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
             let dbPath = docsDir.appendingPathComponent("eh.sqlite").path
-
-            // 只有真的是文件损坏才允许重建。
-            //
-            // 这个 catch 会接住 init 里的任何 throw，其中包括
-            // migrator.migrate()。也就是说：将来某次迁移写错一行 SQL，
-            // 这里会把它当成「数据库坏了」，删掉用户全部的下载、历史、
-            // 收藏、过滤器记录重建一个空库——一个能靠改代码修好的
-            // bug，代价变成了不可逆的数据丢失。
-            guard EhDatabase.isCorruptionError(error) else {
-                print("[EhDatabase] ⚠️ 不是文件损坏（很可能是迁移或代码问题），"
-                      + "不动用户数据，本次运行降级为内存数据库")
-                if let memory = try? EhDatabase(inMemory: true) { return memory }
-                fatalError("[EhDatabase] 内存数据库初始化失败，这是代码 bug: \(error)")
-            }
 
             // 备份损坏的数据库（保留最近一次，用户可自行恢复）
             let backupPath = docsDir.appendingPathComponent("eh.sqlite.corrupted_backup").path
             try? FileManager.default.removeItem(atPath: backupPath) // 清理旧备份
-            let backedUp: Bool
-            do {
-                try FileManager.default.copyItem(atPath: dbPath, toPath: backupPath)
-                backedUp = true
-            } catch {
-                // 备份失败（磁盘满、权限）此前是 try? 吞掉的，然后照删不误。
-                // 备份没成就不能删——留着损坏的文件至少还有抢救的余地。
-                print("[EhDatabase] ⚠️ 备份失败: \(error)，不删除原库，降级为内存数据库")
-                backedUp = false
-            }
-            guard backedUp else {
-                if let memory = try? EhDatabase(inMemory: true) { return memory }
-                fatalError("[EhDatabase] 内存数据库初始化失败，这是代码 bug: \(error)")
-            }
+            try? FileManager.default.copyItem(atPath: dbPath, toPath: backupPath)
             // 同时备份 WAL 和 SHM 文件
             try? FileManager.default.copyItem(atPath: dbPath + "-wal", toPath: backupPath + "-wal")
             try? FileManager.default.copyItem(atPath: dbPath + "-shm", toPath: backupPath + "-shm")
@@ -69,20 +43,6 @@ public final class EhDatabase: Sendable {
             }
         }
     }()
-
-    /// 这个错误是不是「文件真的坏了」。
-    ///
-    /// 只认 SQLite 明确表示文件不可读的那几个码。迁移写错、约束冲突、
-    /// 磁盘满都不算——那些不该以删库收场。
-    private static func isCorruptionError(_ error: Error) -> Bool {
-        guard let dbError = error as? DatabaseError else { return false }
-        switch dbError.resultCode.primaryResultCode {
-        case .SQLITE_CORRUPT, .SQLITE_NOTADB:
-            return true
-        default:
-            return false
-        }
-    }
 
     /// 标记是否处于降级模式（内存数据库，重启后数据丢失）
     public let isDegraded: Bool
@@ -261,18 +221,56 @@ public final class EhDatabase: Sendable {
             }
         }
 
-        migrator.registerMigration("v3") { db in
-            // 下载/历史/本地收藏三张表补 simpleTags。
-            //
-            // 这三处的列表行此前只能显示标题和封面：卡片组件支持标签 chip，
-            // 但记录里根本没存过标签，于是同一本本子在首页信息完整、
-            // 换到收藏页就只剩一个标题。列表接口本来就返回 simpleTags，
-            // 存下来即可，不需要额外请求。
-            for table in ["download", "history", "localFavorite"] {
-                try db.alter(table: table) { t in
-                    t.add(column: "simpleTags", .text)
-                }
+        migrator.registerMigration("v3-watch-later") { db in
+            // 稍后再看完全保存在本机。独立于收藏，避免同步、登录状态或
+            // 收藏夹变更影响用户临时保存的阅读队列。
+            try db.create(table: "watchLater") { t in
+                t.primaryKey("gid", .integer)
+                t.column("token", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("titleJpn", .text)
+                t.column("thumb", .text)
+                t.column("category", .integer).notNull().defaults(to: 0)
+                t.column("posted", .text)
+                t.column("uploader", .text)
+                t.column("rating", .real).defaults(to: 0)
+                t.column("simpleLanguage", .text)
+                t.column("pages", .integer).defaults(to: 0)
+                t.column("date", .integer).notNull()
             }
+        }
+
+        migrator.registerMigration("v4-favorite-metadata-index") { db in
+            try db.create(table: "favoriteMetadataIndex") { t in
+                t.column("site", .integer).notNull()
+                t.column("gid", .integer).notNull()
+                t.column("token", .text).notNull()
+                t.column("title", .text).notNull()
+                t.column("titleJpn", .text)
+                t.column("thumb", .text)
+                t.column("category", .integer).notNull().defaults(to: 0)
+                t.column("posted", .text)
+                t.column("uploader", .text)
+                t.column("rating", .real).notNull().defaults(to: 0)
+                t.column("simpleLanguage", .text)
+                t.column("pages", .integer).notNull().defaults(to: 0)
+                t.column("tagsJSON", .text)
+                t.column("favoriteSlot", .integer).notNull().defaults(to: -1)
+                t.column("serverOrder", .integer).notNull()
+                t.column("syncID", .text).notNull()
+                t.column("syncedAt", .datetime).notNull()
+                t.primaryKey(["site", "gid"])
+            }
+            try db.create(
+                index: "favoriteMetadataIndex_site_slot_order",
+                on: "favoriteMetadataIndex",
+                columns: ["site", "favoriteSlot", "serverOrder"]
+            )
+            try db.create(
+                index: "favoriteMetadataIndex_site_rating",
+                on: "favoriteMetadataIndex",
+                columns: ["site", "rating"]
+            )
         }
 
         return migrator
@@ -327,14 +325,6 @@ public final class EhDatabase: Sendable {
         }
     }
 
-    /// 按 gid 取单条历史。续读同一本时用它保住原有的标题/封面/评分——
-    /// 阅读器没有详情缓存时（从下载或收藏直接打开）只知道 gid 和 token。
-    public func getHistory(gid: Int64) throws -> HistoryRecord? {
-        try dbQueue.read { db in
-            try HistoryRecord.fetchOne(db, key: gid)
-        }
-    }
-
     public func deleteHistory(gid: Int64) throws {
         try dbQueue.write { db in
             _ = try HistoryRecord.deleteOne(db, key: gid)
@@ -385,11 +375,99 @@ public final class EhDatabase: Sendable {
         }
     }
 
+    // MARK: - 云收藏元数据索引
+
+    public func saveFavoriteMetadataPage(_ records: [FavoriteMetadataRecord]) throws {
+        guard !records.isEmpty else { return }
+        try dbQueue.write { db in
+            for record in records { try record.save(db) }
+        }
+    }
+
+    public func finishFavoriteMetadataSync(site: Int, syncID: String) throws {
+        try dbQueue.write { db in
+            try FavoriteMetadataRecord
+                .filter(Column("site") == site && Column("syncID") != syncID)
+                .deleteAll(db)
+        }
+    }
+
+    public func favoriteMetadataCount(site: Int) throws -> Int {
+        try dbQueue.read { db in
+            try FavoriteMetadataRecord.filter(Column("site") == site).fetchCount(db)
+        }
+    }
+
+    public func fetchFavoriteMetadata(
+        site: Int,
+        slot: Int? = nil,
+        query: String = "",
+        sort: FavoriteMetadataSort = .serverOrder
+    ) throws -> [FavoriteMetadataRecord] {
+        try dbQueue.read { db in
+            var request = FavoriteMetadataRecord.filter(Column("site") == site)
+            if let slot, slot >= 0 {
+                request = request.filter(Column("favoriteSlot") == slot)
+            }
+            let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalizedQuery.isEmpty {
+                let pattern = "%\(normalizedQuery)%"
+                request = request.filter(
+                    Column("title").like(pattern)
+                        || Column("titleJpn").like(pattern)
+                        || Column("uploader").like(pattern)
+                        || Column("tagsJSON").like(pattern)
+                )
+            }
+            switch sort {
+            case .serverOrder, .addedAt:
+                request = request.order(Column("serverOrder").asc)
+            case .uploadedAt:
+                request = request.order(Column("posted").desc, Column("serverOrder").asc)
+            case .rating:
+                request = request.order(Column("rating").desc, Column("serverOrder").asc)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    // MARK: - 稍后再看
+
+    public func saveToWatchLater(_ record: WatchLaterRecord) throws {
+        try dbQueue.write { db in
+            try record.save(db)
+        }
+    }
+
+    public func getAllWatchLater() throws -> [WatchLaterRecord] {
+        try dbQueue.read { db in
+            try WatchLaterRecord.order(Column("date").desc).fetchAll(db)
+        }
+    }
+
+    public func containsWatchLater(gid: Int64) throws -> Bool {
+        try dbQueue.read { db in
+            try WatchLaterRecord.fetchOne(db, key: gid) != nil
+        }
+    }
+
+    public func deleteWatchLater(gid: Int64) throws {
+        try dbQueue.write { db in
+            _ = try WatchLaterRecord.deleteOne(db, key: gid)
+        }
+    }
+
+    public func clearWatchLater() throws {
+        try dbQueue.write { db in
+            _ = try WatchLaterRecord.deleteAll(db)
+        }
+    }
+
     // MARK: - 快速搜索操作
 
     public func getAllQuickSearches() throws -> [QuickSearchRecord] {
         try dbQueue.read { db in
-            try QuickSearchRecord.order(Column("date").asc).fetchAll(db)
+            try QuickSearchRecord.order(Column("date").desc).fetchAll(db)
         }
     }
 
@@ -434,15 +512,6 @@ public final class EhDatabase: Sendable {
         }
     }
 
-    /// 原地更新一条过滤规则。
-    /// 此前切换启用状态是「删掉再插入」，id 会变、顺序会跳，
-    /// 列表看起来像是自己重排了。
-    public func updateFilter(_ record: FilterRecord) throws {
-        try dbQueue.write { db in
-            try record.update(db)
-        }
-    }
-
     public func deleteFilter(id: Int64) throws {
         try dbQueue.write { db in
             _ = try FilterRecord.deleteOne(db, key: id)
@@ -463,22 +532,6 @@ public final class EhDatabase: Sendable {
     public func updateDownloadLabel(_ record: DownloadLabelRecord) throws {
         try dbQueue.write { db in
             try record.update(db)
-        }
-    }
-
-    /// 按给定顺序重排下载标签。
-    ///
-    /// 表里没有 position 列，getAllDownloadLabels 是按 date 升序取的，
-    /// 所以这里把 date 依次改写成递增的时间戳来表达顺序——比加一列再迁移
-    /// 一次数据库便宜，排序语义也不变。
-    public func reorderDownloadLabels(_ records: [DownloadLabelRecord]) throws {
-        try dbQueue.write { db in
-            let base = Date(timeIntervalSince1970: 0)
-            for (index, record) in records.enumerated() {
-                var updated = record
-                updated.date = base.addingTimeInterval(TimeInterval(index))
-                try updated.update(db)
-            }
         }
     }
 
@@ -645,65 +698,6 @@ public final class EhDatabase: Sendable {
         }
     }
 
-    /// 把详情页解析出的标签组存进 galleryTags 表
-    ///
-    /// 这张表和 Android 的 GalleryTagsDao 对应，是"下载列表按标签搜索"的数据来源。
-    /// 以前建了表却没人写，所以搜索只能匹配标题。
-    public func saveGalleryTags(gid: Int64, groups: [GalleryTagGroup]) throws {
-        var record = GalleryTagsRecord(gid: gid)
-        record.createTime = Date()
-        record.updateTime = Date()
-
-        for group in groups {
-            // 每个命名空间的标签用逗号拼一行，和 Android 的存法一致
-            let joined = group.tags.joined(separator: ",")
-            switch group.groupName.lowercased() {
-            case "artist":     record.artist = joined
-            case "cosplayer":  record.cosplayer = joined
-            case "character":  record.character = joined
-            case "female":     record.female = joined
-            case "group":      record.group = joined
-            case "language":   record.language = joined
-            case "male":       record.male = joined
-            case "misc":       record.misc = joined
-            case "mixed":      record.mixed = joined
-            case "other":      record.other = joined
-            case "parody":     record.parody = joined
-            case "reclass":    record.reclass = joined
-            default:           break
-            }
-        }
-        record.rows = groups.map { "\($0.groupName):\($0.tags.joined(separator: ","))" }
-            .joined(separator: ";")
-
-        try insertGalleryTags(record)
-    }
-
-    /// 某本画廊的全部标签 (扁平化，含 `命名空间:标签` 和裸标签两种形式)
-    /// 供下载列表按标签搜索使用
-    public func searchableTags(gid: Int64) -> [String] {
-        guard let record = try? getGalleryTags(gid: gid) else { return [] }
-        var result: [String] = []
-        let namespaced: [(String, String?)] = [
-            ("artist", record.artist), ("cosplayer", record.cosplayer),
-            ("character", record.character), ("female", record.female),
-            ("group", record.group), ("language", record.language),
-            ("male", record.male), ("misc", record.misc),
-            ("mixed", record.mixed), ("other", record.other),
-            ("parody", record.parody), ("reclass", record.reclass),
-        ]
-        for (namespace, value) in namespaced {
-            guard let value, !value.isEmpty else { continue }
-            for tag in value.split(separator: ",") {
-                let t = tag.trimmingCharacters(in: .whitespaces)
-                guard !t.isEmpty else { continue }
-                result.append(t)
-                result.append("\(namespace):\(t)")
-            }
-        }
-        return result
-    }
-
     public func insertGalleryTags(_ record: GalleryTagsRecord) throws {
         try dbQueue.write { db in
             try record.save(db)
@@ -834,8 +828,6 @@ public struct DownloadRecord: Codable, FetchableRecord, PersistableRecord, Senda
     public var rating: Float
     public var simpleLanguage: String?
     public var pages: Int
-    /// 列表接口返回的简易标签，供列表行显示 chip
-    public var simpleTags: [String]?
     public var state: Int
     public var legacy: Int
     public var date: Date
@@ -869,8 +861,6 @@ public struct HistoryRecord: Codable, FetchableRecord, PersistableRecord, Sendab
     public var rating: Float
     public var simpleLanguage: String?
     public var pages: Int
-    /// 列表接口返回的简易标签，供列表行显示 chip
-    public var simpleTags: [String]?
     public var mode: Int
     public var date: Date
 
@@ -901,14 +891,119 @@ public struct LocalFavoriteRecord: Codable, FetchableRecord, PersistableRecord, 
     public var rating: Float
     public var simpleLanguage: String?
     public var pages: Int
-    /// 列表接口返回的简易标签，供列表行显示 chip
-    public var simpleTags: [String]?
     public var date: Date
 
     public init(gid: Int64, token: String, title: String, category: Int = 0,
                 pages: Int = 0, date: Date = .init()) {
         self.gid = gid; self.token = token; self.title = title
         self.category = category; self.pages = pages; self.date = date; self.rating = 0
+    }
+}
+
+public enum FavoriteMetadataSort: String, Codable, Sendable, CaseIterable {
+    case serverOrder
+    case uploadedAt
+    case addedAt
+    case rating
+}
+
+/// Complete local metadata mirror of cloud favorites. `syncID` makes page-wise
+/// background updates crash-safe: old rows are removed only after every cursor
+/// page has been stored successfully.
+public struct FavoriteMetadataRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    public static let databaseTableName = "favoriteMetadataIndex"
+
+    public var site: Int
+    public var gid: Int64
+    public var token: String
+    public var title: String
+    public var titleJpn: String?
+    public var thumb: String?
+    public var category: Int
+    public var posted: String?
+    public var uploader: String?
+    public var rating: Float
+    public var simpleLanguage: String?
+    public var pages: Int
+    public var tagsJSON: String?
+    public var favoriteSlot: Int
+    public var serverOrder: Int
+    public var syncID: String
+    public var syncedAt: Date
+
+    public init(
+        site: Int,
+        gid: Int64,
+        token: String,
+        title: String,
+        titleJpn: String? = nil,
+        thumb: String? = nil,
+        category: Int = 0,
+        posted: String? = nil,
+        uploader: String? = nil,
+        rating: Float = 0,
+        simpleLanguage: String? = nil,
+        pages: Int = 0,
+        tagsJSON: String? = nil,
+        favoriteSlot: Int = -1,
+        serverOrder: Int,
+        syncID: String,
+        syncedAt: Date = Date()
+    ) {
+        self.site = site
+        self.gid = gid
+        self.token = token
+        self.title = title
+        self.titleJpn = titleJpn
+        self.thumb = thumb
+        self.category = category
+        self.posted = posted
+        self.uploader = uploader
+        self.rating = rating
+        self.simpleLanguage = simpleLanguage
+        self.pages = pages
+        self.tagsJSON = tagsJSON
+        self.favoriteSlot = favoriteSlot
+        self.serverOrder = serverOrder
+        self.syncID = syncID
+        self.syncedAt = syncedAt
+    }
+}
+
+public struct WatchLaterRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    public static let databaseTableName = "watchLater"
+
+    public var gid: Int64
+    public var token: String
+    public var title: String
+    public var titleJpn: String?
+    public var thumb: String?
+    public var category: Int
+    public var posted: String?
+    public var uploader: String?
+    public var rating: Float
+    public var simpleLanguage: String?
+    public var pages: Int
+    public var date: Date
+
+    public init(
+        gid: Int64, token: String, title: String, titleJpn: String? = nil,
+        thumb: String? = nil, category: Int = 0, posted: String? = nil,
+        uploader: String? = nil, rating: Float = 0, simpleLanguage: String? = nil,
+        pages: Int = 0, date: Date = .init()
+    ) {
+        self.gid = gid
+        self.token = token
+        self.title = title
+        self.titleJpn = titleJpn
+        self.thumb = thumb
+        self.category = category
+        self.posted = posted
+        self.uploader = uploader
+        self.rating = rating
+        self.simpleLanguage = simpleLanguage
+        self.pages = pages
+        self.date = date
     }
 }
 

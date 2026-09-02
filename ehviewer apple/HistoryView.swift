@@ -13,18 +13,28 @@ import EhSettings
 struct HistoryView: View {
     @State private var vm = HistoryViewModel()
     @State private var searchText = ""
-    /// 搜索以按钮形态存在，点开才展开输入框——设计稿的默认状态没有搜索栏
-    @State private var isSearching = false
-    /// 点续读钮时直接开阅读器，不经详情页
-    @State private var resumeItem: ReaderLaunchItem?
-    /// 待选收藏夹的画廊（没设默认收藏夹时）
-    @State private var pendingFavorite: GalleryInfo?
+    @State private var favoritePickerGallery: GalleryInfo?
 
     /// 被推入父导航栈时，不创建自己的 NavigationStack，避免嵌套
     private var isPushed: Bool = false
+    /// 宽屏分栏中由父视图持有详情选择。
+    private var externalSelection: Binding<GalleryInfo?>?
 
     init(isPushed: Bool = false) {
         self.isPushed = isPushed
+    }
+
+    init(selection: Binding<GalleryInfo?>) {
+        self.isPushed = true
+        self.externalSelection = selection
+    }
+
+    private var floatingHeaderInset: CGFloat {
+        #if os(macOS)
+        60
+        #else
+        isPushed ? 60 : 0
+        #endif
     }
 
     var body: some View {
@@ -34,62 +44,99 @@ struct HistoryView: View {
             } else {
                 NavigationStack {
                     historyInnerContent
-                        .navigationDestination(for: GalleryInfo.self) { gallery in
-                            GalleryDetailView(gallery: gallery)
-                                .id(gallery.gid)
-                        }
                 }
             }
         }
         .task {
-            vm.loadHistory()
+            await vm.loadHistory()
         }
-        // 阅读器/详情页写入历史后要跟着变——此前切回历史页还是旧的
-        .onReceive(NotificationCenter.default.publisher(for: .galleryHistoryChanged)) { _ in
-            vm.loadHistory()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .galleryFavoriteChanged)) { _ in
-            vm.loadHistory()
+        .sheet(item: $favoritePickerGallery) { gallery in
+            FavoriteSlotPicker(
+                onSelect: { slot in
+                    favoritePickerGallery = nil
+                    addFavorite(gallery, to: slot)
+                },
+                onCancel: { favoritePickerGallery = nil }
+            )
+            #if os(iOS)
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+            #endif
         }
     }
 
     private var historyInnerContent: some View {
-        VStack(spacing: 0) {
-            // 紧凑页头：标题与动作同一行。系统大标题会先留一条空导航栏带
-            // 再放标题，两处加起来白白吃掉近百点垂直空间。
-            EhPageHeader(title: "阅读历史") {
-                EhSearchToggleButton(isActive: $isSearching)
-                if !vm.records.isEmpty {
-                    Button("清空", role: .destructive) { vm.showClearConfirm = true }
-                        .font(.system(size: 15))
-                        .foregroundStyle(EhColor.danger)
-                }
-            }
-
+        ZStack(alignment: .top) {
             Group {
                 if filteredRecords.isEmpty {
                     if searchText.isEmpty {
-                        EhStateView(kind: .empty(
-                            symbol: "clock",
-                            title: "还没有阅读记录",
-                            message: "浏览过的画廊会出现在这里"
-                        ))
+                        ContentUnavailableView("暂无历史记录",
+                            systemImage: "clock",
+                            description: Text("浏览过的画廊会显示在这里"))
                     } else {
-                        EhStateView(kind: .empty(
-                            symbol: "magnifyingglass",
-                            title: "没有匹配的记录",
-                            message: "换个关键词，或清空搜索看全部历史"
-                        ))
+                        ContentUnavailableView.search(text: searchText)
                     }
                 } else {
                     historyList
                 }
             }
+            .padding(.top, filteredRecords.isEmpty ? floatingHeaderInset : 0)
+
+            Group {
+                if isPushed {
+                    ContentColumnSearchBar(text: $searchText, prompt: "搜索历史", isFloating: true) {
+                        if !vm.records.isEmpty {
+                            Button(role: .destructive) {
+                                vm.showClearConfirm = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .frame(width: 40, height: 40)
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.red)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                            .help("清空历史")
+                            .accessibilityLabel("清空历史")
+                        }
+                    }
+                } else {
+                    #if os(macOS)
+                    ContentColumnSearchBar(text: $searchText, prompt: "搜索历史", isFloating: true) {
+                        if !vm.records.isEmpty {
+                            Button(role: .destructive) {
+                                vm.showClearConfirm = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .frame(width: 40, height: 40)
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.red)
+                            .glassEffect(.regular.interactive(), in: .circle)
+                            .help("清空历史")
+                            .accessibilityLabel("清空历史")
+                        }
+                    }
+                    #endif
+                }
+            }
+            .zIndex(10)
         }
-            // 去掉 .searchable：iOS 26 把搜索栏放在屏幕**底部**，
-            // 于是它和浮起导航条重叠，键盘弹出后也没有收起的落点。
-            .ehPageSearch(isActive: $isSearching, text: $searchText, placeholder: "搜索历史")
-            .ehCompactHeader()
+            .navigationTitle("历史")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            .searchableWhen(!isPushed, text: $searchText, prompt: "搜索历史")
+            .toolbar {
+                if !isPushed && !vm.records.isEmpty {
+                    ToolbarItem(placement: .automatic) {
+                        Button("清空", role: .destructive) {
+                            vm.showClearConfirm = true
+                        }
+                    }
+                }
+            }
+            #endif
             .confirmationDialog("确认清空所有历史记录？", isPresented: $vm.showClearConfirm, titleVisibility: .visible) {
                 Button("清空", role: .destructive) {
                     vm.clearAll()
@@ -109,110 +156,40 @@ struct HistoryView: View {
         }
     }
 
-    /// 按「今天 / 昨天 / 更早」分组。
-    ///
-    /// 历史页去掉了搜索框（见 body 处的说明），检索改由时间分组承担——
-    /// 找一本刚看过的书，「今天」这一段比在搜索框里回忆标题快。
-    private var groupedRecords: [(title: String, records: [HistoryRecord])] {
-        let cal = Calendar.current
-        var today: [HistoryRecord] = []
-        var yesterday: [HistoryRecord] = []
-        var earlier: [HistoryRecord] = []
-        for r in filteredRecords {
-            if cal.isDateInToday(r.date) { today.append(r) }
-            else if cal.isDateInYesterday(r.date) { yesterday.append(r) }
-            else { earlier.append(r) }
-        }
-        return [("今天", today), ("昨天", yesterday), ("更早", earlier)]
-            .filter { !$0.1.isEmpty }
-    }
-
     private var historyList: some View {
         List {
-            ForEach(groupedRecords, id: \.title) { group in
-                Section {
-                    historyRows(group.records)
-                } header: {
-                    Text(group.title).ehSectionHeader()
-                }
-            }
-        }
-        .listStyle(.plain)
-        .sheet(item: $pendingFavorite) { gallery in
-            FavoriteSlotPicker(
-                onSelect: { slot in
-                    pendingFavorite = nil
-                    Task {
-                        if slot == -1 {
-                            GalleryActionService.shared.addLocalFavorite(gallery: gallery)
-                        } else {
-                            try? await GalleryActionService.shared.addFavorite(
-                                gid: gallery.gid, token: gallery.token, slot: slot
-                            )
+            Color.clear
+                .frame(height: floatingHeaderInset)
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+            ForEach(filteredRecords, id: \.gid) { record in
+                Group {
+                    if let externalSelection {
+                        Button {
+                            externalSelection.wrappedValue = record.galleryInfo
+                        } label: {
+                            historyRow(record)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        NavigationLink(value: record.galleryInfo) {
+                            historyRow(record)
                         }
                     }
-                },
-                onCancel: { pendingFavorite = nil }
-            )
-        }
-        #if os(iOS)
-        .ehTabBarAutoHide()
-        .fullScreenCover(item: $resumeItem) { item in
-            ImageReaderView(
-                gid: item.gid, token: item.token,
-                pages: item.pages, initialPage: item.initialPage
-            )
-        }
-        #endif
-    }
-
-    @ViewBuilder
-    private func historyRows(_ records: [HistoryRecord]) -> some View {
-        Group {
-            ForEach(records, id: \.gid) { record in
-                // 零透明链接垫底，避免 List 给 NavigationLink 自动补 disclosure 箭头
-                ZStack {
-                    NavigationLink(value: record.toGalleryInfo()) { EmptyView() }
-                        .opacity(0)
-
-                    EhGalleryRow(
-                        gallery: record.toGalleryInfo(),
-                        // 历史页的第二行放「什么时候看的」而不是上传者——
-                        // 这一页是按时间组织的，上传者在这里没有导航价值
-                        subtitleOverride: formattedTime(record.date),
-                        // 历史页最主要的动作就是接着上次读，
-                        // 让它有个独立落点而不是只能整行点进详情
-                        accessory: AnyView(
-                            EhRowActionButton(symbol: "play.fill") {
-                                resumeItem = ReaderLaunchItem(
-                                    gid: record.gid, token: record.token,
-                                    pages: record.pages, previewSet: nil,
-                                    initialPage: UserDefaults.standard.object(
-                                        forKey: "reading_progress_\(record.gid)"
-                                    ) as? Int
-                                )
-                            }
-                        )
-                    )
                 }
-                .overlay(alignment: .bottom) { EhHairline() }
                 .contextMenu {
                     // 对齐 Android HistoryScene 长按菜单
                     Button {
-                        Task { await GalleryActionService.shared.startDownload(gallery: record.toGalleryInfo()) }
+                        Task { await GalleryActionService.shared.startDownload(gallery: record.galleryInfo) }
                     } label: {
                         Label("下载", systemImage: "arrow.down.circle")
                     }
 
                     Button {
-                        // 没设默认收藏夹时要弹选择器——此前这里丢掉了返回值，
-                        // 历史页长按「收藏」和列表页一样毫无反应
-                        let gallery = record.toGalleryInfo()
-                        Task {
-                            if await GalleryActionService.shared.quickFavorite(gallery: gallery) == .needsPicker {
-                                pendingFavorite = gallery
-                            }
-                        }
+                        performFavoriteToggle(record.galleryInfo)
                     } label: {
                         Label("收藏", systemImage: "heart")
                     }
@@ -227,41 +204,77 @@ struct HistoryView: View {
                 }
             }
             .onDelete { indexSet in
-                // indexSet 是分组内的下标，删除前换算回全局记录
-                let gids = indexSet.map { records[$0].gid }
-                for gid in gids { vm.deleteByGid(gid) }
+                let gids = indexSet.map { filteredRecords[$0].gid }
+                vm.delete(gids: gids)
+            }
+        }
+        .listStyle(.plain)
+        .navigationDestination(for: GalleryInfo.self) { gallery in
+            GalleryDetailView(gallery: gallery)
+        }
+    }
+
+    private func performFavoriteToggle(_ gallery: GalleryInfo) {
+        let service = GalleryActionService.shared
+        if !service.isFavorited(gallery), AppSettings.shared.defaultFavSlot == -2 {
+            favoritePickerGallery = gallery
+        } else {
+            Task { await service.toggleFavorite(gallery) }
+        }
+    }
+
+    private func addFavorite(_ gallery: GalleryInfo, to slot: Int) {
+        Task {
+            do {
+                if slot == -1 {
+                    try await GalleryActionService.shared.addLocalFavorite(gallery: gallery)
+                } else {
+                    try await GalleryActionService.shared.addFavorite(
+                        gid: gallery.gid,
+                        token: gallery.token,
+                        slot: slot
+                    )
+                }
+                Haptics.success()
+            } catch {
+                ErrorHandler.shared.handle(error, context: "HistoryFavorite")
             }
         }
     }
 
-    /// 0...1 的阅读进度；没读过或页数未知则不显示
-    private func readProgress(for record: HistoryRecord) -> Double? {
-        guard record.pages > 0,
-              let index = UserDefaults.standard.object(
-                forKey: "reading_progress_\(record.gid)"
-              ) as? Int, index > 0 else { return nil }
-        return Double(index + 1) / Double(record.pages)
+    private func historyRow(_ record: HistoryRecord) -> some View {
+        HStack(spacing: 12) {
+            CachedAsyncImage(url: ThumbnailURLResolver.url(
+                for: record.thumb,
+                fixLegacy: AppSettings.shared.fixThumbUrl,
+                site: AppSettings.shared.gallerySite
+            )) { img in
+                img.resizable().aspectRatio(contentMode: .fill)
+            } placeholder: {
+                Color(.tertiarySystemFill)
+            }
+            .frame(width: 52, height: 72)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.titleJpn ?? record.title)
+                    .font(.subheadline)
+                    .lineLimit(2)
+
+                Text(formattedTime(record.date))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
     }
 
     private func formattedTime(_ date: Date) -> String {
         let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.locale = AppLocalization.locale
         return formatter.localizedString(for: date, relativeTo: Date())
-    }
-}
-
-// MARK: - HistoryRecord Extension
-
-extension HistoryRecord {
-    func toGalleryInfo() -> GalleryInfo {
-        GalleryInfo(
-            gid: gid, token: token,
-            title: title, titleJpn: titleJpn, thumb: thumb,
-            category: EhCategory(rawValue: category),
-            posted: posted, uploader: uploader,
-            rating: rating, pages: pages,
-            simpleTags: simpleTags, simpleLanguage: simpleLanguage
-        )
     }
 }
 
@@ -273,60 +286,79 @@ class HistoryViewModel {
     var records: [HistoryRecord] = []
     var showClearConfirm = false
 
-    func loadHistory() {
+    func loadHistory() async {
+        let limit = AppSettings.shared.historyInfoSize
         do {
-            records = try EhDatabase.shared.getAllHistory(limit: AppSettings.shared.historyInfoSize)
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                try EhDatabase.shared.getAllHistory(limit: limit)
+            }.value
+            guard !Task.isCancelled else { return }
+            records = loaded
         } catch {
             debugLog("Failed to load history: \(error)")
         }
     }
 
-    func delete(at offsets: IndexSet) {
-        for index in offsets {
-            let record = records[index]
+    func delete(gids: [Int64]) {
+        records.removeAll { gids.contains($0.gid) }
+        Task {
             do {
-                try EhDatabase.shared.deleteHistory(gid: record.gid)
+                try await Task.detached(priority: .utility) {
+                    for gid in gids {
+                        try EhDatabase.shared.deleteHistory(gid: gid)
+                    }
+                }.value
+                NotificationCenter.default.post(name: .ehHistoryDidChange, object: nil)
             } catch {
                 debugLog("Failed to delete history: \(error)")
+                await loadHistory()
             }
         }
-        records.remove(atOffsets: offsets)
     }
 
     func deleteByGid(_ gid: Int64) {
-        do {
-            try EhDatabase.shared.deleteHistory(gid: gid)
-            records.removeAll { $0.gid == gid }
-        } catch {
-            debugLog("Failed to delete history: \(error)")
+        records.removeAll { $0.gid == gid }
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try EhDatabase.shared.deleteHistory(gid: gid)
+                }.value
+                NotificationCenter.default.post(name: .ehHistoryDidChange, object: nil)
+            } catch {
+                debugLog("Failed to delete history: \(error)")
+                await loadHistory()
+            }
         }
     }
 
     func clearAll() {
-        do {
-            try EhDatabase.shared.clearHistory()
-            records.removeAll()
-        } catch {
-            debugLog("Failed to clear history: \(error)")
+        let previousRecords = records
+        records.removeAll()
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try EhDatabase.shared.clearHistory()
+                }.value
+                NotificationCenter.default.post(name: .ehHistoryDidChange, object: nil)
+            } catch {
+                debugLog("Failed to clear history: \(error)")
+                records = previousRecords
+            }
         }
     }
 
     func addRecord(_ gallery: GalleryInfo) {
-        var record = HistoryRecord(
-            gid: gallery.gid, token: gallery.token,
-            title: gallery.bestTitle, category: gallery.category.rawValue,
-            pages: gallery.pages, mode: 0, date: Date()
-        )
-        record.titleJpn = gallery.titleJpn
-        record.thumb = gallery.thumb
-        record.uploader = gallery.uploader
-        record.rating = gallery.rating
-        do {
-            try EhDatabase.shared.insertHistory(record)
-            // 重新加载以保持顺序
-            loadHistory()
-        } catch {
-            debugLog("Failed to add history: \(error)")
+        let record = gallery.historyRecord()
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try EhDatabase.shared.insertHistory(record)
+                }.value
+                NotificationCenter.default.post(name: .ehHistoryDidChange, object: nil)
+                await loadHistory()
+            } catch {
+                debugLog("Failed to add history: \(error)")
+            }
         }
     }
 }

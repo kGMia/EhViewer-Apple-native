@@ -1,0 +1,14 @@
+"在 ${applicationName} 中打开 ${section}" = "在 ${applicationName} 中開啟 ${section}";
+"用 ${applicationName} 打开 ${section}" = "使用 ${applicationName} 開啟 ${section}";
+"使用 ${applicationName} 搜索画廊" = "使用 ${applicationName} 搜尋畫廊";
+"在 ${applicationName} 中搜索画廊" = "在 ${applicationName} 中搜尋畫廊";
+"在 ${applicationName} 中打开收藏" = "在 ${applicationName} 中開啟收藏";
+"用 ${applicationName} 查看收藏" = "使用 ${applicationName} 檢視收藏";
+"在 ${applicationName} 中打开下载" = "在 ${applicationName} 中開啟下載";
+"用 ${applicationName} 查看下载" = "使用 ${applicationName} 檢視下載";
+"在 ${applicationName} 中打开历史" = "在 ${applicationName} 中開啟歷史記錄";
+"用 ${applicationName} 查看历史" = "使用 ${applicationName} 檢視歷史記錄";
+"在 ${applicationName} 中打开订阅" = "在 ${applicationName} 中開啟訂閱";
+"用 ${applicationName} 查看订阅" = "使用 ${applicationName} 檢視訂閱";
+"在 ${applicationName} 中继续阅读" = "在 ${applicationName} 中繼續閱讀";
+"用 ${applicationName} 继续阅读" = "使用 ${applicationName} 繼續閱讀";

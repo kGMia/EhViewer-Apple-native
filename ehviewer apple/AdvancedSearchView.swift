@@ -7,6 +7,8 @@
 
 import SwiftUI
 import EhModels
+import EhDatabase
+import EhSettings
 
 // MARK: - 搜索模式
 
@@ -18,10 +20,13 @@ enum SearchMode: Int, CaseIterable {
 
     var label: String {
         switch self {
-        case .normal:       return "Normal search"
-        case .subscription: return "Subscription search"
-        case .uploader:     return "Specify uploader"
-        case .tag:          return "Specify tag"
+        // 这里返回的是动态 String，SwiftUI 不会像字符串字面量一样自动
+        // 通过 LocalizedStringKey 查表；直接使用当前首选语言可确保分段控件
+        // 与原生菜单保持一致。后续增加语言时只需把它改为 String(localized:)。
+        case .normal:       return AppLocalization.localized("普通搜索")
+        case .subscription: return AppLocalization.localized("订阅搜索")
+        case .uploader:     return AppLocalization.localized("指定上传者")
+        case .tag:          return AppLocalization.localized("指定标签")
         }
     }
 
@@ -45,16 +50,16 @@ private struct CategoryItem: Identifiable {
 }
 
 private let categoryGrid: [[CategoryItem]] = [
-    [CategoryItem(category: .doujinshi, name: "Doujinshi", color: Color(red: 0.957, green: 0.263, blue: 0.212)),
-     CategoryItem(category: .manga,     name: "Manga",     color: Color(red: 1.0,   green: 0.596, blue: 0.0))],
-    [CategoryItem(category: .artistCG,  name: "Artist CG", color: Color(red: 0.984, green: 0.753, blue: 0.176)),
-     CategoryItem(category: .gameCG,    name: "Game CG",   color: Color(red: 0.298, green: 0.686, blue: 0.314))],
-    [CategoryItem(category: .western,   name: "Western",   color: Color(red: 0.545, green: 0.765, blue: 0.290)),
-     CategoryItem(category: .nonH,      name: "Non-H",     color: Color(red: 0.129, green: 0.588, blue: 0.953))],
-    [CategoryItem(category: .imageSet,  name: "Image Set", color: Color(red: 0.247, green: 0.318, blue: 0.710)),
+    [CategoryItem(category: .doujinshi, name: "同人志", color: Color(red: 0.957, green: 0.263, blue: 0.212)),
+     CategoryItem(category: .manga,     name: "漫画",   color: Color(red: 1.0,   green: 0.596, blue: 0.0))],
+    [CategoryItem(category: .artistCG,  name: "画师 CG", color: Color(red: 0.984, green: 0.753, blue: 0.176)),
+     CategoryItem(category: .gameCG,    name: "游戏 CG", color: Color(red: 0.298, green: 0.686, blue: 0.314))],
+    [CategoryItem(category: .western,   name: "欧美", color: Color(red: 0.545, green: 0.765, blue: 0.290)),
+     CategoryItem(category: .nonH,      name: "非 H", color: Color(red: 0.129, green: 0.588, blue: 0.953))],
+    [CategoryItem(category: .imageSet,  name: "图集", color: Color(red: 0.247, green: 0.318, blue: 0.710)),
      CategoryItem(category: .cosplay,   name: "Cosplay",   color: Color(red: 0.612, green: 0.153, blue: 0.690))],
-    [CategoryItem(category: .asianPorn, name: "Asian Porn", color: Color(red: 0.585, green: 0.459, blue: 0.804)),
-     CategoryItem(category: .misc,      name: "Misc",      color: Color(red: 0.941, green: 0.384, blue: 0.573))],
+    [CategoryItem(category: .asianPorn, name: "亚洲", color: Color(red: 0.585, green: 0.459, blue: 0.804)),
+     CategoryItem(category: .misc,      name: "杂项", color: Color(red: 0.941, green: 0.384, blue: 0.573))],
 ]
 
 // MARK: - AdvancedSearchState
@@ -85,6 +90,58 @@ class AdvancedSearchState {
     var pageTo = ""
 
     var isEnabled: Bool { enableAdvance }
+
+    /// Keep the persistent Search section's controls in sync with a search submitted
+    /// from another feed. Values are copied rather than sharing the source view's state.
+    func copyValues(from source: AdvancedSearchState) {
+        searchMode = source.searchMode
+        selectedCategories = source.selectedCategories
+        enableAdvance = source.enableAdvance
+        searchGalleryName = source.searchGalleryName
+        searchGalleryTags = source.searchGalleryTags
+        searchGalleryDescription = source.searchGalleryDescription
+        searchTorrentFilenames = source.searchTorrentFilenames
+        onlyShowWithTorrents = source.onlyShowWithTorrents
+        searchLowPowerTags = source.searchLowPowerTags
+        searchDownvotedTags = source.searchDownvotedTags
+        searchExpungedGalleries = source.searchExpungedGalleries
+        disableLanguageFilter = source.disableLanguageFilter
+        disableUploaderFilter = source.disableUploaderFilter
+        disableTagFilter = source.disableTagFilter
+        enableMinRating = source.enableMinRating
+        minRating = source.minRating
+        enablePageRange = source.enablePageRange
+        pageFrom = source.pageFrom
+        pageTo = source.pageTo
+    }
+
+
+    func copyValues(from record: QuickSearchRecord) {
+        selectedCategories = record.category == 0 ? EhCategory.all.rawValue : record.category
+        enableAdvance = record.advanceSearch > 0
+        searchGalleryName = record.advanceSearch < 0 || record.advanceSearch & 0x001 != 0
+        searchGalleryTags = record.advanceSearch < 0 || record.advanceSearch & 0x002 != 0
+        searchGalleryDescription = record.advanceSearch & 0x004 != 0
+        searchTorrentFilenames = record.advanceSearch & 0x008 != 0
+        onlyShowWithTorrents = record.advanceSearch & 0x010 != 0
+        searchLowPowerTags = record.advanceSearch & 0x020 != 0
+        searchDownvotedTags = record.advanceSearch & 0x040 != 0
+        searchExpungedGalleries = record.advanceSearch & 0x080 != 0
+        disableLanguageFilter = record.advanceSearch & 0x100 != 0
+        disableUploaderFilter = record.advanceSearch & 0x200 != 0
+        disableTagFilter = record.advanceSearch & 0x400 != 0
+        enableMinRating = record.minRating > 0
+        minRating = max(1, record.minRating)
+        enablePageRange = record.pageFrom > 0 || record.pageTo > 0
+        pageFrom = record.pageFrom > 0 ? String(record.pageFrom) : ""
+        pageTo = record.pageTo > 0 ? String(record.pageTo) : ""
+        switch record.mode {
+        case 5: searchMode = .subscription
+        case 1: searchMode = .uploader
+        case 2: searchMode = .tag
+        default: searchMode = .normal
+        }
+    }
 
     func isCategorySelected(_ cat: EhCategory) -> Bool {
         selectedCategories & cat.rawValue != 0
@@ -295,7 +352,7 @@ struct AdvancedSearchView: View {
 
     private func categoryButton(_ item: CategoryItem) -> some View {
         let isSelected = state.isCategorySelected(item.category)
-        return Text(item.name)
+        return Text(LocalizedStringKey(item.name))
             .font(.caption.bold())
             .lineLimit(1)
             .minimumScaleFactor(0.7)

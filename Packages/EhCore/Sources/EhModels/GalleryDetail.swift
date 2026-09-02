@@ -89,13 +89,64 @@ public struct GalleryDetail: Sendable, Codable {
 
 // MARK: - 标签组
 
+public enum GalleryTagVoteStatus: String, Sendable, Codable {
+    case none
+    case up
+    case down
+}
+
+public enum GalleryTagPowerStatus: String, Sendable, Codable {
+    case solid
+    case active
+    case weak
+}
+
+public struct GalleryTagMetadata: Sendable, Codable {
+    public var power: GalleryTagPowerStatus
+    public var vote: GalleryTagVoteStatus
+
+    public init(
+        power: GalleryTagPowerStatus = .active,
+        vote: GalleryTagVoteStatus = .none
+    ) {
+        self.power = power
+        self.vote = vote
+    }
+}
+
 public struct GalleryTagGroup: Sendable, Codable {
     public var groupName: String  // 命名空间: "artist", "female", "male", etc.
     public var tags: [String]
+    /// Keyed by the raw tag text (without namespace). Kept separate from
+    /// `tags` so existing callers and cached data remain source-compatible.
+    public var metadata: [String: GalleryTagMetadata]
 
-    public init(groupName: String = "", tags: [String] = []) {
+    public init(
+        groupName: String = "",
+        tags: [String] = [],
+        metadata: [String: GalleryTagMetadata] = [:]
+    ) {
         self.groupName = groupName
         self.tags = tags
+        self.metadata = metadata
+    }
+
+    public func metadata(for tag: String) -> GalleryTagMetadata {
+        metadata[tag] ?? GalleryTagMetadata()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case groupName, tags, metadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        groupName = try container.decodeIfPresent(String.self, forKey: .groupName) ?? ""
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        metadata = try container.decodeIfPresent(
+            [String: GalleryTagMetadata].self,
+            forKey: .metadata
+        ) ?? [:]
     }
 }
 
@@ -142,7 +193,7 @@ public struct GalleryCommentList: Sendable, Codable {
 
 // MARK: - 预览集 (对应 Android NormalPreviewSet / LargePreviewSet)
 
-public enum PreviewSet: Sendable, Codable {
+public enum PreviewSet: Sendable, Codable, Hashable {
     /// 雪碧图模式: 单张大图裁剪出多个预览
     case normal([NormalPreview])
     /// 独立大图模式: 每个预览一张图
@@ -174,7 +225,7 @@ public enum PreviewSet: Sendable, Codable {
     }
 }
 
-public struct NormalPreview: Sendable, Codable {
+public struct NormalPreview: Sendable, Codable, Hashable {
     public var position: Int
     public var imageUrl: String
     public var pageUrl: String
@@ -191,7 +242,7 @@ public struct NormalPreview: Sendable, Codable {
     }
 }
 
-public struct LargePreview: Sendable, Codable {
+public struct LargePreview: Sendable, Codable, Hashable {
     public var position: Int
     public var imageUrl: String
     public var pageUrl: String
