@@ -77,6 +77,46 @@ public actor SpiderDen {
         }
     }
 
+    // MARK: - Reader cache access
+
+    /// Returns compressed source bytes from the bounded reader cache.
+    public static func cachedImageData(gid: Int64, page: Int) -> Data? {
+        readCache?.getData(forKey: "image_\(gid)_\(page)")
+    }
+
+    /// Stores compressed source bytes in Caches rather than the permanent
+    /// download directory. SimpleDiskCache applies the user's capacity limit.
+    @discardableResult
+    public static func cacheImageData(_ data: Data, gid: Int64, page: Int) -> Bool {
+        guard !data.isEmpty else { return false }
+        return readCache?.set(data, forKey: "image_\(gid)_\(page)") ?? false
+    }
+
+    public static func readCacheUsage() -> Int64 {
+        let directory = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first?.appendingPathComponent("spider_image")
+        guard let directory,
+              let enumerator = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: [.fileSizeKey]
+              ) else { return 0 }
+
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            total += Int64(
+                (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            )
+        }
+        return total
+    }
+
+    public static func clearReadCache() {
+        guard let cache = readCache else { return }
+        cache.removeAll()
+    }
+
     public init(galleryInfo: GalleryInfo) {
         self.gid = galleryInfo.gid
         self.downloadDir = Self.getGalleryDownloadDir(galleryInfo: galleryInfo)
@@ -497,6 +537,18 @@ final class SimpleDiskCache: @unchecked Sendable {
                 return true
             } catch {
                 return false
+            }
+        }
+    }
+
+    func removeAll() {
+        queue.sync {
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            ) else { return }
+            for file in files {
+                try? FileManager.default.removeItem(at: file)
             }
         }
     }

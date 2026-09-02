@@ -1356,10 +1356,13 @@ class SettingsViewModel {
 
     func calculateCacheSize() {
         let urlCacheSize = URLCache.shared.currentDiskUsage
+        let readerCacheSize = SpiderDen.readCacheUsage()
         let byteFormatter = ByteCountFormatter()
         byteFormatter.allowedUnits = [.useMB, .useGB]
         byteFormatter.countStyle = .file
-        diskCacheSize = byteFormatter.string(fromByteCount: Int64(urlCacheSize))
+        diskCacheSize = byteFormatter.string(
+            fromByteCount: Int64(urlCacheSize) + readerCacheSize
+        )
     }
 
     func clearCache() {
@@ -1369,6 +1372,7 @@ class SettingsViewModel {
         ReaderViewModel.clearDecodedImageCache()
         // 清除 URL 磁盘缓存
         URLCache.shared.removeAllCachedResponses()
+        SpiderDen.clearReadCache()
         calculateCacheSize()
     }
 

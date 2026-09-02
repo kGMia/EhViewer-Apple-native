@@ -1283,7 +1283,7 @@ struct ImageReaderView: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: 300)
-        } else if let cachedImage = vm.cachedImages[index] {
+        } else if let cachedImage = vm.image(at: index) {
             let imgSize = cachedImage.size
             let ratio = imgSize.width > 0 ? imgSize.height / imgSize.width : 1.0
             readerImageContextMenu(for: [index]) {
@@ -1367,7 +1367,7 @@ struct ImageReaderView: View {
                     .buttonStyle(.glassProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let cachedImage = vm.cachedImages[index] {
+            } else if let cachedImage = vm.image(at: index) {
                 readerImageContextMenu(for: [index]) {
                     ZoomableImageView(
                         image: cachedImage,

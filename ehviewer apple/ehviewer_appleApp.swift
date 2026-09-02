@@ -13,6 +13,7 @@ import EhSpider
 import EhSettings
 import EhDatabase
 import EhAPI
+import EhCookie
 #if os(iOS)
 import UIKit
 #endif
@@ -28,6 +29,9 @@ struct EhViewerApp: App {
     @State private var settings = AppSettings.shared
 
     init() {
+        // Authentication cookies are session-only when Keychain is available;
+        // restore them before RootView evaluates the initial login state.
+        EhCookieManager.shared.ensureCredentialsRestored()
         // 配置全局 URLCache (对标 Android Conaco 320MB 磁盘缓存)
         // AsyncImage 和所有使用 URLSession.shared 的代码都会受益
         URLCache.shared = URLCache(

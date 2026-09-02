@@ -351,6 +351,7 @@ struct WebViewLogin: UIViewRepresentable {
                     self.hasDetected = true
                     Task {
                         await EhCookieManager.shared.storeCookies(cookiesToSync)
+                        _ = EhCookieManager.shared.secureAuthCookies()
                         // 尝试从页面提取用户名
                         let result = try? await webView.evaluateJavaScript(
                             "document.querySelector('#userlinks .home b')?.textContent || document.querySelector('.home b')?.textContent || ''"
@@ -439,6 +440,7 @@ struct WebViewLogin: NSViewRepresentable {
                     self.hasDetected = true
                     Task {
                         await EhCookieManager.shared.storeCookies(cookiesToSync)
+                        _ = EhCookieManager.shared.secureAuthCookies()
                         let result = try? await webView.evaluateJavaScript(
                             "document.querySelector('#userlinks .home b')?.textContent || document.querySelector('.home b')?.textContent || ''"
                         )
@@ -516,6 +518,8 @@ struct CookieLoginView: View {
         if !igneous.isEmpty {
             await cookieManager.setCookie(name: EhCookieManager.keyIgneous, value: igneous, domain: EhCookieManager.domainExhentai)
         }
+
+        _ = cookieManager.persistCredentials()
 
         // 保存登录状态
         AppSettings.shared.isLogin = true

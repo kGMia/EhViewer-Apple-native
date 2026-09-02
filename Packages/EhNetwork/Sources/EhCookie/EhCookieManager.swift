@@ -12,7 +12,7 @@ public final class EhCookieManager: @unchecked Sendable {
     /// 反转告警；使用相同的 Default QoS，同时由 continuation 挂起调用方，
     /// 不占用用户交互线程等待，也不会让多个写操作交错。
     private let mutationQueue = DispatchQueue(
-        label: "Stellatrix.EhViewer.CookieMutation",
+        label: "com.ehviewer.cookie.mutation",
         qos: .default
     )
 
@@ -30,6 +30,10 @@ public final class EhCookieManager: @unchecked Sendable {
     public static let keyS  = "s"
     public static let keyUConfig = "uconfig"     // 用户配置 (需过滤)
 
+    private static let authCookieNames: Set<String> = [
+        keyIPBMemberId, keyIPBPassHash, keyIgneous,
+    ]
+
     // MARK: - Host 常量
 
     public static let domainEhentai = ".e-hentai.org"
@@ -38,6 +42,109 @@ public final class EhCookieManager: @unchecked Sendable {
 
     private init() {
         storage = HTTPCookieStorage.shared
+        restoreCredentialsFromKeychain()
+    }
+
+    // MARK: - Keychain credentials
+
+    /// Persist the current authentication cookies outside the plaintext cookie
+    /// store. Call this after every login path that writes cookies directly.
+    @discardableResult
+    public func persistCredentials() -> Bool {
+        guard EhCredentialStore.isAvailable else { return false }
+        return EhCredentialStore.save(EhCredentials(
+            memberId: memberId,
+            passHash: passHash,
+            igneous: igneous
+        ))
+    }
+
+    public func ensureCredentialsRestored() {
+        _ = Self.shared
+    }
+
+    private func restoreCredentialsFromKeychain() {
+        guard EhCredentialStore.isAvailable else { return }
+
+        let existing = getCookies(for: Self.domainEhentai)
+        if existing[Self.keyIPBMemberId] != nil,
+           existing[Self.keyIPBPassHash] != nil {
+            let credentials = EhCredentials(
+                memberId: existing[Self.keyIPBMemberId],
+                passHash: existing[Self.keyIPBPassHash],
+                igneous: igneous
+            )
+            guard EhCredentialStore.save(credentials) else { return }
+            removeAuthCookiesSync()
+            rewriteAuthCookiesAsSession(credentials)
+            return
+        }
+
+        guard let credentials = EhCredentialStore.load(), !credentials.isEmpty else { return }
+        rewriteAuthCookiesAsSession(credentials)
+    }
+
+    private func setCookieSync(
+        name: String,
+        value: String,
+        domain: String,
+        path: String = "/"
+    ) {
+        var properties: [HTTPCookiePropertyKey: Any] = [
+            .name: name,
+            .value: value,
+            .domain: domain,
+            .path: path,
+            .secure: "TRUE",
+        ]
+        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable {
+            properties[.discard] = "TRUE"
+        } else {
+            properties[.expires] = Date.distantFuture
+        }
+        if let cookie = HTTPCookie(properties: properties) {
+            storage.setCookie(cookie)
+        }
+    }
+
+    private func rewriteAuthCookiesAsSession(_ credentials: EhCredentials) {
+        if let memberId = credentials.memberId {
+            setCookieSync(name: Self.keyIPBMemberId, value: memberId, domain: Self.domainEhentai)
+            setCookieSync(name: Self.keyIPBMemberId, value: memberId, domain: Self.domainExhentai)
+        }
+        if let passHash = credentials.passHash {
+            setCookieSync(name: Self.keyIPBPassHash, value: passHash, domain: Self.domainEhentai)
+            setCookieSync(name: Self.keyIPBPassHash, value: passHash, domain: Self.domainExhentai)
+        }
+        if let igneous = credentials.igneous {
+            setCookieSync(name: Self.keyIgneous, value: igneous, domain: Self.domainExhentai)
+        }
+    }
+
+    private func removeAuthCookiesSync() {
+        for domain in [Self.domainEhentai, Self.domainExhentai, Self.domainForums] {
+            let host = domain.trimmingCharacters(in: .init(charactersIn: "."))
+            guard let url = URL(string: "https://\(host)") else { continue }
+            for cookie in storage.cookies(for: url) ?? []
+            where Self.authCookieNames.contains(cookie.name) {
+                storage.deleteCookie(cookie)
+            }
+        }
+    }
+
+    /// Converts authentication cookies written by URLSession or WebKit into
+    /// Keychain-backed session cookies.
+    @discardableResult
+    public func secureAuthCookies() -> Bool {
+        let credentials = EhCredentials(memberId: memberId, passHash: passHash, igneous: igneous)
+        guard !credentials.isEmpty,
+              EhCredentialStore.isAvailable,
+              EhCredentialStore.save(credentials)
+        else { return false }
+
+        removeAuthCookiesSync()
+        rewriteAuthCookiesAsSession(credentials)
+        return true
     }
 
     // MARK: - 登录状态检查
@@ -98,14 +205,18 @@ public final class EhCookieManager: @unchecked Sendable {
 
     /// 设置单个 Cookie
     public func setCookie(name: String, value: String, domain: String, path: String = "/") async {
-        let properties: [HTTPCookiePropertyKey: Any] = [
+        var properties: [HTTPCookiePropertyKey: Any] = [
             .name: name,
             .value: value,
             .domain: domain,
             .path: path,
             .secure: "TRUE",
-            .expires: Date.distantFuture,
         ]
+        if Self.authCookieNames.contains(name), EhCredentialStore.isAvailable {
+            properties[.discard] = "TRUE"
+        } else {
+            properties[.expires] = Date.distantFuture
+        }
         if let cookie = HTTPCookie(properties: properties) {
             await performMutation { [storage] in
                 storage.setCookie(cookie)
@@ -134,6 +245,7 @@ public final class EhCookieManager: @unchecked Sendable {
 
         // nw=1 跳过内容警告页面 (Android 硬编码注入)
         await injectNWCookie()
+        _ = secureAuthCookies()
     }
 
     /// 注入 nw=1 Cookie (对应 Android EhCookieStore 中的硬编码 nw=1)
@@ -184,6 +296,7 @@ public final class EhCookieManager: @unchecked Sendable {
         await clearCookies(for: Self.domainEhentai)
         await clearCookies(for: Self.domainExhentai)
         await clearCookies(for: Self.domainForums)
+        EhCredentialStore.clear()
     }
 
     /// 清除 igneous Cookie — Sad Panda 检测后自动调用 (V-15)
@@ -196,6 +309,10 @@ public final class EhCookieManager: @unchecked Sendable {
             for cookie in cookiesToDelete {
                 storage.deleteCookie(cookie)
             }
+        }
+        if var credentials = EhCredentialStore.load() {
+            credentials.igneous = nil
+            EhCredentialStore.save(credentials)
         }
     }
 
@@ -248,6 +365,7 @@ public final class EhCookieManager: @unchecked Sendable {
             ])
         }
         await storeCookies(values)
+        _ = secureAuthCookies()
     }
 
     private func performMutation(_ operation: @escaping @Sendable () -> Void) async {

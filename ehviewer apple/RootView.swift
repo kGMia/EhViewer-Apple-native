@@ -449,16 +449,7 @@ final class AppState {
     }
 
     func signOut() {
-        // 清除所有 EH 相关 Cookie
-        let domains = ["e-hentai.org", "exhentai.org", "forums.e-hentai.org"]
-        for domain in domains {
-            if let url = URL(string: "https://\(domain)") {
-                let cookies = HTTPCookieStorage.shared.cookies(for: url) ?? []
-                for cookie in cookies {
-                    HTTPCookieStorage.shared.deleteCookie(cookie)
-                }
-            }
-        }
+        Task { await EhCookieManager.shared.signOut() }
         isSignedIn = false
     }
 }

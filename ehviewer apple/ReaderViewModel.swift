@@ -296,6 +296,14 @@ class ReaderViewModel {
         "\(gid):\(page)" as NSString
     }
 
+    /// Returns a decoded page from either the observable working set or the
+    /// shared memory cache. Pages evicted from `cachedImages` remain immediately
+    /// displayable when the reader moves back to them, avoiding a false loading
+    /// state while `downloadImageData` promotes the same object again.
+    func image(at page: Int) -> PlatformImage? {
+        cachedImages[page] ?? Self.imageCache.object(forKey: cacheKey(for: page))
+    }
+
     /// 最大解码像素尺寸 (屏幕长边 × 3 倍，限制超大图解码内存)
     /// 15000×20000 的长条漫会被降采样到合理尺寸，避免 OOM
     private static let maxDecodePixelSize: CGFloat = {
@@ -548,9 +556,9 @@ class ReaderViewModel {
         guard index >= 0 && index < spreads.count else { return nil }
         let spread = spreads[index]
 
-        guard let primary = cachedImages[spread.primaryPage] else { return nil }
+        guard let primary = image(at: spread.primaryPage) else { return nil }
         guard let secPage = spread.secondaryPage,
-              let secondary = cachedImages[secPage] else {
+              let secondary = image(at: secPage) else {
             return primary
         }
 
@@ -565,8 +573,8 @@ class ReaderViewModel {
         guard index >= 0 && index < spreads.count else { return }
         let spread = spreads[index]
         guard let secondaryPage = spread.secondaryPage,
-              let primary = cachedImages[spread.primaryPage],
-              let secondary = cachedImages[secondaryPage] else { return }
+              let primary = image(at: spread.primaryPage),
+              let secondary = image(at: secondaryPage) else { return }
 
         let key = SpreadImageCacheKey(spreadID: spread.id, direction: direction.rawValue)
         guard spreadImageCache[key] == nil else { return }
@@ -1050,9 +1058,74 @@ class ReaderViewModel {
             }
             return
         }
+
+        // The configured reader cache stores compressed source bytes. Decode
+        // only after a hit and keep both disk access and ImageIO off MainActor.
+        let galleryID = gid
+        let maxPixelSize = Self.maxDecodePixelSize
+        if let diskCached = await Task.detached(priority: .utility, operation: {
+            guard let data = SpiderDen.cachedImageData(gid: galleryID, page: index)
+            else { return nil as PlatformImage? }
+            return Self.downsampledImage(data: data, maxPixelSize: maxPixelSize)
+        }).value {
+            Self.imageCache.setObject(
+                diskCached,
+                forKey: key,
+                cost: Self.decodedCost(of: diskCached)
+            )
+            cachedImages[index] = diskCached
+            downloadProgress.removeValue(forKey: index)
+            errorPages.remove(index)
+            errorMessages.removeValue(forKey: index)
+            return
+        }
         guard let urlString = imageURLs[index], let url = URL(string: urlString) else { return }
         let performanceInterval = PerformanceDiagnostics.begin("ReaderImageLoadDecode")
         defer { performanceInterval.end() }
+
+        // Downloaded galleries use file URLs. Reading them through URLSession
+        // adds network retry/connection machinery and may fail on some OS
+        // versions. Read and decode locally, entirely away from MainActor.
+        if url.isFileURL {
+            let outcome = await Task.detached(priority: priority) {
+                do {
+                    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                    guard let image = Self.downsampledImage(
+                        data: data,
+                        maxPixelSize: maxPixelSize
+                    ) else {
+                        return ImageLoadOutcome.invalidData
+                    }
+                    return ImageLoadOutcome.image(image)
+                } catch is CancellationError {
+                    return ImageLoadOutcome.cancelled
+                } catch {
+                    return ImageLoadOutcome.failure(error.localizedDescription)
+                }
+            }.value
+
+            switch outcome {
+            case .image(let image):
+                Self.imageCache.setObject(
+                    image,
+                    forKey: key,
+                    cost: Self.decodedCost(of: image)
+                )
+                cachedImages[index] = image
+                downloadProgress.removeValue(forKey: index)
+                errorPages.remove(index)
+                errorMessages.removeValue(forKey: index)
+            case .invalidData:
+                errorPages.insert(index)
+                errorMessages[index] = AppLocalization.localized("图片数据无效")
+            case .failure(let message):
+                errorPages.insert(index)
+                errorMessages[index] = message
+            case .cancelled:
+                break
+            }
+            return
+        }
 
         let entry: InFlightImageLoad
         if let existing = imageLoadTasks[index] {
@@ -1067,7 +1140,6 @@ class ReaderViewModel {
             request.timeoutInterval = 60
 
             let session = Self.session
-            let maxPixelSize = Self.maxDecodePixelSize
             let id = UUID()
             let task = Task.detached(priority: priority) {
                 for attempt in 0..<3 {
@@ -1085,6 +1157,7 @@ class ReaderViewModel {
                         ) else {
                             return ImageLoadOutcome.invalidData
                         }
+                        _ = SpiderDen.cacheImageData(data, gid: galleryID, page: index)
                         return ImageLoadOutcome.image(image)
                     } catch is CancellationError {
                         return ImageLoadOutcome.cancelled
