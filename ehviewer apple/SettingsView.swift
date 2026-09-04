@@ -25,7 +25,15 @@ struct SettingsView: View {
     @State private var vm = SettingsViewModel()
     @State private var settingsRevision = 0
     @State private var newBlockedTag = ""
+    @State private var informationSheet: InformationSheet?
+    @State private var showGalleryUpdates = false
+    @State private var showImageQuota = false
     @Environment(\.openURL) private var openURL
+
+    private enum InformationSheet: String, Identifiable {
+        case about, licenses
+        var id: String { rawValue }
+    }
 
     /// 被推入父导航栈时，不创建自己的 NavigationStack，避免嵌套
     private var isPushed: Bool = false
@@ -78,6 +86,30 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("设置")
+        .sheet(isPresented: $showGalleryUpdates) { GalleryUpdatesView() }
+        .sheet(isPresented: $showImageQuota) { ImageQuotaView() }
+        .sheet(item: $informationSheet) { destination in
+            NavigationStack {
+                Group {
+                    switch destination {
+                    case .about: aboutDetailView
+                    case .licenses: licensesView
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("关闭", systemImage: "xmark") { informationSheet = nil }
+                            .labelStyle(.iconOnly)
+                    }
+                }
+            }
+            #if os(macOS)
+            .frame(minWidth: 460, idealWidth: 560, minHeight: 400, idealHeight: 560)
+            #else
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            #endif
+        }
         .onChange(of: vm.showLogin) { _, isPresented in
             if !isPresented { vm.checkLoginState() }
         }
@@ -108,6 +140,9 @@ struct SettingsView: View {
 
     private var accountSection: some View {
         Section("账号") {
+            Button("图片配额", systemImage: "gauge.with.dots.needle.50percent") {
+                showImageQuota = true
+            }
             if vm.isLoggedIn {
                 HStack {
                     Image(systemName: "person.circle.fill")
@@ -630,6 +665,10 @@ struct SettingsView: View {
                 Text("480 MB").tag(480)
                 Text("640 MB").tag(640)
             }
+            .onChange(of: AppSettings.shared.readCacheSize) { _, megabytes in
+                SpiderDen.updateReadCacheLimit(megabytes: megabytes)
+                vm.calculateCacheSize()
+            }
 
             HStack {
                 Text("磁盘缓存")
@@ -646,6 +685,7 @@ struct SettingsView: View {
             Button("清除磁盘缓存") {
                 vm.clearCache()
             }
+            .disabled(vm.isClearingDiskCache)
         }
     }
 
@@ -653,6 +693,9 @@ struct SettingsView: View {
 
     private var advancedSection: some View {
         Section("高级") {
+            Button("检查画廊更新", systemImage: "arrow.clockwise") {
+                showGalleryUpdates = true
+            }
             // 历史记录容量 (对齐 Android Settings.KEY_HISTORY_INFO_SIZE)
             Stepper("历史记录上限: \(vm.historyInfoSize)", value: $vm.historyInfoSize, in: 100...2000, step: 100)
 
@@ -692,8 +735,8 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         Section("关于") {
-            NavigationLink {
-                aboutDetailView
+            Button {
+                informationSheet = .about
             } label: {
                 HStack(spacing: 12) {
                     Image(systemName: "books.vertical.fill")
@@ -711,8 +754,8 @@ struct SettingsView: View {
                 }
             }
 
-            NavigationLink("开源协议") {
-                licensesView
+            Button("开源协议") {
+                informationSheet = .licenses
             }
         }
         .sheet(isPresented: $vm.showLogExport) {
@@ -771,16 +814,28 @@ struct SettingsView: View {
             }
 
             Section("项目") {
+                LabeledContent("项目名称", value: "EhViewer Apple Native")
+                LabeledContent("作者与维护者", value: "kGMia")
+                LabeledContent("上游作者", value: "felixchaos")
+                LabeledContent("开源协议", value: "Apache-2.0")
                 Button {
-                    openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple")!)
+                    openURL(URL(string: "https://github.com/kGMia/EhViewer-Apple-native")!)
                 } label: {
                     Label("源代码", systemImage: "chevron.left.forwardslash.chevron.right")
                 }
                 Button {
-                    openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple/issues")!)
+                    openURL(URL(string: "https://github.com/kGMia/EhViewer-Apple-native/issues")!)
                 } label: {
                     Label("报告问题", systemImage: "exclamationmark.bubble")
                 }
+                Button {
+                    openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple")!)
+                } label: {
+                    Label("上游项目", systemImage: "arrow.triangle.branch")
+                }
+                Text("基于 EhViewer-Apple 持续开发，专注于 Apple 平台的原生体验。感谢上游作者与所有贡献者。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 NavigationLink {
                     licensesView
                 } label: {
@@ -820,6 +875,8 @@ struct SettingsView: View {
                     Text("Copyright © 2024–2026 felixchaos and contributors")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    LabeledContent("原生分支维护", value: "kGMia")
+                        .font(.caption)
                     Text(verbatim: """
 Licensed under the Apache License, Version 2.0 (the "License"); \
 you may not use this file except in compliance with the License. \
@@ -1353,27 +1410,48 @@ class SettingsViewModel {
     var diagnosisSuccess = false
 
     var diskCacheSize: String = AppLocalization.localized("计算中...")
+    var isClearingDiskCache = false
+    @ObservationIgnored private var cacheSizeRequest = 0
 
     func calculateCacheSize() {
-        let urlCacheSize = URLCache.shared.currentDiskUsage
-        let readerCacheSize = SpiderDen.readCacheUsage()
+        guard !isClearingDiskCache else { return }
+        cacheSizeRequest &+= 1
+        let request = cacheSizeRequest
+        Task { [weak self] in
+            let size = await Task.detached(priority: .utility) {
+                Int64(URLCache.shared.currentDiskUsage) + SpiderDen.readCacheUsage()
+            }.value
+            guard let self, self.cacheSizeRequest == request else { return }
+            self.updateCacheSize(size)
+        }
+    }
+
+    private func updateCacheSize(_ bytes: Int64) {
         let byteFormatter = ByteCountFormatter()
         byteFormatter.allowedUnits = [.useMB, .useGB]
         byteFormatter.countStyle = .file
-        diskCacheSize = byteFormatter.string(
-            fromByteCount: Int64(urlCacheSize) + readerCacheSize
-        )
+        diskCacheSize = byteFormatter.string(fromByteCount: bytes)
     }
 
     func clearCache() {
+        guard !isClearingDiskCache else { return }
+        isClearingDiskCache = true
+        // Invalidate an older size calculation while deletion is in progress.
+        cacheSizeRequest &+= 1
         // 清除内存缓存
         GalleryCache.shared.clearAll()
         ThumbnailMemoryCache.shared.removeAll()
         ReaderViewModel.clearDecodedImageCache()
-        // 清除 URL 磁盘缓存
-        URLCache.shared.removeAllCachedResponses()
-        SpiderDen.clearReadCache()
-        calculateCacheSize()
+        Task { [weak self] in
+            let size = await Task.detached(priority: .utility) {
+                URLCache.shared.removeAllCachedResponses()
+                SpiderDen.clearReadCache()
+                return Int64(URLCache.shared.currentDiskUsage) + SpiderDen.readCacheUsage()
+            }.value
+            guard let self else { return }
+            self.updateCacheSize(size)
+            self.isClearingDiskCache = false
+        }
     }
 
     var showDownloadDirectoryPicker = false

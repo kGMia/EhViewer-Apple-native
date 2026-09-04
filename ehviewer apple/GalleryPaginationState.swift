@@ -4,7 +4,7 @@ import EhModels
 /// 画廊信息流统一分页状态。服务器可能返回整数页码，也可能返回不透明的
 /// prev/next 游标链接；调用方不应猜测或自行递增服务器游标。
 struct GalleryPaginationState {
-    struct Snapshot: Codable {
+    struct Snapshot: Codable, Sendable {
         let currentPage: Int
         let firstLoadedPage: Int
         let lastLoadedPage: Int

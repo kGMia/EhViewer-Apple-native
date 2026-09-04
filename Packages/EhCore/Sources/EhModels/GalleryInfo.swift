@@ -1,5 +1,19 @@
 import Foundation
 
+/// One gdata version check. An unavailable item is not equivalent to a gallery
+/// without a newer version; preserve its error for partial-result reporting.
+public struct GalleryVersionCheck: Sendable {
+    public let gallery: GalleryInfo
+    public let latest: GalleryInfo?
+    public let error: String?
+
+    public init(gallery: GalleryInfo, latest: GalleryInfo? = nil, error: String? = nil) {
+        self.gallery = gallery
+        self.latest = latest
+        self.error = error
+    }
+}
+
 // MARK: - 画廊基础信息 (对应 Android GalleryInfo.java)
 
 public struct GalleryInfo: Identifiable, Sendable, Codable, Hashable {

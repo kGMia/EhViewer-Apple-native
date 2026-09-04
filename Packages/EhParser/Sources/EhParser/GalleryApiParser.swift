@@ -6,6 +6,46 @@ import EhModels
 
 public enum GalleryApiParser {
 
+    /// Parse current_gid/current_key without relying on title or GID ordering.
+    public static func parseVersionChecks(_ data: Data, galleries: [GalleryInfo]) throws -> [GalleryVersionCheck] {
+        var enriched = galleries
+        try parse(data, galleries: &enriched)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["gmetadata"] as? [[String: Any]] else {
+            throw EhParseError.parseFailure("Missing gallery metadata")
+        }
+        func galleryID(_ value: Any?) -> Int64? {
+            if let text = value as? String { return Int64(text) }
+            return (value as? NSNumber)?.int64Value
+        }
+        var records: [Int64: [String: Any]] = [:]
+        for item in items {
+            if let gid = galleryID(item["gid"]) { records[gid] = item }
+        }
+        return enriched.map { gallery in
+            guard let item = records[gallery.gid] else {
+                return GalleryVersionCheck(gallery: gallery, error: "Missing gallery metadata")
+            }
+            if let error = item["error"] as? String {
+                return GalleryVersionCheck(gallery: gallery, error: error)
+            }
+            let currentGID = galleryID(item["current_gid"])
+            let currentKey = (item["current_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasVersionData = (item["current_gid"] != nil && !(item["current_gid"] is NSNull))
+                || (item["current_key"] != nil && !(item["current_key"] is NSNull))
+            if currentGID == gallery.gid || !hasVersionData {
+                return GalleryVersionCheck(gallery: gallery)
+            }
+            guard let currentGID, currentGID > 0, let currentKey, !currentKey.isEmpty else {
+                return GalleryVersionCheck(gallery: gallery, error: "Invalid gallery version metadata")
+            }
+            return GalleryVersionCheck(
+                gallery: gallery,
+                latest: GalleryInfo(gid: currentGID, token: currentKey)
+            )
+        }
+    }
+
     /// 解析 gdata API 响应并更新画廊列表
     /// - Parameters:
     ///   - data: JSON 响应 data

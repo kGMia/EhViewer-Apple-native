@@ -16,6 +16,8 @@ import EhAPI
 import EhCookie
 #if os(iOS)
 import UIKit
+#elseif os(macOS)
+import AppKit
 #endif
 
 @main
@@ -29,25 +31,15 @@ struct EhViewerApp: App {
     @State private var settings = AppSettings.shared
 
     init() {
-        // Authentication cookies are session-only when Keychain is available;
-        // restore them before RootView evaluates the initial login state.
-        EhCookieManager.shared.ensureCredentialsRestored()
-        // 配置全局 URLCache (对标 Android Conaco 320MB 磁盘缓存)
-        // AsyncImage 和所有使用 URLSession.shared 的代码都会受益
-        URLCache.shared = URLCache(
-            memoryCapacity: 20 * 1024 * 1024,     // 20MB 内存
-            diskCapacity: 320 * 1024 * 1024,       // 320MB 磁盘
-            directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("url_cache")
-        )
-        // 注意: 后台任务注册由 AppDelegate.didFinishLaunchingWithOptions 负责
-        // 不要在此处重复调用, BGTaskScheduler 对同一 identifier 注册两次会崩溃
+        // Keep App.init free of disk-backed cache work. RootView prepares the
+        // network stack after SwiftUI has committed its first frame.
     }
 
     var body: some Scene {
         WindowGroup(id: "main") {
             RootView()
                 .modifier(AppAccentTintModifier(accent: settings.accentColor))
+                .modifier(MainWindowFrameAutosaveModifier())
         }
         .environment(\.locale, settings.appLanguage.locale)
         #if os(macOS)
@@ -62,6 +54,7 @@ struct EhViewerApp: App {
             BrowserCommands()
             GalleryCommands()
             #if os(macOS)
+            AppAboutCommands()
             NewWindowCommands()
             ReaderCommands()
             #endif
@@ -99,6 +92,39 @@ struct EhViewerApp: App {
 }
 
 #if os(macOS)
+private struct AppAboutCommands: Commands {
+    var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("关于 EhViewer") {
+                let credits = NSMutableAttributedString(string:
+                    "\(AppLocalization.localized("作者与维护者")): kGMia\n"
+                    + "\(AppLocalization.localized("上游作者")): felixchaos\n\n"
+                )
+                credits.append(NSAttributedString(
+                    string: AppLocalization.localized("源代码"),
+                    attributes: [.link: URL(string: "https://github.com/kGMia/EhViewer-Apple-native")!]
+                ))
+                credits.append(NSAttributedString(string: "  ·  "))
+                credits.append(NSAttributedString(
+                    string: AppLocalization.localized("上游项目"),
+                    attributes: [.link: URL(string: "https://github.com/felixchaos/EhViewer-Apple")!]
+                ))
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = .center
+                credits.addAttributes([
+                    .paragraphStyle: paragraph,
+                    .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                    .foregroundColor: NSColor.labelColor,
+                ], range: NSRange(location: 0, length: credits.length))
+                NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                    .applicationName: "EhViewer Apple Native",
+                    .credits: credits,
+                ])
+            }
+        }
+    }
+}
+
 /// 使用 SwiftUI 的场景系统创建窗口，避免将未注册 URL Scheme 交给 AppKit。
 private struct NewWindowCommands: Commands {
     @Environment(\.openWindow) private var openWindow
@@ -235,17 +261,28 @@ final class ApplicationBootstrap {
     private var hasStarted = false
     private var hasScheduledMaintenance = false
     private var deferredServicesTask: Task<Void, Never>?
+    private let requestServicesTask = Task.detached(priority: .utility) {
+        // Constructing a disk URLCache may read its index. Doing this in
+        // EhViewerApp.init caused cold-launch stalls as that index grew.
+        URLCache.shared = URLCache(
+            memoryCapacity: 20 * 1024 * 1024,
+            diskCapacity: 320 * 1024 * 1024,
+            directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("url_cache")
+        )
+        SpiderDen.initialize()
+        _ = EhAPI.shared
+    }
+
+    /// All windows await the same initialization before their first requests,
+    /// rather than racing a utility task to construct URLSession on MainActor.
+    func prepareForRequests() async {
+        await requestServicesTask.value
+    }
 
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
-
-        // Expensive singleton construction must not share the first-frame main
-        // actor. Both caches are safe to initialize on a utility executor.
-        Task.detached(priority: .utility) {
-            SpiderDen.initialize()
-            _ = EhAPI.shared
-        }
 
         Task.detached(priority: .background) {
             try? await Task.sleep(for: .seconds(2))
@@ -260,12 +297,12 @@ final class ApplicationBootstrap {
         deferredServicesTask = Task { @MainActor in
             // Preserve the launch and initial scrolling window for interactive
             // work before restoring secondary services and Spotlight state.
-            try? await Task.sleep(for: .milliseconds(900))
+            try? await Task.sleep(for: .milliseconds(1_500))
             guard !Task.isCancelled else { return }
 
             Haptics.prepareForInteraction()
-            EhViewerAppShortcuts.updateAppShortcutParameters()
             UNUserNotificationCenter.current().delegate = DownloadNotificationService.shared
+            await Task.yield()
 
             let downloadManager = await Task.detached(priority: .utility) {
                 DownloadManager.shared
@@ -273,11 +310,15 @@ final class ApplicationBootstrap {
             await downloadManager.setListener(DownloadNotificationBridge.shared)
             await GalleryActionService.shared.reloadWatchLaterState()
 
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            EhViewerAppShortcuts.updateAppShortcutParameters()
+
             #if os(macOS)
             await RecentHistoryMenuModel.shared.refresh()
             #endif
 
-            try? await Task.sleep(for: .milliseconds(600))
+            try? await Task.sleep(for: .milliseconds(900))
             guard !Task.isCancelled else { return }
             await SystemGalleryIntegration.indexRecentHistory()
         }
@@ -292,6 +333,40 @@ final class ApplicationBootstrap {
         }
     }
 }
+
+private struct MainWindowFrameAutosaveModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content.background(MainWindowFrameAutosaveView(name: "EhViewer.MainWindow"))
+        #else
+        content
+        #endif
+    }
+}
+
+#if os(macOS)
+/// Retain only the main window's frame while scene restoration stays disabled,
+/// so relaunch does not eagerly recreate old auxiliary windows and feeds.
+private struct MainWindowFrameAutosaveView: NSViewRepresentable {
+    let name: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async { configure(view.window) }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { configure(nsView.window) }
+    }
+
+    private func configure(_ window: NSWindow?) {
+        guard let window, window.frameAutosaveName != name else { return }
+        _ = window.setFrameUsingName(name)
+        window.setFrameAutosaveName(name)
+    }
+}
+#endif
 
 // MARK: - Navigation Notifications
 

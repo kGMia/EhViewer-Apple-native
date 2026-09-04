@@ -122,7 +122,7 @@ public enum GalleryDetailParser {
 
         // 9. 预览
         detail.previewSet = try parsePreviews(doc)
-        detail.previewPages = try parsePreviewPagesFromDoc(doc, body: html)
+        detail.previewPages = try parsePreviewPagesFromDoc(doc)
 
         // 10. SpiderInfo (用于阅读器)
         if let pagesMatch = pagesBodyRegex.firstMatch(in: html, range: fullRange),
@@ -316,14 +316,21 @@ public enum GalleryDetailParser {
 
     // MARK: - 解析预览页数 (对应 Android parsePreviewPages(Document, String))
 
-    private static func parsePreviewPagesFromDoc(_ doc: Document, body: String) throws -> Int {
-        // Android: document.getElementsByClass("ptt").first().child(0).child(0).children()
-        // → table.ptt > tbody > tr > [td...], 取倒数第 2 个 td 的文本
-        guard let ptt = try doc.select(".ptt").first() else { return 0 }
-        let tds = try ptt.child(0).child(0).children()
-        let count = tds.size()
-        guard count >= 2 else { return 0 }
-        return Int(try tds.get(count - 2).text()) ?? 0
+    private static func parsePreviewPagesFromDoc(_ doc: Document) throws -> Int {
+        // Both pagers contain numbered cells and previous/next controls. The
+        // final link may mean "next", not "last": inspect all page evidence.
+        var count = 0
+        for cell in try doc.select(".ptt td, .ptb td") {
+            if let number = Int(try cell.text()), number > count { count = number }
+            for link in try cell.select("a[href]") {
+                let href = try link.attr("href")
+                if let value = URLComponents(string: href)?.queryItems?.first(where: { $0.name == "p" })?.value,
+                   let index = Int(value), index >= 0, index < Int.max {
+                    count = max(count, index + 1)
+                }
+            }
+        }
+        return count
     }
 
     // MARK: - 解析标签
@@ -559,15 +566,15 @@ public enum GalleryDetailParser {
     )
 
     private static func parsePreviews(_ doc: Document) throws -> PreviewSet {
-        // 获取 HTML 字符串用于正则匹配
-        let html = try doc.html()
-        
-        // 先尝试获取 gt200 或 gt100 区域的 HTML (安卓的方式)
-        var targetHtml = html
+        // Serialize only the thumbnail region when present; avoid first
+        // rebuilding the entire gallery document (including tags/comments).
+        let targetHtml: String
         if let gt200 = try doc.select(".gt200").first() {
             targetHtml = try gt200.html()
         } else if let gt100 = try doc.select(".gt100").first() {
             targetHtml = try gt100.html()
+        } else {
+            targetHtml = try doc.html()
         }
         
         let fullRange = NSRange(targetHtml.startIndex..., in: targetHtml)
@@ -771,22 +778,13 @@ public enum GalleryDetailParser {
     /// 解析预览页数 (从 HTML 字符串) — getPreviewSet API 返回值
     public static func parsePreviewPages(_ html: String) throws -> Int {
         let doc = try SwiftSoup.parse(html)
-        // 尝试从分页控件中获取总页数 (ptb table)
-        if let lastPageLink = try doc.select("table.ptb td:last-child > a[href]").first(),
-           let href = try? lastPageLink.attr("href"),
-           let url = URLComponents(string: href),
-           let pageParam = url.queryItems?.first(where: { $0.name == "p" })?.value {
-            return (Int(pageParam) ?? 0) + 1
-        }
+        return try parsePreviewPagesFromDoc(doc)
+    }
 
-        let pttTds = try doc.select("table.ptb td")
-        if pttTds.size() > 2 {
-            let secondLast = pttTds.get(pttTds.size() - 2)
-            let text = try secondLast.text()
-            return Int(text) ?? 0
-        }
-
-        return 0
+    /// Parse thumbnails and pagination from one document on subsequent pages.
+    public static func parsePreviewPage(_ html: String) throws -> (PreviewSet, Int) {
+        let doc = try SwiftSoup.parse(html)
+        return (try parsePreviews(doc), try parsePreviewPagesFromDoc(doc))
     }
 
     /// 从 HTML 提取 apiUid 和 apiKey (用于评分等 API)

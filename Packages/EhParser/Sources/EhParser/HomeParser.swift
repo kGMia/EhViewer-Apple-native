@@ -2,54 +2,67 @@ import Foundation
 import EhModels
 import SwiftSoup
 
-// MARK: - 主页配额解析器 (对应 Android EhHomeParser.java)
-
 public enum HomeParser {
-
-    // MARK: 正则 — 图片配额 (新旧两种格式)
-
-    private static let imageLimitNewRegex = try! NSRegularExpression(
-        pattern: #"<p>You are currently at <strong>(.+?)</strong> towards your account limit of <strong>(.+?)</strong>.</p>\n<p>You can reset your image quota by spending <strong>(.+?)</strong> GP.</p>"#,
-        options: .dotMatchesLineSeparators
+    // Parse rendered text, not exact tag/newline placement. The cost is optional:
+    // a missing reset button must not make an otherwise valid quota unreadable.
+    private static let quotaRegex = try! NSRegularExpression(
+        pattern: #"You are currently at\s*([\d,\s]+?)\s*towards\s+[^.]*?limit of\s*([\d,\s]+)"#,
+        options: .caseInsensitive
+    )
+    private static let costRegex = try! NSRegularExpression(
+        pattern: #"(?:reset your image quota by spending|Reset Cost:)\s*([\d,\s]+)\s*GP"#,
+        options: .caseInsensitive
     )
 
-    private static let imageLimitOldRegex = try! NSRegularExpression(
-        pattern: #"<p>You are currently at <strong>(\d+)</strong> towards a limit of <strong>(\d+)</strong>.</p>.+?<p>Reset Cost: <strong>(\d+)</strong> GP</p>"#,
-        options: .dotMatchesLineSeparators
-    )
-
-    // MARK: - 解析 (对应 Android EhHomeParser.parse)
-
+    /// Compatibility entry point for callers that explicitly accept no data.
     public static func parse(_ body: String) -> HomeDetail {
-        var detail = HomeDetail()
-
-        let nsBody = body as NSString
-        let fullRange = NSRange(location: 0, length: nsBody.length)
-
-        // 先尝试新格式，再尝试旧格式
-        let match: NSTextCheckingResult?
-        if let m = imageLimitNewRegex.firstMatch(in: body, range: fullRange) {
-            match = m
-        } else {
-            match = imageLimitOldRegex.firstMatch(in: body, range: fullRange)
-        }
-
-        if let match = match {
-            let usedStr = extractGroupClean(match: match, group: 1, in: body)
-            let totalStr = extractGroupClean(match: match, group: 2, in: body)
-            let costStr = extractGroupClean(match: match, group: 3, in: body)
-
-            detail.currentUsed = Int(usedStr) ?? 0
-            detail.totalLimit = Int(totalStr) ?? 0
-            detail.resetCost = Int(costStr) ?? 0
-        }
-
-        return detail
+        (try? parseQuota(body)) ?? HomeDetail()
     }
 
-    /// 提取正则分组并去除逗号 (对应 Android getGroupIntString)
-    private static func extractGroupClean(match: NSTextCheckingResult, group: Int, in body: String) -> String {
-        guard let range = Range(match.range(at: group), in: body) else { return "0" }
-        return String(body[range]).replacingOccurrences(of: ",", with: "")
+    public static func parseQuota(_ body: String) throws -> HomeDetail {
+        let doc = try SwiftSoup.parse(body)
+        let text = try doc.text()
+        let lower = text.lowercased()
+        let hasPasswordField = !(try doc.select("input[type=password]")).isEmpty()
+        if lower.contains("requires you to log on") || lower.contains("you must be logged in")
+            || hasPasswordField {
+            throw EhParseError.parseFailure("Image quota requires sign-in")
+        }
+        if body.contains("cf-chl-") || lower.contains("checking your browser") || lower.contains("verify you are human") {
+            throw EhParseError.parseFailure("Image quota blocked by verification")
+        }
+        if lower.contains("you are currently using ip-based limits") {
+            return HomeDetail(limitMode: lower.contains("no restrictions are currently in effect") ? .ipBasedUnrestricted : .ipBased)
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        var used: Int?
+        var total: Int?
+        if let match = quotaRegex.firstMatch(in: text, range: range) {
+            used = number(match, group: 1, text: text)
+            total = number(match, group: 2, text: text)
+        }
+        if used == nil || total == nil {
+            for paragraph in try doc.select("p") {
+                let wording = try paragraph.text().lowercased()
+                guard wording.contains("currently"), wording.contains("limit") else { continue }
+                let values = try paragraph.select("strong").compactMap {
+                    Int(try $0.text().filter { $0.isASCII && $0.isNumber })
+                }
+                if values.count >= 2 { used = values[0]; total = values[1]; break }
+            }
+        }
+        guard let used, let total, total > 0 else {
+            // Login pages, challenges and changed markup are not a 0/0 quota.
+            throw EhParseError.parseFailure("Image quota unavailable")
+        }
+        let cost = costRegex.firstMatch(in: text, range: range)
+            .flatMap { number($0, group: 1, text: text) }
+        return HomeDetail(currentUsed: used, totalLimit: total, resetCost: cost)
+    }
+
+    private static func number(_ match: NSTextCheckingResult, group: Int, text: String) -> Int? {
+        guard let range = Range(match.range(at: group), in: text) else { return nil }
+        let digits = text[range].filter { $0.isASCII && $0.isNumber }
+        return Int(digits)
     }
 }

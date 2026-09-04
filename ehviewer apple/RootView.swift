@@ -24,6 +24,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var appState: AppState   // 仅在 init() 中初始化，避免创建多余实例
     @State private var flowStep: OnboardingStep
+    @State private var credentialsReady = false
     
     /// 剪贴板画廊检测 (对齐 Android MainActivity.onResume 检测 EH 链接)
     @State private var clipboardGallery: (gid: Int64, token: String)?
@@ -46,49 +47,33 @@ struct RootView: View {
         case main          // 主界面
     }
 
-    // MARK: - 同步计算初始页面 (消除白屏)
+    // MARK: - Lightweight initial state; authentication is restored after presentation
     init() {
         let settings = AppSettings.shared
         let bypassOnboardingForUITests = ProcessInfo.processInfo.environment["EH_UI_TEST_BYPASS_ONBOARDING"] == "1"
         let step: OnboardingStep
         if bypassOnboardingForUITests {
             step = .main
-        } else if settings.showWarning {
-            step = .warning
-        } else if !settings.hasSelectedSite {
-            step = .selectSite
-        } else if settings.skipSignIn {
-            step = .main
         } else {
-            // 直接检查 Cookie 判断登录状态 (无需 @MainActor)
-            let cookies = HTTPCookieStorage.shared.cookies(for: URL(string: "https://e-hentai.org")!) ?? []
-            let hasAuth = cookies.contains { $0.name == "ipb_member_id" } &&
-                          cookies.contains { $0.name == "ipb_pass_hash" }
-            step = hasAuth ? .main : .login
+            step = .checking
         }
         _flowStep = State(initialValue: step)
         // 应用锁已移除。清理旧版留下的开关，避免降级/再升级时意外进入旧锁定流程。
         if settings.enableSecurity {
             settings.enableSecurity = false
         }
-        // 同步初始化 appState 登录状态，避免首帧后异步 mutation 导致重渲染
         let initState = AppState()
-        if step == .main {
-            initState.checkLoginStatus()
-            if !initState.isSignedIn {
-                initState.isSignedIn = settings.skipSignIn || bypassOnboardingForUITests
-            }
-        }
+        initState.isSignedIn = bypassOnboardingForUITests
         _appState = State(initialValue: initState)
     }
 
     var body: some View {
-        // ★ 主界面 + 引导层分离
-        //   - flowStep == .main/.checking → 直接显示主界面
-        //   - 其他 → 显示对应引导/登录页面
-        //   不使用 ZStack/opacity，消除不必要的 MainTabView 提前渲染
+        // Do not start authenticated feed requests before Keychain restoration.
         Group {
-            if flowStep == .main || flowStep == .checking {
+            if flowStep == .checking {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if flowStep == .main {
                 MainTabView()
                     .environment(appState)
             } else {
@@ -98,19 +83,28 @@ struct RootView: View {
         .withGlobalErrorBoundary()
         // 已登录用户: 启动时异步获取资料 + ExH 检测 (不 mutate isSignedIn，不触发重渲染)
         .task {
+            let interval = PerformanceDiagnostics.begin("LaunchAuthenticationRestore")
+            async let restoreCredentials: Void = EhCookieManager.shared.ensureCredentialsRestored()
+            async let prepareRequests: Void = ApplicationBootstrap.shared.prepareForRequests()
+            _ = await (restoreCredentials, prepareRequests)
+            interval.end()
+            guard !Task.isCancelled else { return }
+            credentialsReady = true
+            if flowStep == .checking { determineNextStep() }
             await ApplicationBootstrap.shared.start()
-            if appState.isSignedIn && !AppSettings.shared.skipSignIn {
+        }
+        .task(id: credentialsReady && appState.isSignedIn && !AppSettings.shared.skipSignIn) {
+            if credentialsReady && appState.isSignedIn && !AppSettings.shared.skipSignIn {
                 await postLoginActions()
             }
         }
         .onChange(of: appState.isSignedIn) { _, isSignedIn in
-            if isSignedIn {
+            if isSignedIn && credentialsReady {
                 flowStep = .main
-                // 登录后异步任务：获取资料 + ExH 检测
-                if !AppSettings.shared.skipSignIn {
-                    Task { await postLoginActions() }
-                }
             }
+        }
+        .onChange(of: flowStep) { _, step in
+            if step == .main { checkClipboardForGalleryUrl() }
         }
         .alert("ExHentai 可用", isPresented: $showExHAlert) {
             Button("切换到 ExHentai") {
@@ -235,6 +229,11 @@ struct RootView: View {
 
     /// 登录后异步操作：获取用户资料 + ExH 检测
     private func postLoginActions() async {
+        // Let the selected feed receive the initial network/CPU budget. Profile
+        // and ExH capability checks are secondary and remain cancellable.
+        try? await Task.sleep(for: .milliseconds(900))
+        guard !Task.isCancelled else { return }
+
         // 1. 保存 UID
         if let uid = EhCookieManager.shared.memberId {
             AppSettings.shared.userId = uid
@@ -243,6 +242,7 @@ struct RootView: View {
         // 2. 获取用户资料
         do {
             let profile = try await EhAPI.shared.getProfile()
+            guard !Task.isCancelled else { return }
             if let name = profile.displayName {
                 AppSettings.shared.displayName = name
             }
@@ -254,6 +254,7 @@ struct RootView: View {
         }
 
         // 3. ExH 可达性检测
+        guard !Task.isCancelled else { return }
         do {
             guard let url = URL(string: "https://exhentai.org/") else { return }
             var request = URLRequest(url: url)
@@ -264,7 +265,9 @@ struct RootView: View {
             let config = URLSessionConfiguration.default
             config.httpCookieStorage = .shared
             let exSession = URLSession(configuration: config)
+            defer { exSession.finishTasksAndInvalidate() }
             let (data, response) = try await exSession.data(for: request)
+            guard !Task.isCancelled else { return }
 
             if let httpResponse = response as? HTTPURLResponse,
                httpResponse.statusCode == 200, data.count >= 1000 {
@@ -346,11 +349,8 @@ struct RootView: View {
     }
 
     private func openGallery(_ gallery: GalleryInfo) {
-        NotificationCenter.default.post(
-            name: .openGalleryFromClipboard,
-            object: nil,
-            userInfo: ["gid": gallery.gid, "token": gallery.token]
-        )
+        // Keep cold-launch links until MainTabView has mounted its navigation.
+        appState.pendingIncomingGallery = gallery
     }
 
     /// 检查剪贴板中的画廊链接 (对齐 Android MainActivity.checkClipboardUrl)
@@ -414,6 +414,7 @@ struct RootView: View {
 @Observable
 final class AppState {
     var isSignedIn = false
+    var pendingIncomingGallery: GalleryInfo?
     var currentSite: SiteChoice = .eHentai
 
     enum SiteChoice: Int {

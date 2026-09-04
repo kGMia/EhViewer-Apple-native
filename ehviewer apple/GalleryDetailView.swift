@@ -1792,6 +1792,12 @@ struct GalleryDetailView: View {
     #if os(macOS)
     @ViewBuilder
     private func auxiliarySheet(for route: GalleryAuxiliaryRoute) -> some View {
+        let isPreviews = if case .previews = route { true } else { false }
+        // Keep the larger preview sheet inside the usable desktop, including
+        // menu bar/Dock space on smaller Mac screens. Comments keep their size.
+        let available = NSScreen.main?.visibleFrame.size ?? CGSize(width: 1200, height: 900)
+        let previewWidth = min(940, max(620, available.width - 100))
+        let previewHeight = min(680, max(430, available.height - 140))
         NavigationStack {
             Group {
                 switch route {
@@ -1835,7 +1841,12 @@ struct GalleryDetailView: View {
                 .help("关闭")
             }
         }
-        .frame(minWidth: 620, idealWidth: 720, minHeight: 430, idealHeight: 540)
+        .frame(
+            minWidth: isPreviews ? min(720, previewWidth) : 620,
+            idealWidth: isPreviews ? previewWidth : 720,
+            minHeight: isPreviews ? min(500, previewHeight) : 430,
+            idealHeight: isPreviews ? previewHeight : 540
+        )
     }
     #endif
 }

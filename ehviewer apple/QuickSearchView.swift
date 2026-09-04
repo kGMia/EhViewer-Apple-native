@@ -36,6 +36,7 @@ struct SearchRecordsPanelContent: View {
     let onSubmitCurrentSearch: () -> Void
     let onDismiss: () -> Void
     let keyboardCommand: SearchPanelKeyboardCommand?
+    var canSaveCurrentSearch = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -106,10 +107,11 @@ struct SearchRecordsPanelContent: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .scrollBounceBehavior(.always)
             .contentMargins(.vertical, 6, for: .scrollContent)
             .frame(maxHeight: 320)
 
-            if !currentKeyword.isEmpty && !isCurrentSearchSaved {
+            if canSaveCurrentSearch && !currentKeyword.isEmpty && !isCurrentSearchSaved {
                 Divider()
 
                 Button(action: saveCurrentSearch) {
@@ -311,7 +313,7 @@ struct SearchRecordsPanelContent: View {
     }
 
     private func saveCurrentSearch() {
-        guard !currentKeyword.isEmpty, !isCurrentSearchSaved else { return }
+        guard canSaveCurrentSearch, !currentKeyword.isEmpty, !isCurrentSearchSaved else { return }
         vm.addSearch(currentSearch)
     }
 
@@ -337,7 +339,7 @@ struct SearchRecordsPanelContent: View {
                 + suggestions.map {
                     KeyboardItem.suggestion(chinese: $0.chinese, english: $0.english)
                 }
-            if !isCurrentSearchSaved { items.append(.save) }
+            if canSaveCurrentSearch && !isCurrentSearchSaved { items.append(.save) }
         }
         return items
     }

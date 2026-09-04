@@ -391,6 +391,29 @@ public actor EhAPI {
         }
     }
 
+    /// Check one batch only. The update checker schedules and throttles batches
+    /// so this path never silently floods gdata for a large local collection.
+    public func getGalleryVersionChecks(galleries: [GalleryInfo], site: EhSite) async throws -> [GalleryVersionCheck] {
+        guard !galleries.isEmpty else { return [] }
+        guard galleries.count <= 25, let url = URL(string: EhURL.apiUrl(for: site)) else {
+            throw EhError.invalidUrl
+        }
+        let body: [String: Any] = [
+            "method": "gdata",
+            "gidlist": galleries.map { [$0.gid, $0.token] as [Any] },
+            "namespace": 1,
+        ]
+        let request = EhRequestBuilder.buildPostJSONRequest(
+            url: url,
+            json: try JSONSerialization.data(withJSONObject: body),
+            referer: EhURL.referer(for: site),
+            origin: EhURL.origin(for: site)
+        )
+        let (data, response) = try await sanitizedData(for: request)
+        try checkResponse(response, data: data)
+        return try GalleryApiParser.parseVersionChecks(data, galleries: galleries)
+    }
+
     /// 评分画廊 (对应 Android rateGallery, JSON API: rategallery)
     public func rateGallery(
         apiUid: Int64, apiKey: String,
@@ -738,9 +761,7 @@ public actor EhAPI {
         try checkResponse(response, data: data)
 
         let body = String(data: data, encoding: .utf8) ?? ""
-        let previews = try GalleryDetailParser.parsePreviews(body)
-        let pages = try GalleryDetailParser.parsePreviewPages(body)
-        return (previews, pages)
+        return try GalleryDetailParser.parsePreviewPage(body)
     }
 
     /// 获取全部评论 (通过 hc=1 参数) (对应 Android 加载全部评论)
@@ -860,75 +881,56 @@ public actor EhAPI {
         return try GalleryPageParser.parse(body)
     }
 
-    // MARK: - 以图搜图 (对应 Android imageSearch)
+    // MARK: - Native image search
 
-    /// 以图搜图 (对应 Android imageSearch)
-    /// - Parameters:
-    ///   - imageData: 图片数据 (必须是 JPEG)
-    ///   - filename: 文件名
-    ///   - useSimilarity: 搜索相似图片 (fs_similar)
-    ///   - onlyCovers: 仅搜索封面 (fs_covers)
-    ///   - searchExpunged: 搜索已删除画廊 (fs_exp)
-    public func imageSearch(
-        imageData: Data, filename: String,
-        useSimilarity: Bool = true,
-        onlyCovers: Bool = false,
-        searchExpunged: Bool = false
-    ) async throws -> GalleryListResult {
-        let site = AppSettings.shared.gallerySite
-        let urlString = EhURL.imageLookupUrl(for: site)
-        guard let url = URL(string: urlString) else {
-            throw EhError.invalidUrl
-        }
-
-        // 确保文件名有扩展名
-        let fileName = filename.contains(".") ? filename : filename + ".jpg"
-
-        // 构建 multipart 请求
-        var parts: [MultipartPart] = []
-        parts.append(.file(name: "sfile", filename: fileName, data: imageData, contentType: "image/jpeg"))
-        if useSimilarity {
-            parts.append(.text(name: "fs_similar", value: "on"))
-        }
-        if onlyCovers {
-            parts.append(.text(name: "fs_covers", value: "on"))
-        }
-        if searchExpunged {
-            parts.append(.text(name: "fs_exp", value: "on"))
-        }
+    /// Upload only after the user confirms. The result URL is consumed by the
+    /// persistent native Search page; subsequent pagination does not re-upload.
+    public func uploadSearchImage(
+        imageData: Data, contentType: String, site: EhSite,
+        useSimilarity: Bool = true, onlyCovers: Bool = false, searchExpunged: Bool = false
+    ) async throws -> URL {
+        guard ["image/jpeg", "image/png", "image/gif"].contains(contentType),
+              !imageData.isEmpty, imageData.count <= 20 * 1024 * 1024,
+              let url = URL(string: EhURL.imageLookupUrl(for: site)) else { throw EhError.invalidUrl }
+        let ext = contentType == "image/png" ? "png" : contentType == "image/gif" ? "gif" : "jpg"
+        var parts = [MultipartPart.file(name: "sfile", filename: "search.\(ext)", data: imageData, contentType: contentType)]
+        if useSimilarity { parts.append(.text(name: "fs_similar", value: "on")) }
+        if onlyCovers { parts.append(.text(name: "fs_covers", value: "on")) }
+        if searchExpunged { parts.append(.text(name: "fs_exp", value: "on")) }
         parts.append(.text(name: "f_sfile", value: "File Search"))
-
-        let referer = EhURL.referer(for: site)
-        let origin = EhURL.origin(for: site)
         let request = EhRequestBuilder.buildMultipartRequest(
-            url: url,
-            parts: parts,
-            referer: referer,
-            origin: origin
+            url: url, parts: parts, referer: EhURL.referer(for: site), origin: EhURL.origin(for: site)
         )
-
         let (data, response) = try await noRedirectData(for: request)
-
-        // 处理 302 重定向 (对应 Android followRedirects=false + 手动跟随)
-        if let httpResponse = response as? HTTPURLResponse,
-           httpResponse.statusCode == 302,
-           let location = httpResponse.value(forHTTPHeaderField: "Location"),
-           let redirectUrl = URL(string: location) {
-            let redirectRequest = EhRequestBuilder.buildGetRequest(url: redirectUrl, referer: referer)
-            let (redirectData, redirectResponse) = try await sanitizedData(for: redirectRequest)
-            try checkResponse(redirectResponse, data: redirectData)
-            let body = String(data: redirectData, encoding: .utf8) ?? ""
-            var result = try GalleryListParser.parse(body)
-            // 批量填充 API 数据
-            try await fillGalleryListByApi(galleries: &result.galleries)
+        try Task.checkCancellation()
+        try checkResponse(response, data: data)
+        if let http = response as? HTTPURLResponse,
+           [302, 303].contains(http.statusCode),
+           let location = http.value(forHTTPHeaderField: "Location"),
+           let result = Self.imageSearchResultURL(location, relativeTo: url, site: site) {
             return result
         }
+        throw EhError.networkError("Image search did not return a valid result URL")
+    }
 
-        try checkResponse(response, data: data)
-        let body = String(data: data, encoding: .utf8) ?? ""
-        var result = try GalleryListParser.parse(body)
-        try await fillGalleryListByApi(galleries: &result.galleries)
-        return result
+    /// Compatibility wrapper for callers that need the first result immediately.
+    public func imageSearch(imageData: Data, filename: String, useSimilarity: Bool = true,
+                            onlyCovers: Bool = false, searchExpunged: Bool = false) async throws -> GalleryListResult {
+        let url = try await uploadSearchImage(imageData: imageData, contentType: "image/jpeg",
+                                             site: AppSettings.shared.gallerySite, useSimilarity: useSimilarity,
+                                             onlyCovers: onlyCovers, searchExpunged: searchExpunged)
+        return try await getGalleryList(url: url.absoluteString)
+    }
+
+    public static func imageSearchResultURL(_ location: String, relativeTo base: URL, site: EhSite) -> URL? {
+        guard let url = URL(string: location, relativeTo: base)?.absoluteURL,
+              url.scheme == "https", url.host == URL(string: EhURL.host(for: site))?.host,
+              url.user == nil, url.password == nil, url.port == nil || url.port == 443,
+              url.path == "/" || url.path.isEmpty,
+              let hash = URLComponents(url: url, resolvingAgainstBaseURL: true)?.queryItems?
+                .first(where: { $0.name == "f_shash" })?.value,
+              !hash.isEmpty else { return nil }
+        return url
     }
 
     // MARK: - 归档 API (对应 Android getArchiveList / getArchiver / downloadArchiver)
@@ -1065,16 +1067,21 @@ public actor EhAPI {
             throw EhError.invalidUrl
         }
 
-        let request = EhRequestBuilder.buildGetRequest(
+        var request = EhRequestBuilder.buildGetRequest(
             url: url,
-            referer: EhURL.referer(for: AppSettings.shared.gallerySite)
+            referer: EhURL.referer(for: .eHentai)
         )
+        request.cachePolicy = .reloadIgnoringLocalCacheData
 
         let (data, response) = try await sanitizedData(for: request)
         try checkResponse(response, data: data)
 
+        if response.url?.path.contains("bounce_login") == true {
+            throw EhParseError.parseFailure("Image quota requires sign-in")
+        }
+
         let body = String(data: data, encoding: .utf8) ?? ""
-        return HomeParser.parse(body)
+        return try HomeParser.parseQuota(body)
     }
 
     /// 重置图片配额 (对应 Android resetLimit)
@@ -1093,7 +1100,7 @@ public actor EhAPI {
         try checkResponse(response, data: data)
 
         let body = String(data: data, encoding: .utf8) ?? ""
-        return HomeParser.parse(body)
+        return try HomeParser.parseQuota(body)
     }
 
     // MARK: - 用户标签 API (对应 Android getWatchedList / addTag / deleteWatchedTag)

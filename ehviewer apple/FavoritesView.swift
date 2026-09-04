@@ -52,6 +52,7 @@ struct FavoritesView: View {
     @State private var isSelectMode = false
     @State private var selectedGids: Set<Int64> = []
     @State private var showMoveSheet = false
+    @State private var showGalleryUpdates = false
     @State private var showDeleteConfirm = false
     @State private var isBatchProcessing = false
 
@@ -119,6 +120,7 @@ struct FavoritesView: View {
                 }
             }
         }
+        .sheet(isPresented: $showGalleryUpdates) { GalleryUpdatesView() }
         .alert("跳转到收藏页", isPresented: $showPageNumberDialog) {
             TextField("页码", text: $pageNumberInput)
                 #if os(iOS)
@@ -226,6 +228,9 @@ struct FavoritesView: View {
                         Label("更新离线索引", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .disabled(favoriteIndex.isSyncing)
+                    Button("检查画廊更新", systemImage: "arrow.clockwise") {
+                        showGalleryUpdates = true
+                    }
                 } label: {
                     Image(systemName: "arrow.up.arrow.down.circle")
                         .frame(width: 40, height: 40)
@@ -409,6 +414,9 @@ struct FavoritesView: View {
                     selectedGids.removeAll()
                 } label: {
                     Label("批量操作", systemImage: "checkmark.circle")
+                }
+                Button("检查画廊更新", systemImage: "arrow.clockwise") {
+                    showGalleryUpdates = true
                 }
             }
         } label: {

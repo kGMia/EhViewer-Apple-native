@@ -24,8 +24,20 @@ struct GalleryPreviewsView: View {
     let initialPreviewSet: PreviewSet
     
     @State private var vm = GalleryPreviewsViewModel()
+    @State private var scrollAnchor: Int?
+    @State private var pageNavigation = PreviewPageNavigation()
+    @State private var scrollRequest: PreviewScrollRequest?
+    @State private var isScrubbing = false
+    @State private var showsPageSlider = false
+    @State private var sliderPage = 1.0
+    @State private var jumpTask: Task<Void, Never>?
+    @State private var failedJumpPage: Int?
+    @State private var imageSearchRoute: NativeImageSearchRoute?
     @Environment(\.responsiveLayout) private var responsiveLayout
     @Environment(\.readerPresentationAction) private var readerPresentationAction
+    @Environment(\.gallerySearchNavigationAction) private var gallerySearchNavigationAction
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     #if os(iOS)
     @State private var readerTarget: ReaderTarget? = nil
     #else
@@ -34,6 +46,30 @@ struct GalleryPreviewsView: View {
     
     // 预览图尺寸 (对齐 Android gallery_grid_column_width_middle = 120dp)
     private let previewWidth: CGFloat = 120
+    private var visiblePage: Int { pageNavigation.currentPage }
+
+    private struct PreviewScrollRequest: Equatable {
+        let request: PreviewPageNavigation.Request
+        let position: Int
+        let animated: Bool
+    }
+
+    private var pageControlHeight: CGFloat {
+        #if os(macOS)
+        36
+        #else
+        40
+        #endif
+    }
+
+    private var pageControlTint: Color {
+        if let selected = AppSettings.shared.accentColor.swiftUIColor { return selected }
+        #if os(macOS)
+        return Color(nsColor: .controlAccentColor)
+        #else
+        return .accentColor
+        #endif
+    }
 
     private var horizontalContentInset: CGFloat {
         responsiveLayout.horizontalSizeClass == .regular
@@ -50,44 +86,59 @@ struct GalleryPreviewsView: View {
     }
     
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: previewWidth, maximum: previewWidth + 20), spacing: 8)], spacing: 16) {
-                ForEach(vm.allPreviews, id: \.position) { preview in
-                    previewItem(preview: preview)
+            LazyVStack(spacing: 0) {
+                if let previousPage = vm.previousPage {
+                    PreviewPageBoundary(error: vm.errors[previousPage]) {
+                        await vm.loadAdjacent(page: previousPage)
+                    }
+                    .id("previous-\(previousPage)")
                 }
-
-                // 作为 LazyVGrid 的最后一个单元格，仅滚动到末尾时才开始下一页。
-                if let nextPage = vm.nextPage(totalPages: totalPages) {
-                    Group {
-                        if let loadError = vm.loadError {
-                            Button("重试") {
-                                vm.loadError = nil
-                                Task {
-                                    await vm.loadNextPageIfNeeded(
-                                        gid: gid,
-                                        token: token,
-                                        totalPages: totalPages
-                                    )
-                                }
-                            }
-                            .help(loadError)
-                        } else {
-                            ProgressView().controlSize(.small)
-                        }
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: previewWidth, maximum: previewWidth + 20), spacing: 8)], spacing: 16) {
+                    ForEach(vm.allPreviews, id: \.position) { preview in
+                        previewItem(preview: preview)
+                            .id(preview.position)
                     }
-                    .frame(width: previewWidth, height: 44)
-                    .task(id: nextPage) {
-                        await vm.loadNextPageIfNeeded(
-                            gid: gid,
-                            token: token,
-                            totalPages: totalPages
-                        )
+                }
+                .scrollTargetLayout()
+                .padding(.horizontal, horizontalContentInset)
+                .padding(.top, 16)
+                if let nextPage = vm.nextPage {
+                    PreviewPageBoundary(error: vm.errors[nextPage]) {
+                        await vm.loadAdjacent(page: nextPage)
                     }
+                    .id("next-\(nextPage)")
                 }
             }
-            .padding(.horizontal, horizontalContentInset)
-            .padding(.top, 16)
             .padding(.bottom, 68)
+        }
+        // SwiftUI tracks the visible preview identity and its offset when
+        // preceding previews are inserted; never scroll to the list's beginning.
+        .scrollPosition(id: $scrollAnchor)
+        .onChange(of: scrollRequest) { _, target in
+            guard let target else { return }
+            // Explicit alignment also works when the target is already visible
+            // or has the same identity as the previous scroll request.
+            withAnimation(reduceMotion || !target.animated ? nil : .smooth(duration: 0.24), completionCriteria: .removed) {
+                proxy.scrollTo(target.position, anchor: .top)
+            } completion: {
+                pageNavigation.complete(target.request)
+            }
+        }
+        .onScrollPhaseChange { _, phase in
+            if phase == .interacting {
+                jumpTask?.cancel()
+                vm.cancelRequests()
+                pageNavigation.cancel()
+                scrollRequest = nil
+            }
+        }
+        .onScrollTargetVisibilityChange(idType: Int.self, threshold: 0.1) { positions in
+            guard !vm.isJumping, pageNavigation.followsVisibility, pageNavigation.pending == nil, let position = positions.min(),
+                  let page = vm.page(containing: position) else { return }
+            pageNavigation.observe(page: page)
+            if !isScrubbing { sliderPage = Double(page + 1) }
         }
         #if os(macOS)
         .scrollClipDisabled()
@@ -97,15 +148,39 @@ struct GalleryPreviewsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
         #endif
-        .task(id: gid) {
+        .task(id: "\(gid):\(token)") {
+            vm.initialize(gid: gid, token: token, totalPages: totalPages, initialPreviewSet: initialPreviewSet)
             if vm.allPreviews.isEmpty {
-                vm.initialize(initialPreviewSet: initialPreviewSet)
+                jump(to: 0)
             }
         }
+        .onDisappear {
+            jumpTask?.cancel()
+            vm.cancelRequests()
+            pageNavigation.cancel()
+            scrollRequest = nil
+        }
+        .overlay(alignment: .bottom) { pageControl.padding(.bottom, 16) }
         .overlay {
-            if vm.isInitialLoading {
+            if vm.isJumping {
                 ProgressView("加载中...")
+                    .padding(20)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 18))
             }
+        }
+        .alert("加载失败", isPresented: Binding(
+            get: { failedJumpPage != nil },
+            set: { if !$0 { failedJumpPage = nil } }
+        )) {
+            Button("重试") {
+                if let page = failedJumpPage {
+                    failedJumpPage = nil
+                    jump(to: page)
+                }
+            }
+            Button("取消", role: .cancel) { failedJumpPage = nil }
+        } message: {
+            Text(failedJumpPage.flatMap { vm.errors[$0] } ?? "")
         }
         #if os(iOS)
         .fullScreenCover(item: $readerTarget) { target in
@@ -118,6 +193,106 @@ struct GalleryPreviewsView: View {
             )
         }
         #endif
+        }
+        .environment(\.imageSearchPresentationAction, ImageSearchPresentationAction { data in
+            imageSearchRoute = NativeImageSearchRoute(initialData: data)
+        })
+        .sheet(item: $imageSearchRoute) { route in
+            NativeImageSearchView(initialData: route.initialData) { url in
+                imageSearchRoute = nil
+                Task { @MainActor in
+                    // Let the image-search sheet leave first, then remove the
+                    // full-preview layer so it cannot cover the result list.
+                    await Task.yield()
+                    dismiss()
+                    gallerySearchNavigationAction?.imageSearch?(url)
+                }
+            }
+        }
+    }
+
+    private var pageControl: some View {
+        HStack(spacing: 10) {
+            if showsPageSlider {
+                Text("\(Int(sliderPage)) / \(vm.pageCount)")
+                    .font(.caption.monospacedDigit())
+                Slider(value: $sliderPage, in: 1...Double(max(2, vm.pageCount)), step: 1) { editing in
+                    isScrubbing = editing
+                    if !editing { jump(to: Int(sliderPage) - 1) }
+                }
+                .tint(pageControlTint)
+                .accentColor(pageControlTint)
+                .accessibilityLabel("跳转到预览页")
+                .disabled(vm.pageCount <= 1)
+                Button {
+                    showsPageSlider = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 32, height: pageControlHeight)
+                        .contentShape(.rect)
+                }
+                .accessibilityLabel("关闭")
+            } else {
+                Button { jump(to: visiblePage - 1) } label: {
+                    Image(systemName: "chevron.left")
+                        .frame(width: 32, height: pageControlHeight)
+                        .contentShape(.rect)
+                }
+                .accessibilityLabel("上一页")
+                .disabled(visiblePage <= 0)
+                Button {
+                    sliderPage = Double(visiblePage + 1)
+                    showsPageSlider = true
+                } label: {
+                    Text("\(visiblePage + 1) / \(vm.pageCount)")
+                        .font(.subheadline.monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .padding(.horizontal, 4)
+                        .frame(height: pageControlHeight)
+                        .contentShape(.rect)
+                }
+                .accessibilityLabel("跳转到预览页")
+                .accessibilityValue("\(visiblePage + 1) / \(vm.pageCount)")
+                .accessibilityHint("点击后拖动滑块跳页")
+                Button { jump(to: visiblePage + 1) } label: {
+                    Image(systemName: "chevron.right")
+                        .frame(width: 32, height: pageControlHeight)
+                        .contentShape(.rect)
+                }
+                .accessibilityLabel("下一页")
+                .disabled(visiblePage >= vm.pageCount - 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .controlSize(.regular)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: showsPageSlider ? 290 : nil, minHeight: pageControlHeight, maxHeight: pageControlHeight)
+        .glassEffect(.regular.interactive(), in: .capsule)
+        .animation(.snappy(duration: 0.22), value: showsPageSlider)
+        .padding(.horizontal, 56)
+    }
+
+    private func jump(to page: Int) {
+        let request = pageNavigation.begin(page: page, pageCount: vm.pageCount)
+        sliderPage = Double(request.page + 1)
+        failedJumpPage = nil
+        let isInLoadedWindow = !vm.allPreviews.isEmpty && (
+            (vm.lowerPage...vm.upperPage).contains(request.page)
+                || request.page == vm.previousPage || request.page == vm.nextPage
+        )
+        jumpTask?.cancel()
+        jumpTask = Task {
+            guard !Task.isCancelled, pageNavigation.pending == request else { return }
+            if let position = await vm.jump(to: request.page) {
+                guard !Task.isCancelled, pageNavigation.pending == request else { return }
+                scrollRequest = PreviewScrollRequest(request: request, position: position, animated: isInLoadedWindow)
+            } else if !Task.isCancelled, pageNavigation.pending == request {
+                pageNavigation.cancel()
+                sliderPage = Double(visiblePage + 1)
+                failedJumpPage = request.page
+            }
+        }
     }
     
     // MARK: - 预览项 (点击跳转到阅读器，对齐 Android GalleryPreviewsScene.onItemClick)
@@ -185,6 +360,30 @@ struct GalleryPreviewsView: View {
             previewSet: initialPreviewSet,
             page: preview.position
         )
+    }
+}
+
+/// Only request a neighboring page when the boundary is actually visible,
+/// not merely because LazyVGrid has prefetched its view.
+private struct PreviewPageBoundary: View {
+    let error: String?
+    let load: @MainActor () async -> Void
+    @State private var isVisible = false
+
+    var body: some View {
+        Group {
+            if let error {
+                Button("重试") { Task { await load() } }
+                    .help(error)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .onScrollVisibilityChange(threshold: 0.1) { isVisible = $0 }
+        .task(id: isVisible) {
+            if isVisible && error == nil { await load() }
+        }
     }
 }
 
@@ -306,6 +505,7 @@ private struct PreviewOriginalImageActionsModifier: ViewModifier {
     let previewSet: PreviewSet
     let page: Int
 
+    @Environment(\.imageSearchPresentationAction) private var imageSearchPresentationAction
     @State private var isLoadingOriginal = false
 
     func body(content: Content) -> some View {
@@ -335,6 +535,20 @@ private struct PreviewOriginalImageActionsModifier: ViewModifier {
                 Label("拷贝图片", systemImage: "doc.on.doc")
             }
             .disabled(isLoadingOriginal)
+
+            if imageSearchPresentationAction != nil {
+                Divider()
+
+                Button {
+                    searchOriginalImage()
+                } label: {
+                    Label(
+                        AppLocalization.localized(isLoadingOriginal ? "正在加载原图…" : "以图搜图"),
+                        systemImage: "magnifyingglass"
+                    )
+                }
+                .disabled(isLoadingOriginal)
+            }
         }
     }
 
@@ -397,6 +611,21 @@ private struct PreviewOriginalImageActionsModifier: ViewModifier {
         }
     }
 
+    private func searchOriginalImage() {
+        guard !isLoadingOriginal, let imageSearchPresentationAction else { return }
+        isLoadingOriginal = true
+        Task {
+            defer { isLoadingOriginal = false }
+            do {
+                let data = try await loadOriginalData()
+                imageSearchPresentationAction.present(data)
+                Haptics.impact()
+            } catch {
+                ErrorHandler.shared.handle(error, context: "SearchPreviewOriginal")
+            }
+        }
+    }
+
     private static func fileExtension(for data: Data) -> String {
         let prefix = Array(data.prefix(12))
         if prefix.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
@@ -444,79 +673,185 @@ private final class PreviewOriginalImageLoader {
 
 // MARK: - ViewModel
 
+/// Keep the requested page separate from visibility callbacks during loading
+/// and native scrolling. Rapid taps advance from the most recent target.
+struct PreviewPageNavigation {
+    struct Request: Equatable {
+        let id = UUID()
+        let page: Int
+    }
+
+    private(set) var settledPage = 0
+    private(set) var pending: Request?
+    private(set) var followsVisibility = true
+    var currentPage: Int { pending?.page ?? settledPage }
+
+    mutating func begin(page: Int, pageCount: Int) -> Request {
+        let request = Request(page: min(max(0, page), max(0, pageCount - 1)))
+        pending = request
+        followsVisibility = false
+        return request
+    }
+
+    mutating func observe(page: Int) {
+        guard pending == nil, followsVisibility else { return }
+        settledPage = page
+    }
+
+    mutating func complete(_ request: Request) {
+        guard pending == request else { return }
+        settledPage = request.page
+        pending = nil
+    }
+
+    mutating func cancel() {
+        pending = nil
+        followsVisibility = true
+    }
+}
+
 @MainActor
 @Observable
 class GalleryPreviewsViewModel {
-    var allPreviews: [PreviewItem] = []
-    var isInitialLoading = false
-    var isLoadingMore = false
-    var loadError: String?
-    private var loadedPages: Set<Int> = []
-    private var currentPage = 0
-    
-    func initialize(initialPreviewSet: PreviewSet) {
-        appendPreviews(from: initialPreviewSet)
-        loadedPages.insert(0)
-        currentPage = 0
+    typealias Loader = @Sendable (String) async throws -> (PreviewSet, Int)
+    private(set) var allPreviews: [PreviewItem] = []
+    private(set) var pageCount = 1
+    private(set) var lowerPage = 0
+    private(set) var upperPage = 0
+    private(set) var isJumping = false
+    private(set) var errors: [Int: String] = [:]
+    @ObservationIgnored private let loader: Loader
+    @ObservationIgnored private var baseURL = ""
+    @ObservationIgnored private var generation = UUID()
+    @ObservationIgnored private var pageCache: [Int: [PreviewItem]] = [:]
+    @ObservationIgnored private var positionPages: [Int: Int] = [:]
+    @ObservationIgnored private var requests: [Int: Task<(PreviewSet, Int), Error>] = [:]
+
+    init(loader: @escaping Loader = { try await EhAPI.shared.getPreviewSet(url: $0) }) {
+        self.loader = loader
     }
-    
-    func loadNextPageIfNeeded(gid: Int64, token: String, totalPages: Int) async {
-        guard !isLoadingMore else { return }
-        
-        let nextPage = currentPage + 1
-        guard nextPage < totalPages else { return }
-        guard !loadedPages.contains(nextPage) else { return }
-        
-        isLoadingMore = true
-        loadError = nil
-        
+
+    var previousPage: Int? { lowerPage > 0 ? lowerPage - 1 : nil }
+    var nextPage: Int? { upperPage + 1 < pageCount ? upperPage + 1 : nil }
+
+    func initialize(gid: Int64, token: String, totalPages: Int, initialPreviewSet: PreviewSet) {
+        let url = "\(GalleryActionService.siteBaseURL)g/\(gid)/\(token)/"
+        guard baseURL != url else { return }
+        cancelRequests()
+        baseURL = url
+        pageCount = max(1, totalPages)
+        lowerPage = 0
+        upperPage = 0
+        errors.removeAll()
+        pageCache.removeAll()
+        positionPages.removeAll()
+        allPreviews = Self.items(from: initialPreviewSet)
+        if !allPreviews.isEmpty { pageCache[0] = allPreviews }
+        for item in allPreviews { positionPages[item.position] = 0 }
+    }
+
+    func page(containing position: Int) -> Int? { positionPages[position] }
+
+    /// A jump loads only the requested website page, not every intervening page.
+    /// Adjacent loads subsequently grow a contiguous window in both directions.
+    func jump(to requestedPage: Int) async -> Int? {
+        let page = min(max(requestedPage, 0), pageCount - 1)
+        cancelRequests()
+        let identity = generation
+        isJumping = true
+        defer { if generation == identity { isJumping = false } }
+        guard let items = await fetch(page: page), generation == identity, !Task.isCancelled else { return nil }
+        if !allPreviews.isEmpty && (page == previousPage || page == nextPage) {
+            mergeAdjacent(items, page: page)
+        } else if !(lowerPage...upperPage).contains(page) || allPreviews.isEmpty {
+            lowerPage = page
+            upperPage = page
+            allPreviews = items
+        }
+        trimInactiveCache()
+        return items.first?.position
+    }
+
+    func loadAdjacent(page: Int) async {
+        guard !isJumping, page == previousPage || page == nextPage else { return }
+        let identity = generation
+        guard let items = await fetch(page: page), generation == identity, !Task.isCancelled,
+              page == previousPage || page == nextPage else { return }
+        mergeAdjacent(items, page: page)
+        trimInactiveCache()
+    }
+
+    private func mergeAdjacent(_ items: [PreviewItem], page: Int) {
+        lowerPage = min(lowerPage, page)
+        upperPage = max(upperPage, page)
+        var positions = Set(allPreviews.map(\.position))
+        allPreviews.append(contentsOf: items.filter { positions.insert($0.position).inserted })
+        allPreviews.sort { $0.position < $1.position }
+    }
+
+    func cancelRequests() {
+        generation = UUID()
+        requests.values.forEach { $0.cancel() }
+        requests.removeAll()
+        isJumping = false
+    }
+
+    private func fetch(page: Int) async -> [PreviewItem]? {
+        if let cached = pageCache[page] { return cached }
+        let identity = generation
+        errors[page] = nil
+        let task: Task<(PreviewSet, Int), Error>
+        if let existing = requests[page] {
+            task = existing
+        } else {
+            let loader = loader
+            let url = "\(baseURL)?p=\(page)"
+            task = Task { try await loader(url) }
+            requests[page] = task
+        }
+        defer { if generation == identity { requests[page] = nil } }
         do {
-            let site = GalleryActionService.siteBaseURL
-            let urlStr = "\(site)g/\(gid)/\(token)/?p=\(nextPage)"
-            debugLog("Loading preview page \(nextPage): \(urlStr)")
-            let (previewSet, _) = try await EhAPI.shared.getPreviewSet(url: urlStr)
-            
-            try Task.checkCancellation()
-            appendPreviews(from: previewSet)
-            loadedPages.insert(nextPage)
-            currentPage = nextPage
-            isLoadingMore = false
-            debugLog("Loaded preview page \(nextPage) with \(previewSet.count) items, total: \(allPreviews.count)")
+            let (previews, count) = try await task.value
+            guard generation == identity else { return nil }
+            let items = Self.items(from: previews)
+            guard !items.isEmpty else { throw URLError(.cannotParseResponse) }
+            // A partial/missing pager must not truncate an already known total.
+            pageCount = max(pageCount, max(page + 1, count))
+            pageCache[page] = items
+            for item in items { positionPages[item.position] = page }
+            // Scrolling away cancels the boundary's waiter, not a shared
+            // request. Retain its result for a later visit without inserting it.
+            return Task.isCancelled ? nil : items
         } catch {
-            isLoadingMore = false
-            if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                return
-            }
-            loadError = error.localizedDescription
-            debugLog("Failed to load preview page \(nextPage): \(error)")
+            guard generation == identity, !Task.isCancelled,
+                  !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return nil }
+            errors[page] = error.localizedDescription
+            return nil
         }
     }
 
-    func nextPage(totalPages: Int) -> Int? {
-        let next = currentPage + 1
-        return next < totalPages && !loadedPages.contains(next) ? next : nil
+    private func trimInactiveCache() {
+        // Keep browsed pages plus a small recent-jump cache, never image bitmaps.
+        let inactive = pageCache.keys.filter { !(lowerPage...upperPage).contains($0) }
+            .sorted { abs($0 - lowerPage) > abs($1 - lowerPage) }
+        for page in inactive.prefix(max(0, pageCache.count - 24)) {
+            pageCache.removeValue(forKey: page)
+        }
     }
-    
-    private func appendPreviews(from previewSet: PreviewSet) {
+
+    private static func items(from previewSet: PreviewSet) -> [PreviewItem] {
+        let values: [PreviewItem]
         switch previewSet {
         case .large(let items):
-            let newItems = items.map { preview in
+            values = items.map { preview in
                 PreviewItem(position: preview.position, type: .large(imageUrl: preview.imageUrl))
             }
-            // 去重并排序
-            let existingPositions = Set(allPreviews.map { $0.position })
-            let filtered = newItems.filter { !existingPositions.contains($0.position) }
-            allPreviews.append(contentsOf: filtered)
-            allPreviews.sort { $0.position < $1.position }
-            
         case .normal(let items):
-            let newItems = items.map { preview in
+            values = items.map { preview in
                 PreviewItem(position: preview.position, type: .normal(preview))
             }
-            let existingPositions = Set(allPreviews.map { $0.position })
-            let filtered = newItems.filter { !existingPositions.contains($0.position) }
-            allPreviews.append(contentsOf: filtered)
-            allPreviews.sort { $0.position < $1.position }
         }
+        var positions = Set<Int>()
+        return values.filter { positions.insert($0.position).inserted }.sorted { $0.position < $1.position }
     }
 }

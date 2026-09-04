@@ -28,6 +28,7 @@ struct GallerySearchNavigationAction {
     /// to the originating gallery.
     let searchFromGallery: @MainActor (_ query: String, _ gallery: GalleryInfo) -> Void
     let quickSearch: @MainActor (_ record: QuickSearchRecord) -> Void
+    var imageSearch: (@MainActor (URL) -> Void)? = nil
 }
 
 private struct GallerySearchNavigationActionKey: EnvironmentKey {
@@ -67,6 +68,7 @@ struct GalleryListView: View {
 
     @State private var viewModel = GalleryListViewModel()
     @State private var showAdvancedSearch = false
+    @State private var imageSearchRoute: NativeImageSearchRoute?
     @State private var advancedSearch = AdvancedSearchState()
     @State private var selectedQuickSearch: QuickSearchRecord?
     @State private var favoritePickerGallery: GalleryInfo?
@@ -382,12 +384,26 @@ struct GalleryListView: View {
             compactContent
         }
         }
+        .environment(\.imageSearchPresentationAction, ImageSearchPresentationAction { data in
+            isSearchFocused = false
+            imageSearchRoute = NativeImageSearchRoute(initialData: data)
+        })
+        .sheet(item: $imageSearchRoute) { route in
+            NativeImageSearchView(initialData: route.initialData) { url in
+                imageSearchRoute = nil
+                if let action = gallerySearchNavigationAction?.imageSearch {
+                    action(url)
+                } else {
+                    viewModel.loadImageSearch(url)
+                }
+            }
+        }
         .task {
             // 异步执行 ViewModel 初始化 — 避免 .onAppear 同步变更 @Observable 导致 NavigationStack 多次更新
             viewModel.favSearchKeyword = favSearchKeyword
             viewModel.loadSearchHistory()
             if isDedicatedSearchPage {
-                viewModel.restoreDedicatedSearchSession(into: advancedSearch)
+                await viewModel.restoreDedicatedSearchSession(into: advancedSearch)
             }
             if case .tag(let keyword) = mode, viewModel.searchText.isEmpty {
                 viewModel.searchText = keyword
@@ -410,7 +426,13 @@ struct GalleryListView: View {
             await viewModel.refreshAsync(mode: mode)
         }
         .onChange(of: AppSettings.shared.gallerySite) { _, _ in
-            viewModel.refresh(mode: selectedBaseMode)
+            if viewModel.imageSearchURL != nil {
+                // Image-result URLs belong to the site that accepted the upload.
+                // Do not silently reuse one under a different EH/EX selection.
+                viewModel.clearDedicatedSearch()
+            } else {
+                viewModel.refresh(mode: selectedBaseMode)
+            }
         }
         .onChange(of: primaryFeed) { _, newFeed in
             guard supportsPrimaryFeedSwitching else { return }
@@ -1058,10 +1080,20 @@ struct GalleryListView: View {
             }
 
             HStack(spacing: 7) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-
                 searchFieldControl
+
+                Button {
+                    isSearchFocused = false
+                    imageSearchRoute = NativeImageSearchRoute(initialData: nil)
+                } label: {
+                    Image(systemName: "photo")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("以图搜图")
+                .accessibilityLabel("以图搜图")
 
                 Button {
                     if viewModel.searchText.isEmpty {
@@ -1124,13 +1156,13 @@ struct GalleryListView: View {
                 }
                 .buttonStyle(.plain)
                 .glassEffect(.regular.interactive(), in: .circle)
-                .disabled(viewModel.galleries.isEmpty)
+                .disabled(viewModel.galleries.isEmpty || viewModel.imageSearchURL != nil)
                 .help("跳页")
                 .accessibilityIdentifier("gallery.search.jump")
                 .transition(.scale.combined(with: .opacity))
             }
         }
-        .animation(.snappy(duration: 0.2), value: isSearchFocused)
+        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: isSearchFocused)
     }
 
     private var searchRecordsPanel: some View {
@@ -1152,7 +1184,8 @@ struct GalleryListView: View {
                 submitSearch()
             },
             onDismiss: { isSearchFocused = false },
-            keyboardCommand: searchPanelKeyboardCommand
+            keyboardCommand: searchPanelKeyboardCommand,
+            canSaveCurrentSearch: viewModel.imageSearchURL == nil
         )
     }
 
@@ -1241,13 +1274,16 @@ struct GalleryListView: View {
                     .padding(.trailing, 46)
                     .transition(
                         .asymmetric(
-                            insertion: .opacity.combined(with: .offset(y: -7)),
-                            removal: .opacity.combined(with: .scale(scale: 0.985, anchor: .top))
+                            insertion: .move(edge: .top)
+                                .combined(with: .opacity)
+                                .combined(with: .scale(scale: 0.975, anchor: .top)),
+                            removal: .opacity
+                                .combined(with: .scale(scale: 0.985, anchor: .top))
                         )
                     )
             }
         }
-        .animation(.snappy(duration: 0.24, extraBounce: 0.05), value: isSearchFocused)
+        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: isSearchFocused)
     }
 
     private var galleryDisplayMode: EhSettings.ListMode {
@@ -2404,6 +2440,7 @@ class GalleryListViewModel {
 
     private var currentCacheKey: String?
     private var currentMode: GalleryListView.ListMode?
+    private(set) var imageSearchURL: URL?
     /// 与 EhPanda cancellable Effect 相同的语义：新的导航/搜索请求会取消旧请求，
     /// 防止较慢的旧响应覆盖用户刚选择的新页面。
     private var requestTask: Task<Void, Never>?
@@ -2436,13 +2473,14 @@ class GalleryListViewModel {
     var dedicatedSearchRestorationGeneration = 0
     private(set) var dedicatedSearchRestorationAnchor: Int64?
 
-    private struct DedicatedSearchSession: Codable {
+    private struct DedicatedSearchSession: Codable, Sendable {
         let site: Int
         let search: QuickSearchRecord
         let galleries: [GalleryInfo]
         let scrollPosition: Int64?
         let pagination: GalleryPaginationState.Snapshot
         let savedAt: Date
+        let imageSearchURL: URL?
     }
 
     private static let dedicatedSearchSessionKey = "ehDedicatedSearchSession.v1"
@@ -2507,16 +2545,23 @@ class GalleryListViewModel {
     /// Restore the persistent Search tab once per scene-owned model. Results and
     /// opaque EH cursors are restored together, so returning to Search does not
     /// silently restart from page one or lose bidirectional pagination.
-    func restoreDedicatedSearchSession(into advancedState: AdvancedSearchState) {
+    func restoreDedicatedSearchSession(into advancedState: AdvancedSearchState) async {
         persistsDedicatedSearchSession = true
         guard !didRestoreDedicatedSearchSession else { return }
         didRestoreDedicatedSearchSession = true
+        guard searchText.isEmpty, galleries.isEmpty else { return }
+
+        let session: DedicatedSearchSession? = await Task.detached(priority: .utility) { () -> DedicatedSearchSession? in
+            guard let data = UserDefaults.standard.data(forKey: Self.dedicatedSearchSessionKey) else { return nil }
+            return try? JSONDecoder().decode(DedicatedSearchSession.self, from: data)
+        }.value
+
+        // Search may have been used while the saved result was decoding.
         guard searchText.isEmpty, galleries.isEmpty,
-              let data = UserDefaults.standard.data(forKey: Self.dedicatedSearchSessionKey),
-              let session = try? JSONDecoder().decode(DedicatedSearchSession.self, from: data),
+              let session,
               session.site == AppSettings.shared.gallerySite.rawValue,
               let keyword = session.search.keyword,
-              !keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              !keyword.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty
         else { return }
 
         applyDedicatedSearchSession(session, into: advancedState)
@@ -2551,7 +2596,8 @@ class GalleryListViewModel {
             galleries: galleries,
             scrollPosition: scrollPosition,
             pagination: pagination.snapshot,
-            savedAt: Date()
+            savedAt: Date(),
+            imageSearchURL: imageSearchURL
         )
     }
 
@@ -2566,6 +2612,7 @@ class GalleryListViewModel {
         currentMode = .search(keyword: keyword)
         advancedState.copyValues(from: session.search)
         syncAdvancedSettings(advancedState)
+        imageSearchURL = session.imageSearchURL
         pagination.restore(session.pagination, galleries: galleries)
         GalleryCache.shared.putMetadata(galleries)
     }
@@ -2583,7 +2630,7 @@ class GalleryListViewModel {
         }
 
         // 先查缓存 (空结果不视为有效缓存 — 可能是之前网络失败)
-        let cacheKey = Self.cacheKey(for: mode, page: 0)
+        let cacheKey = resolvedCacheKey(for: mode, page: 0)
         if let cached = GalleryCache.shared.getListResult(forKey: cacheKey),
            !cached.galleries.isEmpty,
            cached.galleries.allSatisfy({ !GalleryCache.shared.needsMetadataHydration($0) }) {
@@ -2633,12 +2680,13 @@ class GalleryListViewModel {
         currentMode = mode
         errorMessage = nil
         pagination.reset()
-        let cacheKey = Self.cacheKey(for: mode, page: 0)
+        let cacheKey = resolvedCacheKey(for: mode, page: 0)
         currentCacheKey = cacheKey
         await fetchPage(mode: mode, page: 0)
     }
 
     func search() {
+        imageSearchURL = nil
         guard !searchText.isEmpty else { return }
         scrollPosition = nil
         addSearchToHistory(searchText)
@@ -2662,6 +2710,7 @@ class GalleryListViewModel {
     }
 
     func clearDedicatedSearch() {
+        imageSearchURL = nil
         suggestionTask?.cancel()
         requestTask?.cancel()
         searchRestorationTask?.cancel()
@@ -2681,6 +2730,7 @@ class GalleryListViewModel {
 
     /// 带高级搜索参数的搜索 (对齐 Android AdvanceSearchTable → ListUrlBuilder)
     func searchWithAdvanced(_ state: AdvancedSearchState) {
+        imageSearchURL = nil
         scrollPosition = nil
         if !searchText.isEmpty { addSearchToHistory(searchText) }
         currentAdvanceSearch = state.advanceSearchValue
@@ -2715,6 +2765,7 @@ class GalleryListViewModel {
 
     /// 高级搜索面板关闭后自动应用设置 (对齐 Android GalleryListScene.onApplySearch)
     func applyAdvancedSettings(_ state: AdvancedSearchState, initialMode: GalleryListView.ListMode) {
+        imageSearchURL = nil
         syncAdvancedSettings(state)
 
         // 清除缓存，强制使用新参数重新加载
@@ -2772,6 +2823,7 @@ class GalleryListViewModel {
     }
 
     func applyQuickSearch(_ search: QuickSearchRecord) {
+        imageSearchURL = nil
         guard let keyword = search.keyword, !keyword.isEmpty else { return }
         searchText = keyword
         galleries = []
@@ -3352,6 +3404,20 @@ class GalleryListViewModel {
         }
     }
 
+    func loadImageSearch(_ url: URL) {
+        guard EhAPI.imageSearchResultURL(url.absoluteString, relativeTo: url, site: AppSettings.shared.gallerySite) != nil else { return }
+        cancelRequests()
+        imageSearchURL = url
+        searchText = AppLocalization.localized("以图搜图")
+        galleries = []
+        scrollPosition = nil
+        pagination.reset()
+        errorMessage = nil
+        isLoading = true
+        currentMode = .search(keyword: searchText)
+        startReplacingRequest { await self.fetchPage(mode: .search(keyword: self.searchText), page: 0) }
+    }
+
     private func applyReplacement(_ result: GalleryListResult, loadedPage: Int = 0) {
         let replacement = pagination.merge(result.galleries, replacing: true)
         galleries = replacement
@@ -3438,6 +3504,17 @@ class GalleryListViewModel {
             case .popular:
                 urlString = EhURL.popularUrl(for: site)
             case .search(let keyword):
+                if let imageSearchURL {
+                    var components = URLComponents(url: imageSearchURL, resolvingAgainstBaseURL: true)!
+                    if page > 0 {
+                        var items = components.queryItems ?? []
+                        items.removeAll { $0.name == "page" }
+                        items.append(URLQueryItem(name: "page", value: String(page)))
+                        components.queryItems = items
+                    }
+                    urlString = components.url!.absoluteString
+                    break
+                }
                 var builder = ListUrlBuilder()
                 builder.mode = ListUrlBuilder.Mode(rawValue: currentSearchMode.listMode) ?? .normal
                 builder.keyword = keyword
@@ -3503,7 +3580,7 @@ class GalleryListViewModel {
 
             // 缓存第一页结果
             if page == 0 {
-                let cacheKey = Self.cacheKey(for: mode, page: 0)
+                let cacheKey = resolvedCacheKey(for: mode, page: 0)
                 GalleryCache.shared.putListResult(
                     CachedGalleryListResult(
                         galleries: self.galleries,
@@ -3556,6 +3633,11 @@ class GalleryListViewModel {
     }
 
     /// 生成缓存 key
+    private func resolvedCacheKey(for mode: GalleryListView.ListMode, page: Int) -> String {
+        if let imageSearchURL { return "image:\(imageSearchURL.absoluteString):\(page)" }
+        return Self.cacheKey(for: mode, page: page)
+    }
+
     private static func cacheKey(for mode: GalleryListView.ListMode, page: Int) -> String {
         let site = AppSettings.shared.gallerySite.rawValue
         switch mode {

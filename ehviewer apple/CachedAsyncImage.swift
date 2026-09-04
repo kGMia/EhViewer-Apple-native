@@ -346,6 +346,10 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
         self.onImageLoaded = onImageLoaded
         self.content = content
         self.placeholder = placeholder
+        // Native context-menu snapshots may rebuild a cell before its .task
+        // runs. Seed from the decoded cache so that frame is the image, not a
+        // placeholder, without new I/O or a custom preview hierarchy.
+        _image = State(initialValue: url.flatMap { ThumbnailMemoryCache.shared.get($0) })
     }
 
     var body: some View {
@@ -391,13 +395,19 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
             await load()
         }
         .onChange(of: url) { _, _ in
-            image = nil
+            image = url.flatMap { ThumbnailMemoryCache.shared.get($0) }
             hasFailed = false
         }
     }
 
     private func load() async {
-        guard let url else { return }
+        guard let url, !Task.isCancelled else { return }
+        if let cached = ThumbnailMemoryCache.shared.get(url) {
+            image = cached
+            hasFailed = false
+            onImageLoaded?(cached)
+            return
+        }
         isLoading = true
         defer { isLoading = false }
 

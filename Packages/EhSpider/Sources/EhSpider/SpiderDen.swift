@@ -29,10 +29,9 @@ public actor SpiderDen {
     private var mode: SpiderMode = .read
 
     /// 简单的文件缓存（用于阅读模式）
-    /// 审计修复 C-2: 使用 OSAllocatedUnfairLock 替代 nonisolated(unsafe)，消除数据竞争
+    /// Publication of the shared cache is protected by this lock.
     private static let _readCacheLock = NSLock()
     private static nonisolated(unsafe) var _readCache: SimpleDiskCache?
-    private static nonisolated(unsafe) var _cacheInitialized = false
 
     /// 线程安全的 readCache 访问器
     static var readCache: SimpleDiskCache? {
@@ -46,12 +45,8 @@ public actor SpiderDen {
     /// 初始化缓存系统 (应在 App 启动时调用)
     public static func initialize() {
         _readCacheLock.lock()
-        guard !_cacheInitialized else {
-            _readCacheLock.unlock()
-            return
-        }
-        _cacheInitialized = true
-        _readCacheLock.unlock()
+        defer { _readCacheLock.unlock() }
+        guard _readCache == nil else { return }
 
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
             .appendingPathComponent("spider_image")
@@ -63,10 +58,12 @@ public actor SpiderDen {
         let cacheSizeMB = min(max(AppSettings.shared.readCacheSize, 40), 640)
         let cacheSize = cacheSizeMB * 1024 * 1024
 
-        let cache = SimpleDiskCache(directory: cacheDir, maxSize: cacheSize)
-        _readCacheLock.lock()
-        _readCache = cache
-        _readCacheLock.unlock()
+        _readCache = SimpleDiskCache(directory: cacheDir, maxSize: cacheSize)
+    }
+
+    /// Apply a settings change without recreating the cache or restarting.
+    public static func updateReadCacheLimit(megabytes: Int) {
+        readCache?.updateLimit(maxSize: min(max(megabytes, 40), 640) * 1024 * 1024)
     }
 
     /// 清除指定画廊的所有缓存图片 (删除画廊时调用, 避免缓存泄漏)
@@ -74,25 +71,27 @@ public actor SpiderDen {
         guard let cache = readCache else { return }
         for i in 0..<pages {
             cache.remove(key: "image_\(gid)_\(i)")
+            cache.remove(key: "original_\(gid)_\(i)")
         }
     }
 
     // MARK: - Reader cache access
 
     /// Returns compressed source bytes from the bounded reader cache.
-    public static func cachedImageData(gid: Int64, page: Int) -> Data? {
-        readCache?.getData(forKey: "image_\(gid)_\(page)")
+    public static func cachedImageData(gid: Int64, page: Int, original: Bool = false) -> Data? {
+        readCache?.getData(forKey: "\(original ? "original" : "image")_\(gid)_\(page)")
     }
 
     /// Stores compressed source bytes in Caches rather than the permanent
     /// download directory. SimpleDiskCache applies the user's capacity limit.
     @discardableResult
-    public static func cacheImageData(_ data: Data, gid: Int64, page: Int) -> Bool {
+    public static func cacheImageData(_ data: Data, gid: Int64, page: Int, original: Bool = false) -> Bool {
         guard !data.isEmpty else { return false }
-        return readCache?.set(data, forKey: "image_\(gid)_\(page)") ?? false
+        return readCache?.set(data, forKey: "\(original ? "original" : "image")_\(gid)_\(page)") ?? false
     }
 
     public static func readCacheUsage() -> Int64 {
+        if let cache = readCache { return cache.usage() }
         let directory = FileManager.default.urls(
             for: .cachesDirectory,
             in: .userDomainMask
@@ -473,7 +472,10 @@ public enum SpiderMode: Sendable {
 /// 审计修复 C-1: 所有文件系统操作统一在 queue 上执行，消除数据竞争
 final class SimpleDiskCache: @unchecked Sendable {
     private let directory: URL
-    private let maxSize: Int
+    // Accessed only on queue. Count once at startup and update on writes;
+    // directory enumeration is needed again only when actually evicting files.
+    private var maxSize: Int
+    private var totalSize = 0
     private let queue = DispatchQueue(label: "com.ehviewer.spider.cache", qos: .utility)
 
     init(directory: URL, maxSize: Int) {
@@ -510,22 +512,31 @@ final class SimpleDiskCache: @unchecked Sendable {
 
     @discardableResult
     func set(_ data: Data, forKey key: String) -> Bool {
-        let success: Bool = queue.sync {
+        queue.sync {
             let file = fileURL(for: key)
             do {
-                try data.write(to: file)
+                let previousSize = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                try data.write(to: file, options: .atomic)
+                totalSize = max(0, totalSize - previousSize) + data.count
+                if totalSize > maxSize {
+                    trimToSize()
+                }
                 return true
             } catch {
                 return false
             }
         }
-        if success {
-            // 异步检查缓存大小
-            queue.async { [weak self] in
-                self?.trimToSize()
-            }
+    }
+
+    func updateLimit(maxSize: Int) {
+        queue.async { [self] in
+            self.maxSize = maxSize
+            if totalSize > maxSize { trimToSize() }
         }
-        return success
+    }
+
+    func usage() -> Int64 {
+        queue.sync { Int64(totalSize) }
     }
 
     @discardableResult
@@ -533,7 +544,9 @@ final class SimpleDiskCache: @unchecked Sendable {
         queue.sync {
             let file = fileURL(for: key)
             do {
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 try FileManager.default.removeItem(at: file)
+                totalSize = max(0, totalSize - size)
                 return true
             } catch {
                 return false
@@ -550,15 +563,18 @@ final class SimpleDiskCache: @unchecked Sendable {
             for file in files {
                 try? FileManager.default.removeItem(at: file)
             }
+            // Recount in case an individual removal failed.
+            trimToSize()
         }
     }
 
     private func fileURL(for key: String) -> URL {
-        // 使用MD5哈希作为文件名以避免特殊字符问题
+        // Keep existing standard-image filenames; do not truncate longer keys
+        // (original-image keys include a distinct prefix and the complete page).
         let hash = key.data(using: .utf8)?.base64EncodedString()
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "+", with: "-")
-            .prefix(32) ?? key.prefix(32)
+            ?? key
         return directory.appendingPathComponent(String(hash))
     }
 
@@ -571,18 +587,19 @@ final class SimpleDiskCache: @unchecked Sendable {
             )
 
             // 计算总大小
-            var totalSize = 0
+            var measuredSize = 0
             var fileInfos: [(url: URL, size: Int, date: Date)] = []
 
             for file in files {
                 let attributes = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
                 let size = attributes.fileSize ?? 0
                 let date = attributes.contentModificationDate ?? .distantPast
-                totalSize += size
+                measuredSize += size
                 fileInfos.append((file, size, date))
             }
 
             // 如果超过最大大小，删除最旧的文件
+            totalSize = measuredSize
             if totalSize > maxSize {
                 // 按修改时间排序（最旧的在前）
                 fileInfos.sort { $0.date < $1.date }
@@ -592,9 +609,15 @@ final class SimpleDiskCache: @unchecked Sendable {
 
                 for info in fileInfos {
                     if currentSize <= targetSize { break }
-                    try? FileManager.default.removeItem(at: info.url)
-                    currentSize -= info.size
+                    do {
+                        try FileManager.default.removeItem(at: info.url)
+                        currentSize -= info.size
+                    } catch {
+                        // Failed deletions still occupy the cache budget.
+                        continue
+                    }
                 }
+                totalSize = currentSize
             }
         } catch {
             print("[SimpleDiskCache] Failed to trim cache: \(error)")

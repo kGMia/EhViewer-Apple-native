@@ -53,6 +53,7 @@ extension FocusedValues {
 }
 
 struct MainTabView: View {
+    @Environment(AppState.self) private var appState
     /// 每个窗口独立恢复上次所在页面；App Intent 的显式导航请求仍具有更高优先级。
     @SceneStorage("main.selectedTab") private var restoredSelectedTabRawValue = ""
     @SceneStorage("main.selectedGallery") private var restoredSelectedGalleryPayload = ""
@@ -284,7 +285,8 @@ struct MainTabView: View {
                         returnContext: SearchReturnContext(gallery: gallery, tab: selectedTab)
                     )
                 },
-                quickSearch: openDedicatedQuickSearch
+                quickSearch: openDedicatedQuickSearch,
+                imageSearch: openDedicatedImageSearch
             )
         )
         .environment(
@@ -314,8 +316,11 @@ struct MainTabView: View {
             restoredSelectedGalleryPayload = Self.encodeRestoredGallery(gallery)
         }
         .task {
-            searchViewModel.restoreDedicatedSearchSession(into: searchAdvancedState)
-            if let route = AppNavigationRequest.consumePendingReader() {
+            await searchViewModel.restoreDedicatedSearchSession(into: searchAdvancedState)
+            if let gallery = appState.pendingIncomingGallery {
+                appState.pendingIncomingGallery = nil
+                openIncomingGallery(gallery)
+            } else if let route = AppNavigationRequest.consumePendingReader() {
                 openIntentReader(route)
             } else if let query = AppNavigationRequest.consumePendingSearch() {
                 openIntentSearch(query)
@@ -360,6 +365,11 @@ struct MainTabView: View {
             _ = AppNavigationRequest.consumePendingReader()
             openIntentReader(route)
         }
+        .onChange(of: appState.pendingIncomingGallery) { _, gallery in
+            guard let gallery else { return }
+            appState.pendingIncomingGallery = nil
+            openIncomingGallery(gallery)
+        }
         // Focused commands drive the native macOS and iPadOS 26 menu bars.
         .focusedSceneValue(\.selectedMainTab, $selectedTab)
         .focusedSceneValue(
@@ -371,15 +381,7 @@ struct MainTabView: View {
                   let gid = userInfo["gid"] as? Int64,
                   let token = userInfo["token"] as? String else { return }
             let gallery = GalleryInfo(gid: gid, token: token)
-            #if os(macOS)
-            selectedGallery = gallery
-            #else
-            if horizontalSizeClass == .regular {
-                selectedGallery = gallery
-            } else {
-                clipboardGallery = gallery
-            }
-            #endif
+            openIncomingGallery(gallery)
         }
         #if os(iOS)
         .fullScreenCover(item: $intentReaderRoute) { route in
@@ -1060,6 +1062,28 @@ struct MainTabView: View {
         }
     }
 
+    private func openDedicatedImageSearch(_ url: URL) {
+        requestDedicatedSearchFocus(false)
+        if selectedTab == .search {
+            searchViewModel.pushDedicatedSearchStateIfNeeded(replacingWith: url.absoluteString)
+        } else {
+            searchViewModel.discardDedicatedSearchNavigationHistory()
+            searchReturnContext = nil
+        }
+        withAnimation(.smooth(duration: 0.22)) {
+            selectedTab = .search
+            clearTransientNavigation()
+            dedicatedSearchNavigationResetRequest &+= 1
+        }
+        dedicatedSearchPresentationTask?.cancel()
+        dedicatedSearchPresentationTask = Task { @MainActor in
+            await Task.yield()
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            searchViewModel.loadImageSearch(url)
+        }
+    }
+
     private func openDedicatedSearchField() {
         searchReturnContext = nil
         // Do not focus the Search tab while it is still hidden. UIKit would
@@ -1136,6 +1160,18 @@ struct MainTabView: View {
         openWindow(value: route)
         #else
         intentReaderRoute = route
+        #endif
+    }
+
+    private func openIncomingGallery(_ gallery: GalleryInfo) {
+        #if os(macOS)
+        selectedGallery = gallery
+        #else
+        if horizontalSizeClass == .regular {
+            selectedGallery = gallery
+        } else {
+            clipboardGallery = gallery
+        }
         #endif
     }
 

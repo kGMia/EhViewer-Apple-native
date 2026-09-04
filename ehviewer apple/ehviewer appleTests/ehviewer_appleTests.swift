@@ -7,19 +7,612 @@
 
 import Testing
 import AppKit
+import ImageIO
 import EhModels
 import EhAPI
 import EhParser
 import EhDatabase
 import EhDownload
 import EhSettings
+@testable import EhSpider
+@testable import EhCookie
 @testable import ehviewer_apple
+
+private actor PreviewPaginationProbe {
+    private(set) var requestedPages: [Int] = []
+    private let delayedPage: Int?
+    private var delayedStarted = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    init(delayedPage: Int? = nil) { self.delayedPage = delayedPage }
+
+    func waitForDelayedRequest() async {
+        if delayedStarted { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func load(_ url: String) async throws -> (PreviewSet, Int) {
+        let components = URLComponents(string: url)
+        let page = Int(components?.queryItems?.first(where: { $0.name == "p" })?.value ?? "0") ?? 0
+        requestedPages.append(page)
+        if page == delayedPage {
+            delayedStarted = true
+            waiter?.resume()
+            waiter = nil
+            // Simulate a transport that still delivers a cancelled response.
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return (Self.previews(page: page), 5)
+    }
+
+    nonisolated static func previews(page: Int) -> PreviewSet {
+        .large((page * 4..<page * 4 + 4).map {
+            LargePreview(position: $0, imageUrl: "https://unit.invalid/\($0).jpg", pageUrl: "")
+        })
+    }
+}
+
+private actor GalleryUpdateResponseGate {
+    private var started = false
+    private var startedWaiter: CheckedContinuation<Void, Never>?
+    private var responseWaiter: CheckedContinuation<Void, Never>?
+
+    func holdResponse() async {
+        started = true
+        startedWaiter?.resume()
+        startedWaiter = nil
+        await withCheckedContinuation { responseWaiter = $0 }
+    }
+
+    func waitForRequest() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiter = $0 }
+    }
+
+    func releaseResponse() {
+        responseWaiter?.resume()
+        responseWaiter = nil
+    }
+}
 
 @Suite(.serialized)
 struct ehviewer_appleTests {
+    @Test func imageQuotaAcceptsIPModeWithoutInventingNumericLimits() throws {
+        let body = """
+        <h2>Image Limits</h2><p>You are currently using IP-based limits. No restrictions are currently in effect.</p>
+        <p>Alternatively, you can unlock a high-resolution quota for 24 hours by spending 20,000 GP.</p>
+        """
+        let result = try HomeParser.parseQuota(body)
+        #expect(result.limitMode == .ipBasedUnrestricted)
+        #expect(result.resetCost == nil)
+        let uncertain = try HomeParser.parseQuota("<p>You are currently using IP-based limits.</p>")
+        #expect(uncertain.limitMode == .ipBased)
+        do {
+            _ = try HomeParser.parseQuota("<p>This page requires you to log on.</p>")
+            Issue.record("Expected sign-in failure")
+        } catch EhParseError.parseFailure(let reason) {
+            #expect(reason == "Image quota requires sign-in")
+        }
+    }
+
+    @Test @MainActor func imageQuotaIPModeIsNotReportedAsFailure() async {
+        let vm = ImageQuotaViewModel(loader: { HomeDetail(limitMode: .ipBasedUnrestricted) }, context: { "test" })
+        await vm.refresh().value
+        #expect(vm.detail?.limitMode == .ipBasedUnrestricted)
+        #expect(vm.updatedAt != nil && vm.errorMessage == nil)
+    }
+
+    @Test func imageSearchRedirectStaysOnChosenSite() throws {
+        let base = try #require(URL(string: "https://upld.e-hentai.org/image_lookup.php"))
+        let valid = "https://e-hentai.org/?f_shash=abcdef&fs_similar=1"
+        #expect(EhAPI.imageSearchResultURL(valid, relativeTo: base, site: .eHentai)?.absoluteString == valid)
+        #expect(EhAPI.imageSearchResultURL(valid, relativeTo: base, site: .exHentai) == nil)
+        for bad in ["https://untrusted.invalid/?f_shash=abc", "http://e-hentai.org/?f_shash=abc", "https://e-hentai.org/?f_shash=", "https://e-hentai.org/bounce_login.php"] {
+            #expect(EhAPI.imageSearchResultURL(bad, relativeTo: base, site: .eHentai) == nil)
+        }
+    }
+
+    @Test @MainActor func imageSearchPreparationPreservesExactBytes() throws {
+        let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2400, pixelsHigh: 100,
+                                                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                                isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        let image = try SearchImage.prepare(png)
+        #expect(image.original == png && image.originalType == "image/png")
+        #expect(image.thumbnail.width <= 1600 && image.thumbnail.height <= 1600)
+        #expect(CGImageSourceCreateWithData(image.similarityData as CFData, nil) != nil)
+        #expect(image.similarityData.starts(with: [0xff, 0xd8]))
+        #expect(throws: (any Error).self) { try SearchImage.prepare(Data("not an image".utf8)) }
+    }
+
+    @Test @MainActor
+    func previewArrowTargetsAccumulateAndRejectOldCompletion() {
+        var navigation = PreviewPageNavigation()
+        navigation.observe(page: 5)
+        let first = navigation.begin(page: navigation.currentPage + 1, pageCount: 30)
+        let second = navigation.begin(page: navigation.currentPage + 1, pageCount: 30)
+        #expect(navigation.currentPage == 7)
+        navigation.observe(page: 5)
+        navigation.complete(first)
+        #expect(navigation.currentPage == 7 && navigation.pending == second)
+        navigation.complete(second)
+        // A short last page may leave previous-page thumbnails visible. Their
+        // layout callbacks must not undo an explicit selection.
+        navigation.observe(page: 6)
+        #expect(navigation.currentPage == 7)
+        navigation.cancel() // user scrolling takes over
+        navigation.observe(page: 6)
+        #expect(navigation.currentPage == 6)
+        let last = navigation.begin(page: 300, pageCount: 30)
+        #expect(last.page == 29)
+        let reverse = navigation.begin(page: navigation.currentPage - 1, pageCount: 30)
+        navigation.complete(last)
+        #expect(navigation.currentPage == 28 && navigation.pending == reverse)
+        navigation.cancel()
+        #expect(navigation.currentPage == 6)
+    }
+
+    @Test @MainActor
+    func previewAdjacentArrowPreservesLoadedPages() async {
+        let probe = PreviewPaginationProbe()
+        let vm = GalleryPreviewsViewModel(loader: { try await probe.load($0) })
+        vm.initialize(gid: 1, token: "test", totalPages: 5, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        #expect(await vm.jump(to: 1) == 4)
+        #expect(vm.allPreviews.map(\.position) == Array(0..<8))
+        #expect(await vm.jump(to: 2) == 8)
+        #expect(await vm.jump(to: 1) == 4)
+        #expect(vm.allPreviews.map(\.position) == Array(0..<12))
+        #expect(await probe.requestedPages == [1, 2])
+    }
+
+    @Test func imageQuotaParserHandlesFormattingAndMissingCost() throws {
+        let modern = #"""
+        <p>You are currently at <strong>1,234</strong> towards your account limit of
+        <strong>10,000</strong>.</p> <p>You can reset your image quota by spending <strong>250</strong> GP.</p>
+        """#
+        let quota = try HomeParser.parseQuota(modern)
+        #expect(quota.currentUsed == 1234 && quota.totalLimit == 10000 && quota.resetCost == 250)
+        let legacy = #"<p>You are currently at <strong>0</strong> towards a limit of <strong>5,000</strong>.</p><p>Reset Cost: <strong>0</strong> GP</p>"#
+        #expect(try HomeParser.parseQuota(legacy).resetCost == 0)
+        let noCost = #"<p>You are currently at <strong>12,000</strong> towards your account limit of <strong>10,000</strong>.</p>"#
+        #expect(try HomeParser.parseQuota(noCost).resetCost == nil)
+        #expect(throws: (any Error).self) { try HomeParser.parseQuota("<html>Please log in</html>") }
+        #expect(throws: (any Error).self) { try HomeParser.parseQuota("You are currently at 0 towards a limit of 0.") }
+    }
+
+    @Test @MainActor
+    func imageQuotaRefreshFailureKeepsDatedSnapshot() async {
+        var calls = 0
+        let vm = ImageQuotaViewModel(loader: {
+            calls += 1
+            if calls > 1 { throw URLError(.notConnectedToInternet) }
+            return HomeDetail(currentUsed: 120, totalLimit: 100)
+        }, context: { "account" })
+        await vm.refresh().value
+        let date = vm.updatedAt
+        #expect(vm.remaining == 0)
+        #expect(vm.detail?.currentUsed == 120 && date != nil)
+        await vm.refresh().value
+        #expect(vm.updatedAt == date && vm.detail?.currentUsed == 120)
+        #expect(vm.errorMessage != nil && !vm.isLoading)
+    }
+
+    @Test @MainActor
+    func imageQuotaRejectsLateAccountResponse() async {
+        let gate = GalleryUpdateResponseGate()
+        var identity = "old"
+        var calls = 0
+        let vm = ImageQuotaViewModel(loader: {
+            calls += 1
+            if calls == 1 {
+                await gate.holdResponse()
+                return HomeDetail(currentUsed: 90, totalLimit: 100)
+            }
+            return HomeDetail(currentUsed: 10, totalLimit: 100)
+        }, context: { identity })
+        let old = vm.refresh()
+        await gate.waitForRequest()
+        identity = "new"
+        vm.invalidateIfNeeded()
+        await vm.refresh().value
+        await gate.releaseResponse()
+        await old.value
+        #expect(vm.detail?.currentUsed == 10 && vm.remaining == 90)
+        #expect(!vm.isLoading)
+    }
+
+    @Test @MainActor
+    func galleryUpdateResumeSkipsCompletedBatches() async {
+        let galleries = (1...51).map { GalleryInfo(gid: Int64($0), token: "test") }
+        var loads = 0
+        var requests: [[Int64]] = []
+        var shouldFail = true
+        var pauses: [Duration] = []
+        let checker = GalleryUpdateChecker(dependencies: .init(
+            context: { "test" },
+            load: { _ in loads += 1; return .init(galleries: galleries) },
+            check: { batch, _ in
+                requests.append(batch.map(\.gid))
+                if batch.first?.gid == 26 && shouldFail {
+                    shouldFail = false
+                    throw URLError(.networkConnectionLost)
+                }
+                return batch.map { GalleryVersionCheck(gallery: $0, latest: $0.gid == 1 ? GalleryInfo(gid: 101, token: "new") : nil) }
+            },
+            pause: { pauses.append($0) }
+        ))
+        await checker.start()?.value
+        #expect(checker.phase == .failed)
+        #expect(checker.checkedCount == 25)
+        #expect(checker.remainingCount == 26)
+        #expect(checker.updates.count == 1)
+        #expect(checker.canResume)
+        await checker.resume()?.value
+        #expect(checker.phase == .finished)
+        #expect(checker.checkedCount == 51)
+        #expect(checker.remainingCount == 0)
+        #expect(checker.updates.count == 1)
+        #expect(loads == 1)
+        #expect(requests.compactMap(\.first) == [1, 26, 26, 51])
+        #expect(pauses == [.milliseconds(500), .milliseconds(500), .milliseconds(500)])
+        // A new manual pass still observes the cooldown from earlier attempts.
+        await checker.start()?.value
+        #expect(pauses[3] == .seconds(5))
+    }
+
+    @Test @MainActor
+    func galleryUpdateRetryOnlyReplacesFailedItems() async {
+        let galleries = (1...3).map { GalleryInfo(gid: Int64($0), token: "test") }
+        var loads = 0
+        var requests: [[Int64]] = []
+        let checker = GalleryUpdateChecker(dependencies: .init(
+            context: { "test" },
+            load: { _ in loads += 1; return .init(galleries: galleries) },
+            check: { batch, _ in
+                requests.append(batch.map(\.gid))
+                if requests.count == 1 {
+                    return [GalleryVersionCheck(gallery: batch[0], latest: GalleryInfo(gid: 101, token: "new")),
+                            GalleryVersionCheck(gallery: batch[1], error: "Temporary failure")]
+                }
+                return batch.map { GalleryVersionCheck(gallery: $0, latest: $0.gid == 2 ? GalleryInfo(gid: 102, token: "new") : nil) }
+            },
+            pause: { _ in }
+        ))
+        await checker.start()?.value
+        #expect(checker.checkedCount == 3)
+        #expect(checker.unavailable.map(\.gallery.gid) == [2, 3])
+        #expect(checker.canRetryUnavailable)
+        await checker.retryUnavailable()?.value
+        #expect(requests == [[1, 2, 3], [2, 3]])
+        #expect(loads == 1)
+        #expect(checker.checkedCount == 3)
+        #expect(checker.updates.map(\.gallery.gid) == [1, 2])
+        #expect(checker.unavailable.isEmpty)
+        #expect(!checker.canRetryUnavailable)
+    }
+
+    @Test @MainActor
+    func galleryUpdateCancelledResponseCanBeResumed() async {
+        let gate = GalleryUpdateResponseGate()
+        var requests = 0
+        var loads = 0
+        let checker = GalleryUpdateChecker(dependencies: .init(
+            context: { "test" },
+            load: { _ in loads += 1; return .init(galleries: [GalleryInfo(gid: 1, token: "test")]) },
+            check: { batch, _ in
+                requests += 1
+                if requests == 1 { await gate.holdResponse() }
+                return batch.map { GalleryVersionCheck(gallery: $0) }
+            },
+            pause: { _ in }
+        ))
+        let first = checker.start()
+        await gate.waitForRequest()
+        checker.cancel()
+        await gate.releaseResponse()
+        await first?.value
+        #expect(checker.phase == .cancelled)
+        #expect(checker.checkedCount == 0)
+        #expect(checker.remainingCount == 1)
+        await checker.resume()?.value
+        #expect(checker.phase == .finished)
+        #expect(checker.checkedCount == 1)
+        #expect(loads == 1 && requests == 2)
+    }
+
+    @Test @MainActor
+    func galleryUpdateOldAccountCannotOverwriteNewRun() async {
+        let gate = GalleryUpdateResponseGate()
+        var identity = "first"
+        let checker = GalleryUpdateChecker(dependencies: .init(
+            context: { identity },
+            load: { _ in .init(galleries: [GalleryInfo(gid: identity == "first" ? 1 : 2, token: "test")]) },
+            check: { batch, _ in
+                if batch.first?.gid == 1 { await gate.holdResponse() }
+                return batch.map { GalleryVersionCheck(gallery: $0, latest: GalleryInfo(gid: $0.gid + 100, token: "new")) }
+            },
+            pause: { _ in }
+        ))
+        let first = checker.start()
+        await gate.waitForRequest()
+        identity = "second"
+        checker.invalidateIfNeeded()
+        #expect(checker.phase == .idle && checker.updates.isEmpty)
+        await checker.start()?.value
+        await gate.releaseResponse()
+        await first?.value
+        #expect(checker.phase == .finished)
+        #expect(checker.checkedCount == 1)
+        #expect(checker.updates.map(\.gallery.gid) == [2])
+        identity = "third"
+        #expect(checker.resume() == nil)
+        #expect(checker.phase == .idle && checker.updates.isEmpty)
+    }
+
+    @Test func galleryVersionChecksPreservePartialResults() throws {
+        let galleries = (1...7).map { GalleryInfo(gid: Int64($0), token: "old-token") }
+        let data = Data(#"""
+        {"gmetadata":[
+          {"gid":2,"current_gid":2,"current_key":"unchanged"},
+          {"gid":1,"title":"Original title","current_gid":"101","current_key":"new-token"},
+          {"gid":"3","current_gid":null,"current_key":null},
+          {"gid":4,"error":"Gallery unavailable"},
+          {"gid":5,"current_gid":105},
+          {"gid":7,"current_gid":"invalid","current_key":"key"}
+        ]}
+        """#.utf8)
+        let results = try GalleryApiParser.parseVersionChecks(data, galleries: galleries)
+        #expect(results.map(\.gallery.gid) == galleries.map(\.gid))
+        #expect(results[0].gallery.title == "Original title")
+        #expect(results[0].latest?.gid == 101)
+        #expect(results[0].latest?.token == "new-token")
+        #expect(results[1].latest == nil && results[1].error == nil)
+        #expect(results[2].latest == nil && results[2].error == nil)
+        #expect(results[3].error == "Gallery unavailable")
+        #expect(results[4].error == "Invalid gallery version metadata")
+        #expect(results[4].latest == nil)
+        #expect(results[5].error == "Missing gallery metadata")
+        #expect(results[6].error == "Invalid gallery version metadata")
+    }
+
+    @Test func galleryUpdateCandidatesAreUniqueAndValid() {
+        let source = [
+            GalleryInfo(gid: 7, token: "download"),
+            GalleryInfo(gid: 7, token: "favorite"),
+            GalleryInfo(gid: 0, token: "invalid"),
+            GalleryInfo(gid: 8, token: ""),
+            GalleryInfo(gid: 9, token: "valid")
+        ]
+        let result = GalleryUpdateChecker.uniqueGalleries(source)
+        #expect(result.map(\.gid) == [7, 9])
+        #expect(result.first?.token == "download")
+    }
+
 
     @Test func example() async throws {
         // Write your test here and use APIs like `#expect(...)` to check expected conditions.
+    }
+
+    @Test @MainActor
+    func previewJumpLoadsTargetThenBothNeighbors() async throws {
+        let probe = PreviewPaginationProbe()
+        let vm = GalleryPreviewsViewModel(loader: { try await probe.load($0) })
+        vm.initialize(gid: 1, token: "test", totalPages: 5, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        #expect(await vm.jump(to: 3) == 12)
+        #expect(await probe.requestedPages == [3])
+        #expect(vm.previousPage == 2)
+        #expect(vm.nextPage == 4)
+        await vm.loadAdjacent(page: 2)
+        await vm.loadAdjacent(page: 4)
+        await vm.loadAdjacent(page: 1)
+        #expect(vm.allPreviews.map(\.position) == Array(4..<20))
+        #expect(vm.page(containing: 12) == 3)
+        #expect(vm.previousPage == 0)
+        #expect(vm.nextPage == nil)
+        #expect(await vm.jump(to: 0) == 0)
+        #expect(await probe.requestedPages == [3, 2, 4, 1])
+    }
+
+    @Test
+    func previewPagerDoesNotMistakeNextForLast() throws {
+        for pagerClass in ["ptt", "ptb"] {
+            let html = """
+            <table class="\(pagerClass)"><tr>
+              <td><a href="?p=18">&lt;</a></td>
+              <td><a href="?p=0">1</a></td><td>…</td><td>20</td>
+              <td><a href="?p=29">30</a></td>
+              <td><a href="?p=20">&gt;</a></td>
+            </tr></table>
+            """
+            #expect(try GalleryDetailParser.parsePreviewPages(html) == 30)
+        }
+        let last = #"<table class="ptb"><tr><td><a href="?p=28">&lt;</a></td><td>30</td><td>&gt;</td></tr></table>"#
+        #expect(try GalleryDetailParser.parsePreviewPages(last) == 30)
+        #expect(try GalleryDetailParser.parsePreviewPages("<html></html>") == 0)
+    }
+
+    @Test
+    func previewCombinedParserPreservesImagesAndCount() throws {
+        let html = #"""
+        <div class="gdtl"><a href="https://e-hentai.org/s/test/1-77"><img alt="77" src="https://unit.invalid/77.jpg"></a></div>
+        <table class="ptt"><tr><td>20</td><td><a href="?p=29">30</a></td><td><a href="?p=20">&gt;</a></td></tr></table>
+        """#
+        let (previews, count) = try GalleryDetailParser.parsePreviewPage(html)
+        #expect(count == 30)
+        guard case .large(let items) = previews else {
+            Issue.record("Expected large previews")
+            return
+        }
+        #expect(items.map(\.position) == [76])
+        #expect(items.first?.imageUrl == "https://unit.invalid/77.jpg")
+    }
+
+    @Test @MainActor
+    func previewJumpPreservesKnownTotalAndCanReachBothEnds() async {
+        let vm = GalleryPreviewsViewModel(loader: { url in
+            let page = Int(URLComponents(string: url)?.queryItems?.first(where: { $0.name == "p" })?.value ?? "0") ?? 0
+            // Simulate a partial pager reporting just the selected page.
+            return (PreviewPaginationProbe.previews(page: page), page + 1)
+        })
+        vm.initialize(gid: 1, token: "test", totalPages: 30, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        #expect(await vm.jump(to: 19) == 76)
+        #expect(vm.pageCount == 30)
+        #expect(vm.previousPage == 18 && vm.nextPage == 20)
+        await vm.loadAdjacent(page: 18)
+        await vm.loadAdjacent(page: 20)
+        #expect(vm.pageCount == 30)
+        #expect(vm.allPreviews.map(\.position) == Array(72..<84))
+        #expect(await vm.jump(to: 29) == 116)
+        #expect(vm.pageCount == 30 && vm.nextPage == nil)
+        #expect(await vm.jump(to: 0) == 0)
+        #expect(vm.pageCount == 30 && vm.nextPage == 1)
+    }
+
+    @Test @MainActor
+    func previewPageTotalCanGrowWhenNewMetadataArrives() async {
+        let vm = GalleryPreviewsViewModel(loader: { _ in (PreviewPaginationProbe.previews(page: 1), 31) })
+        vm.initialize(gid: 1, token: "test", totalPages: 2, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        #expect(await vm.jump(to: 1) == 4)
+        #expect(vm.pageCount == 31 && vm.nextPage == 2)
+    }
+
+    @Test @MainActor
+    func previewFailedJumpPreservesCurrentWindow() async {
+        let vm = GalleryPreviewsViewModel(loader: { _ in throw URLError(.notConnectedToInternet) })
+        vm.initialize(gid: 1, token: "test", totalPages: 5, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        #expect(await vm.jump(to: 4) == nil)
+        #expect(vm.allPreviews.map(\.position) == Array(0..<4))
+        #expect(vm.lowerPage == 0 && vm.upperPage == 0)
+        #expect(vm.errors[4] != nil)
+        #expect(!vm.isJumping)
+    }
+
+    @Test @MainActor
+    func previewNewJumpRejectsLateResponse() async {
+        let probe = PreviewPaginationProbe(delayedPage: 3)
+        let vm = GalleryPreviewsViewModel(loader: { try await probe.load($0) })
+        vm.initialize(gid: 1, token: "test", totalPages: 5, initialPreviewSet: PreviewPaginationProbe.previews(page: 0))
+        let oldJump = Task { await vm.jump(to: 3) }
+        await probe.waitForDelayedRequest()
+        #expect(await vm.jump(to: 1) == 4)
+        #expect(await oldJump.value == nil)
+        #expect(vm.allPreviews.map(\.position) == Array(0..<8))
+        #expect(vm.lowerPage == 0 && vm.upperPage == 1)
+    }
+
+    @Test
+    func cookieSnapshotAcceptsDuplicateNames() throws {
+        let first = try #require(HTTPCookie(properties: [
+            .name: "ipb_member_id", .value: "first", .domain: "e-hentai.org", .path: "/",
+        ]))
+        let duplicate = try #require(HTTPCookie(properties: [
+            .name: "ipb_member_id", .value: "second", .domain: ".e-hentai.org", .path: "/",
+        ]))
+        let pass = try #require(HTTPCookie(properties: [
+            .name: "ipb_pass_hash", .value: "test-only", .domain: ".e-hentai.org", .path: "/",
+        ]))
+        let values = EhCookieManager.cookieValues([first, duplicate, pass])
+        #expect(values["ipb_member_id"] == "first")
+        #expect(values["ipb_pass_hash"] == "test-only")
+        #expect(values.count == 2)
+        #expect(EhCookieManager.cookieValues([]).isEmpty)
+    }
+
+    @Test
+    func readerDiskCacheAccountsForOverwriteRemovalAndLimitChanges() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = SimpleDiskCache(directory: directory, maxSize: 100)
+        #expect(cache.set(Data(repeating: 1, count: 40), forKey: "first"))
+        #expect(cache.set(Data(repeating: 2, count: 20), forKey: "first"))
+        #expect(cache.usage() == 20)
+        #expect(cache.set(Data(repeating: 3, count: 40), forKey: "second"))
+        #expect(cache.usage() == 60)
+        #expect(cache.remove(key: "first"))
+        #expect(cache.usage() == 40)
+        cache.updateLimit(maxSize: 20)
+        #expect(cache.usage() <= 20)
+        #expect(cache.set(Data(repeating: 4, count: 10), forKey: "third"))
+        cache.removeAll()
+        #expect(cache.usage() == 0)
+    }
+
+    @Test
+    func readerDiskCacheDoesNotTruncatePageIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = SimpleDiskCache(directory: directory, maxSize: 1024)
+        let first = "original_123456789012345678_100"
+        let second = "original_123456789012345678_101"
+        #expect(cache.set(Data([1]), forKey: first))
+        #expect(cache.set(Data([2]), forKey: second))
+        #expect(cache.getData(forKey: first) == Data([1]))
+        #expect(cache.getData(forKey: second) == Data([2]))
+    }
+
+    @Test @MainActor
+    func readerUsesLocalDownloadInsteadOfScaledDiskCache() async throws {
+        let gid = -Int64.random(in: 1...Int64.max)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            SpiderDen.clearCache(forGid: gid, pages: 1)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        SpiderDen.initialize()
+        let scaled = try readerTestPNG(width: 4, height: 8)
+        #expect(SpiderDen.cacheImageData(scaled, gid: gid, page: 0))
+        let localURL = directory.appendingPathComponent("page.png")
+        try readerTestPNG(width: 12, height: 4).write(to: localURL)
+        let reader = ReaderViewModel()
+        reader.gid = gid
+        reader.totalPages = 1
+        reader.isDownloaded = true
+        reader.imageURLs[0] = localURL.absoluteString
+        await reader.downloadImageData(0)
+        let image = try #require(reader.image(at: 0))
+        #expect(image.size.width > image.size.height)
+        reader.cancelBackgroundWork()
+    }
+
+    @Test @MainActor
+    func loadingOriginalDoesNotReuseScaledDiskCache() async throws {
+        let gid = -Int64.random(in: 1...Int64.max)
+        SpiderDen.initialize()
+        defer { SpiderDen.clearCache(forGid: gid, pages: 1) }
+        let scaled = try readerTestPNG(width: 4, height: 8)
+        let original = try readerTestPNG(width: 12, height: 4)
+        #expect(SpiderDen.cacheImageData(scaled, gid: gid, page: 0))
+        #expect(SpiderDen.cacheImageData(original, gid: gid, page: 0, original: true))
+        let reader = ReaderViewModel()
+        reader.gid = gid
+        reader.totalPages = 1
+        reader.imageURLs[0] = "https://unit.invalid/scaled.png"
+        reader.originalImageURLs[0] = "https://unit.invalid/original.png"
+        await reader.downloadImageData(0)
+        let before = try #require(reader.image(at: 0))
+        #expect(before.size.width < before.size.height)
+        await reader.loadOriginalImage(0)
+        let after = try #require(reader.image(at: 0))
+        #expect(after.size.width > after.size.height)
+        #expect(reader.pagesUsingOriginalImage.contains(0))
+        #expect(SpiderDen.cachedImageData(gid: gid, page: 0) == scaled)
+        reader.cancelBackgroundWork()
+    }
+
+    @MainActor
+    private func readerTestPNG(width: Int, height: Int) throws -> Data {
+        let bitmap = try #require(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+            isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ))
+        for x in 0..<width {
+            for y in 0..<height { bitmap.setColor(.white, atX: x, y: y) }
+        }
+        return try #require(bitmap.representation(using: .png, properties: [:]))
     }
 
     @Test @MainActor

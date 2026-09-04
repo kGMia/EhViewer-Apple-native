@@ -297,11 +297,14 @@ public struct ArchiverData: Sendable {
 // MARK: - 配额信息
 
 public struct HomeDetail: Sendable {
+    public enum LimitMode: Sendable { case account, ipBased, ipBasedUnrestricted }
+    public var limitMode: LimitMode
     public var currentUsed: Int
     public var totalLimit: Int
-    public var resetCost: Int
+    public var resetCost: Int?
 
-    public init(currentUsed: Int = 0, totalLimit: Int = 0, resetCost: Int = 0) {
+    public init(currentUsed: Int = 0, totalLimit: Int = 0, resetCost: Int? = nil, limitMode: LimitMode = .account) {
+        self.limitMode = limitMode
         self.currentUsed = currentUsed
         self.totalLimit = totalLimit
         self.resetCost = resetCost

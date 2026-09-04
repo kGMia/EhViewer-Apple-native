@@ -62,6 +62,7 @@ struct DownloadsView: View {
     /// 内，List 收起 swipe 时可能重建/回收该行，菜单会随宿主一起消失。
     @State private var pendingDeleteTask: DownloadTask?
     @State private var showMoveLabelSheet = false
+    @State private var showGalleryUpdates = false
 
     // MARK: - 标签管理
     @State private var showNewLabelAlert = false
@@ -150,6 +151,7 @@ struct DownloadsView: View {
             .sheet(isPresented: $showMoveLabelSheet) {
                 batchMoveLabelSheet
             }
+            .sheet(isPresented: $showGalleryUpdates) { GalleryUpdatesView() }
             // 批量删除确认
             .confirmationDialog("确认删除 \(selectedGids.count) 个下载？", isPresented: $showBatchDeleteConfirm, titleVisibility: .visible) {
                 Button("仅删除记录", role: .destructive) {
@@ -415,6 +417,10 @@ struct DownloadsView: View {
                 }
             } else {
                 // 普通模式
+                Button("检查画廊更新", systemImage: "arrow.clockwise") {
+                    showGalleryUpdates = true
+                }
+                Divider()
 
                 // 状态过滤 (对齐 Android DownloadsScene 状态筛选)
                 Picker("状态过滤", selection: $statusFilter) {

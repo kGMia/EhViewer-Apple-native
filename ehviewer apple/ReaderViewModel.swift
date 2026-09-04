@@ -217,7 +217,8 @@ class ReaderViewModel {
 
     private var pTokens: [Int: String] = [:]
     private var showKeys: [Int: String] = [:]
-    private var loadingPages: Set<Int> = []
+    private var loadingPages: [Int: UUID] = [:]
+    private var galleryGeneration = UUID()
     private var downloadDir: URL?
     private var imageLoadTasks: [Int: InFlightImageLoad] = [:]
     private var prefetchTask: Task<Void, Never>?
@@ -291,9 +292,10 @@ class ReaderViewModel {
         #endif
     }
 
-    /// NSCache composite key: "gid:pageIndex" — 防止切换画廊时命中旧画廊的图片缓存
+    /// Keep downloaded files and originals separate from the site's scaled image.
     private func cacheKey(for page: Int) -> NSString {
-        "\(gid):\(page)" as NSString
+        let source = pagesUsingOriginalImage.contains(page) ? "original" : (isDownloaded ? "local" : "scaled")
+        return "\(gid):\(page):\(source)" as NSString
     }
 
     /// Returns a decoded page from either the observable working set or the
@@ -889,6 +891,7 @@ class ReaderViewModel {
     /// 彻底重置所有状态 — 在加载新画廊前调用
     /// UI 会因 totalPages == 0 立即切入 Loading 状态
     private func resetState() {
+        galleryGeneration = UUID()
         // 页面状态
         currentPage = 0
         totalPages = 0
@@ -933,12 +936,17 @@ class ReaderViewModel {
     /// 检查下载状态并设置本地目录 — 替代旧的硬编码 `isDownloaded` + `gid-token` 路径
     /// 验证: 数据库状态 == stateFinish AND 磁盘目录存在
     func setupLocalGallery() async {
-        let fullyDownloaded = await DownloadManager.shared.isGalleryFullyDownloaded(gid: gid)
+        let generation = galleryGeneration
+        let galleryID = gid
+        let fullyDownloaded = await DownloadManager.shared.isGalleryFullyDownloaded(gid: galleryID)
+        guard !Task.isCancelled, generation == galleryGeneration else { return }
         if fullyDownloaded,
-           let dir = await DownloadManager.shared.getDownloadedGalleryDirectory(gid: gid) {
+           let dir = await DownloadManager.shared.getDownloadedGalleryDirectory(gid: galleryID) {
+            guard !Task.isCancelled, generation == galleryGeneration else { return }
             self.isDownloaded = true
             self.downloadDir = dir
         } else {
+            guard !Task.isCancelled, generation == galleryGeneration else { return }
             self.isDownloaded = false
             self.downloadDir = nil
         }
@@ -1048,85 +1056,22 @@ class ReaderViewModel {
         _ index: Int,
         priority: TaskPriority = .userInitiated
     ) async {
+        guard !Task.isCancelled, index >= 0, index < totalPages else { return }
         // 已缓存 → 直接提升到 Observable 层 (使用 gid:page 复合 key)
         let key = cacheKey(for: index)
         if let cached = Self.imageCache.object(forKey: key) {
-            await MainActor.run {
-                if self.cachedImages[index] == nil {
-                    self.cachedImages[index] = cached
-                }
+            if cachedImages[index] == nil {
+                cachedImages[index] = cached
             }
             return
         }
-
-        // The configured reader cache stores compressed source bytes. Decode
-        // only after a hit and keep both disk access and ImageIO off MainActor.
         let galleryID = gid
         let maxPixelSize = Self.maxDecodePixelSize
-        if let diskCached = await Task.detached(priority: .utility, operation: {
-            guard let data = SpiderDen.cachedImageData(gid: galleryID, page: index)
-            else { return nil as PlatformImage? }
-            return Self.downsampledImage(data: data, maxPixelSize: maxPixelSize)
-        }).value {
-            Self.imageCache.setObject(
-                diskCached,
-                forKey: key,
-                cost: Self.decodedCost(of: diskCached)
-            )
-            cachedImages[index] = diskCached
-            downloadProgress.removeValue(forKey: index)
-            errorPages.remove(index)
-            errorMessages.removeValue(forKey: index)
-            return
-        }
         guard let urlString = imageURLs[index], let url = URL(string: urlString) else { return }
         let performanceInterval = PerformanceDiagnostics.begin("ReaderImageLoadDecode")
         defer { performanceInterval.end() }
-
-        // Downloaded galleries use file URLs. Reading them through URLSession
-        // adds network retry/connection machinery and may fail on some OS
-        // versions. Read and decode locally, entirely away from MainActor.
-        if url.isFileURL {
-            let outcome = await Task.detached(priority: priority) {
-                do {
-                    let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                    guard let image = Self.downsampledImage(
-                        data: data,
-                        maxPixelSize: maxPixelSize
-                    ) else {
-                        return ImageLoadOutcome.invalidData
-                    }
-                    return ImageLoadOutcome.image(image)
-                } catch is CancellationError {
-                    return ImageLoadOutcome.cancelled
-                } catch {
-                    return ImageLoadOutcome.failure(error.localizedDescription)
-                }
-            }.value
-
-            switch outcome {
-            case .image(let image):
-                Self.imageCache.setObject(
-                    image,
-                    forKey: key,
-                    cost: Self.decodedCost(of: image)
-                )
-                cachedImages[index] = image
-                downloadProgress.removeValue(forKey: index)
-                errorPages.remove(index)
-                errorMessages.removeValue(forKey: index)
-            case .invalidData:
-                errorPages.insert(index)
-                errorMessages[index] = AppLocalization.localized("图片数据无效")
-            case .failure(let message):
-                errorPages.insert(index)
-                errorMessages[index] = message
-            case .cancelled:
-                break
-            }
-            return
-        }
-
+        // Register before the first suspension: visible loading and prefetch
+        // share disk reads and decoding, not just network requests.
         let entry: InFlightImageLoad
         if let existing = imageLoadTasks[index] {
             entry = existing
@@ -1140,8 +1085,32 @@ class ReaderViewModel {
             request.timeoutInterval = 60
 
             let session = Self.session
+            let original = pagesUsingOriginalImage.contains(index)
             let id = UUID()
             let task = Task.detached(priority: priority) {
+                guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
+                // A permanent download takes precedence over the reading cache.
+                if url.isFileURL {
+                    do {
+                        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                        try Task.checkCancellation()
+                        guard let image = Self.downsampledImage(data: data, maxPixelSize: maxPixelSize) else {
+                            return ImageLoadOutcome.invalidData
+                        }
+                        try Task.checkCancellation()
+                        return ImageLoadOutcome.image(image)
+                    } catch is CancellationError {
+                        return ImageLoadOutcome.cancelled
+                    } catch {
+                        return ImageLoadOutcome.failure(error.localizedDescription)
+                    }
+                }
+                if let data = SpiderDen.cachedImageData(gid: galleryID, page: index, original: original) {
+                    guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
+                    if let image = Self.downsampledImage(data: data, maxPixelSize: maxPixelSize) {
+                        return Task.isCancelled ? .cancelled : .image(image)
+                    }
+                }
                 for attempt in 0..<3 {
                     guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
                     do {
@@ -1157,7 +1126,8 @@ class ReaderViewModel {
                         ) else {
                             return ImageLoadOutcome.invalidData
                         }
-                        _ = SpiderDen.cacheImageData(data, gid: galleryID, page: index)
+                        guard !Task.isCancelled else { return ImageLoadOutcome.cancelled }
+                        _ = SpiderDen.cacheImageData(data, gid: galleryID, page: index, original: original)
                         return ImageLoadOutcome.image(image)
                     } catch is CancellationError {
                         return ImageLoadOutcome.cancelled
@@ -1181,14 +1151,16 @@ class ReaderViewModel {
         }
 
         let outcome = await entry.task.value
-        if imageLoadTasks[index]?.id == entry.id {
-            imageLoadTasks.removeValue(forKey: index)
-        }
+        // A retry, source change or gallery reset revokes the old task's right
+        // to publish. Only one of its coalesced callers consumes the result.
+        guard imageLoadTasks[index]?.id == entry.id else { return }
+        imageLoadTasks.removeValue(forKey: index)
+        guard gid == galleryID, imageURLs[index] == urlString, cacheKey(for: index) == key else { return }
 
         switch outcome {
         case .image(let image):
             let cost = Self.decodedCost(of: image)
-            Self.imageCache.setObject(image, forKey: cacheKey(for: index), cost: cost)
+            Self.imageCache.setObject(image, forKey: key, cost: cost)
             if pagesRetainedForLoading(around: currentPage).contains(index) {
                 cachedImages[index] = image
             }
@@ -1212,11 +1184,11 @@ class ReaderViewModel {
     }
 
     /// Re-resolves the page and replaces the displayed source with the site's
-    /// "Download original" URL. The decoded cache must be cleared because its
-    /// key intentionally identifies a page rather than a particular source URL.
+    /// "Download original" URL. Revoke the scaled-image task before switching
+    /// to the original's independent disk and memory cache entries.
     func loadOriginalImage(_ index: Int) async {
         guard index >= 0, index < totalPages else { return }
-
+        let generation = galleryGeneration
         let originalURL: URL
         do {
             originalURL = try await resolveOriginalImageURL(for: index)
@@ -1224,9 +1196,12 @@ class ReaderViewModel {
             debugLog("[Reader] Original image lookup failed page \(index): \(error.localizedDescription)")
             return
         }
+        guard !Task.isCancelled, galleryGeneration == generation else { return }
+        imageLoadTasks.removeValue(forKey: index)?.task.cancel()
         Self.imageCache.removeObject(forKey: cacheKey(for: index))
         cachedImages.removeValue(forKey: index)
         spreadImageCache.removeAll(keepingCapacity: true)
+        dominantColors.removeValue(forKey: index)
         imageURLs[index] = originalURL.absoluteString
         pagesUsingOriginalImage.insert(index)
         errorPages.remove(index)
@@ -1252,7 +1227,11 @@ class ReaderViewModel {
 
     private func sourceImageData(from url: URL) async throws -> Data {
         if url.isFileURL {
-            return try Data(contentsOf: url, options: .mappedIfSafe)
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: url, options: .mappedIfSafe)
+            }.value
+            try Task.checkCancellation()
+            return data
         }
         var request = URLRequest(url: url)
         request.setValue(
@@ -1270,6 +1249,7 @@ class ReaderViewModel {
     }
 
     private func resolveOriginalImageURL(for index: Int) async throws -> URL {
+        let generation = galleryGeneration
         if let cached = originalImageURLs[index], let url = URL(string: cached) {
             return url
         }
@@ -1279,6 +1259,7 @@ class ReaderViewModel {
             pToken = cachedToken
         } else {
             pToken = try await fetchPToken(page: index)
+            guard generation == galleryGeneration else { throw CancellationError() }
             pTokens[index] = pToken
         }
 
@@ -1293,6 +1274,8 @@ class ReaderViewModel {
         )
         request.timeoutInterval = 20
         let (data, response) = try await Self.session.data(for: request)
+        try Task.checkCancellation()
+        guard generation == galleryGeneration else { throw CancellationError() }
         if let response = response as? HTTPURLResponse,
            !(200...299).contains(response.statusCode) {
             throw URLError(.badServerResponse)
@@ -1319,12 +1302,14 @@ class ReaderViewModel {
     /// 带重试的页面 URL 获取 (最多 5 次)
     func loadPageWithRetry(_ index: Int) async {
         let maxRetries = 5
+        let generation = galleryGeneration
         for attempt in 0..<maxRetries {
-            guard !Task.isCancelled else { return }
-            await MainActor.run { self.retryingPages[index] = attempt }
+            guard !Task.isCancelled, generation == galleryGeneration else { return }
+            retryingPages[index] = attempt
             await loadPage(index)
+            guard !Task.isCancelled, generation == galleryGeneration else { return }
             if imageURLs[index] != nil {
-                await MainActor.run { _ = self.retryingPages.removeValue(forKey: index) }
+                retryingPages.removeValue(forKey: index)
                 return
             }
             if errorPages.contains(index) { return }
@@ -1332,26 +1317,26 @@ class ReaderViewModel {
             let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
             do { try await Task.sleep(nanoseconds: delay) } catch { return }
         }
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-            self.errorPages.insert(index)
-            self.errorMessages[index] = AppLocalization.localized("加载超时，请点击重试")
-            self.retryingPages.removeValue(forKey: index)
-        }
+        guard !Task.isCancelled, generation == galleryGeneration else { return }
+        errorPages.insert(index)
+        errorMessages[index] = AppLocalization.localized("加载超时，请点击重试")
+        retryingPages.removeValue(forKey: index)
     }
 
     func loadPage(_ index: Int) async {
         guard index >= 0, index < totalPages else { return }
+        let generation = galleryGeneration
         guard imageURLs[index] == nil else { return }
-        if loadingPages.contains(index) {
+        if loadingPages[index] != nil {
             // 可见页与预取命中同一 HTML 请求时等待该请求，而不是直接返回。
             // 若原预取被取消，集合会在 defer 中释放，当前调用随后接管重试。
-            while loadingPages.contains(index) {
+            while loadingPages[index] != nil {
                 do {
                     try await Task.sleep(for: .milliseconds(20))
                 } catch {
                     return
                 }
+                guard generation == galleryGeneration else { return }
             }
             guard imageURLs[index] == nil else { return }
             guard !Task.isCancelled else { return }
@@ -1360,10 +1345,8 @@ class ReaderViewModel {
         // 优先本地 (Fix D-1: 通过 DownloadManager 统一路径，本地找不到时回退网络)
         if isDownloaded, let dir = downloadDir {
             if let localURL = SpiderInfoFile.getLocalImageURL(in: dir, pageIndex: index) {
-                await MainActor.run {
-                    self.imageURLs[index] = localURL.absoluteString
-                    self.errorPages.remove(index)
-                }
+                imageURLs[index] = localURL.absoluteString
+                errorPages.remove(index)
                 return
             }
             // 本地文件缺失 — 不 return，继续尝试网络加载
@@ -1371,15 +1354,16 @@ class ReaderViewModel {
 
         // URL 缓存
         if let cached = GalleryCache.shared.getImageURL(gid: gid, page: index) {
-            await MainActor.run {
-                self.imageURLs[index] = cached
-                self.errorPages.remove(index)
-            }
+            imageURLs[index] = cached
+            errorPages.remove(index)
             return
         }
 
-        loadingPages.insert(index)
-        defer { loadingPages.remove(index) }
+        let requestID = UUID()
+        loadingPages[index] = requestID
+        defer {
+            if loadingPages[index] == requestID { loadingPages.removeValue(forKey: index) }
+        }
 
         do {
             let site = GalleryActionService.siteBaseURL
@@ -1389,6 +1373,7 @@ class ReaderViewModel {
                 pageUrl = "\(site)s/\(pToken)/\(gid)-\(index + 1)"
             } else {
                 let pToken = try await fetchPToken(page: index)
+                guard generation == galleryGeneration, loadingPages[index] == requestID else { return }
                 pTokens[index] = pToken
                 pageUrl = "\(site)s/\(pToken)/\(gid)-\(index + 1)"
             }
@@ -1401,6 +1386,8 @@ class ReaderViewModel {
             request.timeoutInterval = 15
 
             let (data, _) = try await Self.session.data(for: request)
+            try Task.checkCancellation()
+            guard generation == galleryGeneration, loadingPages[index] == requestID else { return }
             let html = String(data: data, encoding: .utf8) ?? ""
             cacheOriginalImageURL(from: html, for: index)
 
@@ -1408,13 +1395,11 @@ class ReaderViewModel {
                let r = Range(m.range(at: 1), in: html) {
                 let imgUrl = String(html[r])
                 GalleryCache.shared.putImageURL(imgUrl, gid: gid, page: index)
-                await MainActor.run {
-                    self.imageURLs[index] = imgUrl
-                    self.errorPages.remove(index)
-                }
+                imageURLs[index] = imgUrl
+                errorPages.remove(index)
             } else {
                 debugLog("[Reader] Failed to extract image URL from page HTML for page \(index)")
-                await MainActor.run { _ = self.errorPages.insert(index) }
+                errorPages.insert(index)
                 return
             }
 
@@ -1434,21 +1419,24 @@ class ReaderViewModel {
     }
 
     func retryLoadPage(_ index: Int) async {
-        await MainActor.run {
-            self.imageURLs[index] = nil
-            self.cachedImages.removeValue(forKey: index)
-            self.spreadImageCache.removeAll(keepingCapacity: true)
-            self.errorPages.remove(index)
-            self.errorMessages.removeValue(forKey: index)
-            self.retryingPages.removeValue(forKey: index)
-            self.downloadProgress.removeValue(forKey: index)
-            self.retryGeneration[index, default: 0] += 1
-        }
+        let generation = galleryGeneration
+        imageLoadTasks.removeValue(forKey: index)?.task.cancel()
+        Self.imageCache.removeObject(forKey: cacheKey(for: index))
+        pagesUsingOriginalImage.remove(index)
+        imageURLs[index] = nil
+        cachedImages.removeValue(forKey: index)
+        spreadImageCache.removeAll(keepingCapacity: true)
+        errorPages.remove(index)
+        errorMessages.removeValue(forKey: index)
+        retryingPages.removeValue(forKey: index)
+        downloadProgress.removeValue(forKey: index)
+        retryGeneration[index, default: 0] += 1
         Self.imageCache.removeObject(forKey: cacheKey(for: index))
         pTokens.removeValue(forKey: index)
         GalleryCache.shared.removeImageURL(gid: gid, page: index)
-        loadingPages.remove(index)
+        loadingPages.removeValue(forKey: index)
         await loadPageWithRetry(index)
+        guard !Task.isCancelled, generation == galleryGeneration else { return }
         await downloadImageData(index)
     }
 
@@ -1524,6 +1512,7 @@ class ReaderViewModel {
     }
 
     private func fetchPToken(page: Int) async throws -> String {
+        let generation = galleryGeneration
         let site = GalleryActionService.siteBaseURL
         let detailPage = page / 20
         let urlStr = "\(site)g/\(gid)/\(token)/\(detailPage > 0 ? "?p=\(detailPage)" : "")"
@@ -1537,6 +1526,8 @@ class ReaderViewModel {
         request.timeoutInterval = 15
 
         let (data, _) = try await Self.session.data(for: request)
+        try Task.checkCancellation()
+        guard generation == galleryGeneration else { throw CancellationError() }
         let html = String(data: data, encoding: .utf8) ?? ""
 
         let range = NSRange(html.startIndex..., in: html)
