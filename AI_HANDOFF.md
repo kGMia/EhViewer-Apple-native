@@ -109,3 +109,35 @@
 - Both feed List implementations keep GalleryWatchLaterSwipeButton in the same trailing action slot for add/remove. The component reads current service state, disables repeated taps while writing and retains the descriptive VoiceOver label. The old opposite-edge removal action is removed.
 - User authorized committing and pushing the accumulated changes to GitHub on the existing codex/reader-cache-stability branch. No force push or main-branch merge is intended.
 - Validation before submission: iOS and macOS Debug builds passed (logs: /tmp/ehviewer-search-width-ios.log and /tmp/ehviewer-search-width-macos.log); git diff --check passed. Window sizing and swipe behavior still need runtime verification.
+
+## 2026-09-09 ordered refinement pass
+
+- Previous-page responses now carry the replacement generation: switching/restoring/cancelling search invalidates old results, pending scroll restoration and old-request loading-state cleanup. Cancellation is rechecked after asynchronous enrichment.
+- Geometry anchor ties select by vertical position, then horizontal position, then gid. Three anchor regressions passed including partial rows, viewport-sized rows, deterministic columns and stale owner cleanup.
+- Search panel resolves its keyboard selection once per body instead of rebuilding candidate arrays for each row highlight. Previous-page button has 44 pt minimum height and loading feedback.
+- Added background ThumbnailDecode signpost with static, metadata-free names. Failure-cache pruning now enforces 500 entries even when all failures are inside the 120-second cooldown.
+- xctrace device enumeration found paired iOS/iPadOS devices offline. Device first/second-preview traces, scroll frame-rate/memory measurements and runtime visual acceptance remain pending; do not claim these steps verified or the cold stall fixed.
+- GitHub push remains paused. These changes are uncommitted after local commit 5311688.
+
+## 2026-09-09 system-style search refinement
+
+- Focused search uses an explicit localized Cancel text button; home/popular switching is temporarily hidden. Cancel width is measured so the history surface aligns with the actual field, including longer localizations.
+- Removed the history panel's extra horizontal inset, adjusted headers/icon hierarchy and delete target size, and softened focus-transition bounce. Compact List section spacing is iOS-only.
+- Preserved image search, advanced search, keyboard candidate routing, Liquid Glass and separate unscaled text. This is a refinement of the existing search component, not a migration to searchable.
+- Current running macOS app was inspected as a reference only; its build identity was not verified. Do not treat that observation as validation of the new binary.
+- Validation: iOS and macOS Debug builds succeeded; git diff --check passed. New-build visual acceptance and device touch/keyboard testing remain pending. No commit or push this turn.
+
+## 2026-09-09 glass consistency, close icon and list preview
+
+- User requested the close icon back: focused search now uses the original circle xmark. Measured trailing width and aligned panel remain.
+- SearchSurfaceStyle shares 22 pt corners, 12 pt inset, 6 pt gap and spring timing. At 44 pt height the field still reads as a capsule. History clips its foreground before adding glass so the system shadow is not cut off. No manual shadow/blur layer.
+- iOS GalleryActionMenu has a cached-image-only horizontal GalleryListPreview (larger cover, headline, uploader/category/page metadata). The system still owns source visibility and dismissal. Debug system-snapshot control now also bypasses the list custom preview.
+- Reduced iOS startup feedback warmup from seven engines to light/selection and removed the unattached dummy menu. This reduces known startup work but is not evidence that it caused the cold stall. Keep profiling controls.
+- Runtime verification needed for preview size/continuity, narrow screens, Dynamic Type and first/second press timing. No new device trace this turn.
+- Validation: iOS/macOS Debug builds and git diff --check passed. Build logs: /tmp/ehviewer-glass-preview-ios.log and /tmp/ehviewer-glass-preview-macos.log. Changes remain uncommitted; push remains paused.
+
+## 2026-09-09 finishing and submission
+
+- List preview uses a minimum height rather than a fixed height to accommodate larger text; decorative cover is hidden from accessibility and metadata is grouped. Added matching list-preview disappearance event.
+- User renewed the request to finish, commit and push these changes to GitHub. Target remains origin (kGMia/EhViewer-Apple-native), branch codex/reader-cache-stability; the previous local commit 5311688 may be uploaded with this follow-up.
+- First-use stutter remains unverified. Do not conflate reduced startup work or passing builds with device performance validation.

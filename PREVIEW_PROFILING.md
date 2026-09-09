@@ -15,7 +15,7 @@
 | --- | --- |
 | 无参数 | 正常功能基线 |
 | `-EHPreviewWithoutShare` | 去掉菜单 ShareLink，检查分享桥接是否影响菜单首次初始化 |
-| `-EHPreviewSystemSnapshot` | 瀑布流只用默认系统快照，不创建自定义预览 |
+| `-EHPreviewSystemSnapshot` | 列表和瀑布流只用默认系统快照，不创建自定义预览 |
 | `-EHPreviewStaticTitle` | 保留自定义封面，去掉滚动标题 TimelineView |
 | `-EHSkipInteractionWarmup` | 跳过启动时触感/菜单符号预热，检查它是否与首个手势重叠 |
 
@@ -39,3 +39,11 @@
 builder/body 求值可能早于实际长按或发生多次；onAppear 也不等于第一帧已经显示。必须结合 Instruments 的主线程和渲染轨道解释，不能只拿两条事件相减作为手势响应时间。
 
 参考：[Apple SwiftUI 性能分析](https://developer.apple.com/documentation/swiftui/performance-analysis)、[使用 Instruments 优化 SwiftUI](https://developer.apple.com/videos/play/wwdc2025/306/)。
+
+## 2026-09-09 采样准备更新
+
+- 当前配对真机离线，未取得新的长按 trace。
+- 新增 ImagePipeline 分类下的 ThumbnailDecode 区间，覆盖后台静态/动态缩略图解码，不记录 URL、标题或账号信息。将其与主线程、菜单埋点及渲染轨道并排查看，以区分并行解码和实际主线程阻塞。
+- 解码区间相互重叠本身不表示掉帧，也不能用模拟器结果判定真机首次卡顿已修复。
+
+- 最新启动基线只预热轻触和选择反馈，不再创建占位 UIKit 菜单。应重新采集基线与跳过预热的对照，不沿用旧版本耗时结论。列表新增 GalleryListPreviewAppeared 事件。

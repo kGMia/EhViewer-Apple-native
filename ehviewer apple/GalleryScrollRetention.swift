@@ -34,7 +34,11 @@ final class GalleryScrollRetention {
     func capture() -> Anchor? {
         guard let entry = frames
             .filter({ $0.value.maxY > 0 && $0.value.minY < viewportHeight })
-            .min(by: { $0.value.minY < $1.value.minY }) else { return nil }
+            .min(by: {
+                if $0.value.minY != $1.value.minY { return $0.value.minY < $1.value.minY }
+                if $0.value.minX != $1.value.minX { return $0.value.minX < $1.value.minX }
+                return $0.key < $1.key
+            }) else { return nil }
         let available = viewportHeight - entry.value.height
         return Anchor(id: entry.key, alignment: abs(available) > 1 ? entry.value.minY / available : 0)
     }
@@ -103,9 +107,16 @@ struct GalleryPreviousPageButton: View {
         Button {
             Task { await action() }
         } label: {
-            Label("加载上一页", systemImage: "arrow.up")
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
+            HStack(spacing: 8) {
+                if isLoading {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.up")
+                }
+                Text("加载上一页")
+            }
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(isLoading)

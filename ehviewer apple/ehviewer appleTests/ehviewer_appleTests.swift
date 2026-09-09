@@ -1217,4 +1217,15 @@ struct ehviewer_appleTests {
         #expect(anchor.alignment == 0)
     }
 
+    @Test @MainActor
+    func waterfallAnchorSelectsLeadingCardDeterministically() throws {
+        let retention = GalleryScrollRetention()
+        retention.viewportHeight = 800
+        retention.frames = [
+            9: CGRect(x: 180, y: -20, width: 160, height: 240),
+            4: CGRect(x: 0, y: -20, width: 160, height: 200)
+        ]
+        #expect(try #require(retention.capture()).id == 4)
+    }
+
 }

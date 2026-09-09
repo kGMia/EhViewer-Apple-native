@@ -41,21 +41,12 @@ enum Haptics {
         ]
         #if os(iOS)
         light.prepare()
-        medium.prepare()
-        heavy.prepare()
-        soft.prepare()
-        rigid.prepare()
         selection.prepare()
-        notification.prepare()
         for name in symbolNames {
             _ = UIImage(systemName: name)
         }
-        // Context-menu classes and actions are otherwise initialized during
-        // the first long press. Constructing a tiny unattached menu primes the
-        // native path without installing custom gesture handling.
-        _ = UIMenu(children: [
-            UIAction(title: "", image: UIImage(systemName: "bookmark")) { _ in }
-        ])
+        // Do not construct a dummy menu or allocate unused feedback engines:
+        // neither exercises presentation, and both compete with first input.
         #elseif os(macOS)
         let menu = NSMenu()
         let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")

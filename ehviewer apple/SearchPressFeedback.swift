@@ -1,25 +1,26 @@
 import SwiftUI
 
 /// Keep press updates local to the decoration, outside the text/list hierarchy.
+enum SearchSurfaceStyle {
+    static let cornerRadius: CGFloat = 22
+    static let inset: CGFloat = 12
+    static let spacing: CGFloat = 6
+    static let pressAnimation = Animation.spring(duration: 0.26, bounce: 0.16)
+}
+
 struct SearchElasticSurface: View {
     var isField: Bool
     @State private var isPressed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Group {
-            if isField {
-                Color.clear.glassEffect(.regular, in: .capsule)
-            } else {
-                Color.clear
-                    .glassEffect(.regular, in: .rect(cornerRadius: 20))
-            }
-        }
+        Color.clear
+            .glassEffect(.regular, in: .rect(cornerRadius: SearchSurfaceStyle.cornerRadius))
         .scaleEffect(
             x: isPressed && !reduceMotion ? (isField ? 0.985 : 0.988) : 1,
-            y: isPressed && !reduceMotion ? (isField ? 0.94 : 0.988) : 1
+            y: isPressed && !reduceMotion ? (isField ? 0.96 : 0.988) : 1
         )
-        .animation(reduceMotion ? nil : .spring(duration: 0.26, bounce: 0.22), value: isPressed)
+        .animation(reduceMotion ? nil : SearchSurfaceStyle.pressAnimation, value: isPressed)
         .modifier(SearchPressFeedback(isPressed: $isPressed))
     }
 }

@@ -55,3 +55,16 @@ enum GalleryPreviewDiagnostics {
     static let skipInteractionWarmup = false
     #endif
 }
+
+/// Background-only measurements; labels contain no URL, title or account data.
+nonisolated enum BackgroundPerformanceDiagnostics {
+    private static let signposter = OSSignposter(
+        subsystem: "Stellatrix.ehviewer-apple", category: "ImagePipeline"
+    )
+
+    static func measure<T>(_ name: StaticString, operation: () -> T) -> T {
+        let state = signposter.beginInterval(name, id: signposter.makeSignpostID())
+        defer { signposter.endInterval(name, state) }
+        return operation()
+    }
+}

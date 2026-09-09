@@ -43,7 +43,9 @@ struct SearchRecordsPanelContent: View {
     var maximumHeight: CGFloat = 320
 
     var body: some View {
-        VStack(spacing: 0) {
+        let items = keyboardItems
+        let selection = selectedKeyboardIndex.flatMap { items.indices.contains($0) ? items[$0] : nil }
+        return VStack(spacing: 0) {
             ScrollViewReader { scroll in
                 List {
                     if currentKeyword.isEmpty {
@@ -52,7 +54,7 @@ struct SearchRecordsPanelContent: View {
                                 emptyRow("暂无搜索历史")
                             } else {
                                 ForEach(recentSearchHistory, id: \.self) { term in
-                                    historyRow(term, item: .history(term))
+                                    historyRow(term, item: .history(term), selection: selection)
                                 }
                             }
                         } header: {
@@ -64,7 +66,7 @@ struct SearchRecordsPanelContent: View {
                                 emptyRow("暂无已保存搜索")
                             } else {
                                 ForEach(vm.searches, id: \.id) { search in
-                                    savedSearchRow(search, item: .saved(search))
+                                    savedSearchRow(search, item: .saved(search), selection: selection)
                                 }
                             }
                         } header: {
@@ -74,7 +76,7 @@ struct SearchRecordsPanelContent: View {
                         if !matchingHistory.isEmpty {
                             Section {
                                 ForEach(matchingHistory, id: \.self) { term in
-                                    historyRow(term, item: .history(term))
+                                    historyRow(term, item: .history(term), selection: selection)
                                 }
                             } header: {
                                 sectionHeader("搜索历史", systemImage: "clock")
@@ -84,7 +86,7 @@ struct SearchRecordsPanelContent: View {
                         if !matchingSavedSearches.isEmpty {
                             Section {
                                 ForEach(matchingSavedSearches, id: \.id) { search in
-                                    savedSearchRow(search, item: .saved(search))
+                                    savedSearchRow(search, item: .saved(search), selection: selection)
                                 }
                             } header: {
                                 sectionHeader("已保存的搜索", systemImage: "bookmark")
@@ -99,7 +101,7 @@ struct SearchRecordsPanelContent: View {
                                         item: .suggestion(
                                             chinese: suggestion.chinese,
                                             english: suggestion.english
-                                        )
+                                        ), selection: selection
                                     )
                                 }
                             } header: {
@@ -115,6 +117,9 @@ struct SearchRecordsPanelContent: View {
                 .scrollBounceBehavior(.basedOnSize)
                 .environment(\.defaultMinListRowHeight, rowHeight)
                 .contentMargins(.vertical, 6, for: .scrollContent)
+                #if os(iOS)
+                .listSectionSpacing(.compact)
+                #endif
                 .frame(height: panelHeight)
                 .onChange(of: selectedKeyboardIndex) { _, index in
                     guard let index, keyboardItems.indices.contains(index) else { return }
@@ -132,22 +137,21 @@ struct SearchRecordsPanelContent: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(vm.isMutating)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, SearchSurfaceStyle.inset)
                 .padding(.vertical, 11)
-                .background(isKeyboardSelected(.save) ? Color.accentColor.opacity(0.13) : Color.clear)
+                .background((selection == .save) ? Color.accentColor.opacity(0.13) : Color.clear)
                 .onHover { hovering in
                     if hovering { selectKeyboardItem(.save) }
                 }
             }
         }
         .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: SearchSurfaceStyle.cornerRadius, style: .continuous))
         .background {
             SearchElasticSurface(isField: false)
                 .allowsHitTesting(false)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .padding(.horizontal, 10)
-        .padding(.top, 4)
+        .padding(.top, SearchSurfaceStyle.spacing)
         .accessibilityIdentifier("quickSearch.panel")
         .task { await vm.loadSearches() }
         .onChange(of: searchText) { _, _ in selectedKeyboardIndex = nil }
@@ -180,8 +184,8 @@ struct SearchRecordsPanelContent: View {
 
     private func sectionHeader(_ title: String, systemImage: String) -> some View {
         Text(AppLocalization.localized(title))
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.primary)
             .textCase(nil)
     }
 
@@ -221,14 +225,18 @@ struct SearchRecordsPanelContent: View {
         vm.searches.contains { vm.isEquivalent($0, to: currentSearch) }
     }
 
-    private func historyRow(_ term: String, item: KeyboardItem) -> some View {
+    private func historyRow(_ term: String, item: KeyboardItem, selection: KeyboardItem?) -> some View {
         HStack(spacing: 8) {
             Button {
                 onSelectHistory(term)
                 onDismiss()
             } label: {
-                Label(term, systemImage: "clock")
-                    .lineLimit(2)
+                Label {
+                    Text(term).foregroundStyle(.primary)
+                } icon: {
+                    Image(systemName: "clock").foregroundStyle(.secondary)
+                }
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
             }
@@ -238,15 +246,15 @@ struct SearchRecordsPanelContent: View {
                 onDeleteHistory(term)
             }
         }
-        .padding(.leading, 14)
+        .padding(.leading, SearchSurfaceStyle.inset)
         .padding(.trailing, 9)
-        .padding(.vertical, 5)
+        .padding(.vertical, 2)
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
         .listRowSeparatorTint(.primary.opacity(0.08))
         .id(item.scrollID)
         .background(
-            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            (selection == item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .onHover { hovering in
@@ -254,7 +262,7 @@ struct SearchRecordsPanelContent: View {
         }
     }
 
-    private func savedSearchRow(_ search: QuickSearchRecord, item: KeyboardItem) -> some View {
+    private func savedSearchRow(_ search: QuickSearchRecord, item: KeyboardItem, selection: KeyboardItem?) -> some View {
         HStack(spacing: 8) {
             Button {
                 selectedSearch = search
@@ -286,15 +294,15 @@ struct SearchRecordsPanelContent: View {
                 Task { await vm.delete(searches: [search]) }
             }
         }
-        .padding(.leading, 14)
+        .padding(.leading, SearchSurfaceStyle.inset)
         .padding(.trailing, 9)
-        .padding(.vertical, 5)
+        .padding(.vertical, 2)
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
         .listRowSeparatorTint(.primary.opacity(0.08))
         .id(item.scrollID)
         .background(
-            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            (selection == item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .onHover { hovering in
@@ -304,7 +312,7 @@ struct SearchRecordsPanelContent: View {
 
     private func suggestionRow(
         _ suggestion: (chinese: String, english: String),
-        item: KeyboardItem
+        item: KeyboardItem, selection: KeyboardItem?
     ) -> some View {
         Button {
             onSelectSuggestion(suggestion.english)
@@ -327,14 +335,14 @@ struct SearchRecordsPanelContent: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 5)
+        .padding(.horizontal, SearchSurfaceStyle.inset)
+        .padding(.vertical, 2)
         .listRowInsets(EdgeInsets())
         .listRowBackground(Color.clear)
         .listRowSeparatorTint(.primary.opacity(0.08))
         .id(item.scrollID)
         .background(
-            isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
+            (selection == item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .onHover { hovering in
@@ -347,7 +355,7 @@ struct SearchRecordsPanelContent: View {
             Image(systemName: "xmark")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 34, height: 34)
+                .frame(width: 40, height: 40)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -391,13 +399,6 @@ struct SearchRecordsPanelContent: View {
             if canSaveCurrentSearch && !isCurrentSearchSaved { items.append(.save) }
         }
         return items
-    }
-
-    private func isKeyboardSelected(_ item: KeyboardItem) -> Bool {
-        guard let selectedKeyboardIndex,
-              keyboardItems.indices.contains(selectedKeyboardIndex)
-        else { return false }
-        return keyboardItems[selectedKeyboardIndex] == item
     }
 
     private func selectKeyboardItem(_ item: KeyboardItem) {

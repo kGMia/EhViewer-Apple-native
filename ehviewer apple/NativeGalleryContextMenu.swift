@@ -26,6 +26,7 @@ struct GalleryActionMenu: ViewModifier {
     let download: @MainActor @Sendable () -> Void
     let toggleFavorite: @MainActor @Sendable () -> Void
     let copyLink: @MainActor @Sendable () -> Void
+    var listPreview: GalleryListPreview? = nil
     var waterfallPreview: GalleryWaterfallPreview? = nil
 
     @ViewBuilder
@@ -34,6 +35,10 @@ struct GalleryActionMenu: ViewModifier {
             content
                 .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 13))
                 .contextMenu { menuItems } preview: { waterfallPreview }
+        } else if let listPreview, !GalleryPreviewDiagnostics.useSystemSnapshot {
+            content
+                .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 13))
+                .contextMenu { menuItems } preview: { listPreview }
         } else {
             content
                 .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 13))
@@ -64,6 +69,53 @@ struct GalleryActionMenu: ViewModifier {
                 Label("分享", systemImage: "square.and.arrow.up")
             }
         }
+    }
+}
+
+/// A larger horizontal card; no network work or source visibility changes.
+struct GalleryListPreview: View {
+    let title: String
+    let thumbnailURL: URL?
+    let uploader: String?
+    let category: String
+    let pages: Int?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Color(uiColor: .secondarySystemBackground)
+                .frame(width: 120, height: 174)
+                .overlay {
+                    if let image = thumbnailURL.flatMap({ ThumbnailMemoryCache.shared.get($0) }) {
+                        Image(uiImage: image.images?.first ?? image)
+                            .resizable()
+                            .scaledToFit()
+                    } else {
+                        Image(systemName: "photo").foregroundStyle(.secondary)
+                    }
+                }
+                .clipShape(.rect(cornerRadius: 9))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title).font(.headline).lineLimit(5)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let uploader, !uploader.isEmpty {
+                    Text(uploader).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Text(category).font(.caption).foregroundStyle(.secondary)
+                if let pages {
+                    Text("\(pages)P").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 312)
+        .frame(minHeight: 174)
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: .rect(cornerRadius: 13))
+        .accessibilityElement(children: .combine)
+        .onAppear { PerformanceDiagnostics.event("GalleryListPreviewAppeared") }
+        .onDisappear { PerformanceDiagnostics.event("GalleryListPreviewDisappeared") }
     }
 }
 

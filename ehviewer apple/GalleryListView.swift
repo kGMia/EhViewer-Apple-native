@@ -77,6 +77,7 @@ struct GalleryListView: View {
     @State private var selectedGallery: GalleryInfo?
     @State private var primaryFeed: PrimaryFeed
     @FocusState private var isSearchFocused: Bool
+    @State private var searchTrailingWidth: CGFloat = 38
     @Environment(\.accessibilityReduceMotion) private var searchReduceMotion
     @Environment(\.contentRouteBackAction) private var contentRouteBackAction
     @Environment(\.gallerySearchNavigationAction) private var gallerySearchNavigationAction
@@ -1053,7 +1054,7 @@ struct GalleryListView: View {
                 .accessibilityIdentifier("gallery.search.back")
             }
 
-            if supportsPrimaryFeedSwitching {
+            if supportsPrimaryFeedSwitching && !isSearchFocused {
                 Menu {
                     Button {
                         primaryFeed = .home
@@ -1139,6 +1140,9 @@ struct GalleryListView: View {
             }
             .buttonStyle(.plain)
             .glassEffect(.regular.interactive(), in: .circle)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: {
+                searchTrailingWidth = $0
+            }
             .help(AppLocalization.localized(isSearchFocused ? "结束搜索输入" :
                     (galleryDisplayMode == .list ? "切换到瀑布流" : "切换到列表")))
             .accessibilityLabel(AppLocalization.localized(isSearchFocused ? "结束搜索输入" :
@@ -1165,7 +1169,7 @@ struct GalleryListView: View {
                 .transition(searchReduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity))
             }
         }
-        .animation(searchReduceMotion ? nil : .spring(duration: 0.36, bounce: 0.18), value: isSearchFocused)
+        .animation(searchReduceMotion ? nil : .spring(duration: 0.3, bounce: 0.08), value: isSearchFocused)
     }
 
     private func searchRecordsPanel(maximumHeight: CGFloat) -> some View {
@@ -1274,14 +1278,14 @@ struct GalleryListView: View {
                         .padding(
                             .leading,
                             (contentRouteBackAction == nil ? 0 : 46)
-                                + (supportsPrimaryFeedSwitching ? 46 : 0)
+                                + (supportsPrimaryFeedSwitching && !isSearchFocused ? 46 : 0)
                         )
-                        .padding(.trailing, 46)
+                        .padding(.trailing, searchTrailingWidth + 8)
                 }
                 .transition(searchReduceMotion ? .opacity : .opacity.combined(with: .offset(y: -6)))
             }
         }
-        .animation(searchReduceMotion ? nil : .spring(duration: 0.32, bounce: 0.1), value: isSearchFocused)
+        .animation(searchReduceMotion ? nil : .spring(duration: 0.3, bounce: 0.08), value: isSearchFocused)
     }
 
     private var galleryDisplayMode: EhSettings.ListMode {
@@ -1754,7 +1758,14 @@ struct GalleryRow: View {
                 toggleFavorite: { performFavoriteToggle(gallery) },
                 copyLink: {
                     GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
-                }
+                },
+                listPreview: GalleryListPreview(
+                    title: gallery.suitableTitle(preferJpn: showJpnTitle),
+                    thumbnailURL: thumbURL,
+                    uploader: gallery.uploader,
+                    category: gallery.category.name,
+                    pages: showPages ? gallery.pages : nil
+                )
             )
         )
         #endif
@@ -2528,6 +2539,7 @@ class GalleryListViewModel {
     /// 与 EhPanda cancellable Effect 相同的语义：新的导航/搜索请求会取消旧请求，
     /// 防止较慢的旧响应覆盖用户刚选择的新页面。
     private var requestTask: Task<Void, Never>?
+    private var replacementGeneration = UUID()
     /// 收藏列表使用服务器生成的游标而非稳定页码。缓存已经走过的游标，
     /// 让重复跳页不必每次都从第一页重新请求，同时不触发界面观察更新。
     @ObservationIgnored
@@ -2596,6 +2608,8 @@ class GalleryListViewModel {
     @discardableResult
     func restorePreviousDedicatedSearch(into advancedState: AdvancedSearchState) -> Bool {
         guard let session = dedicatedSearchBackStack.popLast() else { return false }
+        replacementGeneration = UUID()
+        scrollRetention.request = nil
         requestTask?.cancel()
         suggestionTask?.cancel()
         searchRestorationTask?.cancel()
@@ -2796,6 +2810,8 @@ class GalleryListViewModel {
     func clearDedicatedSearch() {
         imageSearchURL = nil
         suggestionTask?.cancel()
+        replacementGeneration = UUID()
+        scrollRetention.request = nil
         requestTask?.cancel()
         searchRestorationTask?.cancel()
         searchText = ""
@@ -3002,8 +3018,9 @@ class GalleryListViewModel {
 
     private func fetchPreviousPage(_ href: String) async {
         guard !isLoading else { return }
+        let generation = replacementGeneration
         isLoading = true
-        defer { isLoading = false }
+        defer { if replacementGeneration == generation { isLoading = false } }
         errorMessage = nil
         let targetPage = max(pagination.firstLoadedPage - 1, 0)
 
@@ -3011,6 +3028,8 @@ class GalleryListViewModel {
             let result = try await EhAPI.shared.getGalleryList(url: resolvedListHref(href))
             try Task.checkCancellation()
             let pageGalleries = try await enrichedGalleries(result.galleries)
+            try Task.checkCancellation()
+            guard replacementGeneration == generation else { return }
             let prependedGalleries = pagination.merge(pageGalleries, replacing: false)
             let retainedAnchor = scrollRetention.capture()
             if !prependedGalleries.isEmpty {
@@ -3028,6 +3047,7 @@ class GalleryListViewModel {
             }
             scheduleDedicatedSearchPersistence()
         } catch {
+            guard replacementGeneration == generation else { return }
             if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
             errorMessage = EhError.localizedMessage(for: error)
         }
@@ -3508,6 +3528,8 @@ class GalleryListViewModel {
     private func startReplacingRequest(
         _ operation: @escaping @MainActor () async -> Void
     ) {
+        replacementGeneration = UUID()
+        scrollRetention.request = nil
         requestTask?.cancel()
         requestTask = Task {
             await operation()
@@ -3516,6 +3538,8 @@ class GalleryListViewModel {
 
     func cancelRequests() {
         suggestionTask?.cancel()
+        replacementGeneration = UUID()
+        scrollRetention.request = nil
         requestTask?.cancel()
         suggestionTask = nil
         requestTask = nil

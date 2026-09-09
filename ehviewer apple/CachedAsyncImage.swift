@@ -229,6 +229,13 @@ private actor ThumbnailImagePipeline {
             if recentFailures.count > 500 {
                 let cutoff = Date().addingTimeInterval(-failureCooldown)
                 recentFailures = recentFailures.filter { $0.value >= cutoff }
+                // A burst of distinct failures within the cooldown must also
+                // be bounded; expiry alone does not bound this dictionary.
+                if recentFailures.count > 500 {
+                    let oldest = recentFailures.sorted { $0.value < $1.value }
+                        .prefix(recentFailures.count - 500)
+                    for entry in oldest { recentFailures.removeValue(forKey: entry.key) }
+                }
             }
         }
         return result
@@ -278,41 +285,43 @@ private actor ThumbnailImagePipeline {
 
     private static func decode(_ data: Data, maxPixelSize: CGFloat) async -> PlatformImage? {
         await Task.detached(priority: .utility) {
-            let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-            guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else {
-                return nil
+            BackgroundPerformanceDiagnostics.measure("ThumbnailDecode") { () -> PlatformImage? in
+                let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+                guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else {
+                    return nil
+                }
+                if CGImageSourceGetCount(source) > 1,
+                   let animated = decodeAnimatedPlatformImage(
+                       data: data,
+                       source: source,
+                       requestedMaxPixelSize: min(maxPixelSize, 420),
+                       maximumFrames: 24,
+                       pixelBudget: 4_000_000
+                   ) {
+                    return animated
+                }
+                let thumbnailOptions: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                    kCGImageSourceShouldCacheImmediately: true
+                ]
+                guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    thumbnailOptions as CFDictionary
+                ) else {
+                    return nil
+                }
+                #if os(macOS)
+                return NSImage(
+                    cgImage: cgImage,
+                    size: NSSize(width: cgImage.width, height: cgImage.height)
+                )
+                #else
+                return UIImage(cgImage: cgImage)
+                #endif
             }
-            if CGImageSourceGetCount(source) > 1,
-               let animated = decodeAnimatedPlatformImage(
-                   data: data,
-                   source: source,
-                   requestedMaxPixelSize: min(maxPixelSize, 420),
-                   maximumFrames: 24,
-                   pixelBudget: 4_000_000
-               ) {
-                return animated
-            }
-            let thumbnailOptions: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-                kCGImageSourceShouldCacheImmediately: true
-            ]
-            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
-                source,
-                0,
-                thumbnailOptions as CFDictionary
-            ) else {
-                return nil
-            }
-            #if os(macOS)
-            return NSImage(
-                cgImage: cgImage,
-                size: NSSize(width: cgImage.width, height: cgImage.height)
-            )
-            #else
-            return UIImage(cgImage: cgImage)
-            #endif
         }.value
     }
 }
