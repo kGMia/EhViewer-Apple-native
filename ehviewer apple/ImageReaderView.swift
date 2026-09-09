@@ -1698,7 +1698,15 @@ struct ImageReaderView: View {
     }
 
     private func topBar(geometry: GeometryProxy) -> some View {
-        GlassEffectContainer(spacing: 12) {
+        let controlHeight: CGFloat = {
+            #if os(iOS)
+            44
+            #else
+            40
+            #endif
+        }()
+
+        return GlassEffectContainer(spacing: 12) {
             ZStack {
                 // 页码显示 (双页模式标注 spread)
                 Group {
@@ -1716,7 +1724,7 @@ struct ImageReaderView: View {
                 .font(.subheadline.weight(.medium).monospacedDigit())
                 .foregroundStyle(readerForegroundColor)
                 .padding(.horizontal, 16)
-                .frame(height: 40)
+                .frame(height: controlHeight)
                 .glassEffect(.regular.tint(readerPanelTint), in: .capsule)
 
                 HStack(spacing: 12) {
@@ -1725,6 +1733,7 @@ struct ImageReaderView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .frame(width: 20, height: 20)
                     }
+                    .frame(width: controlHeight, height: controlHeight)
                     .help("关闭阅读器")
 
                     Spacer(minLength: 120)
@@ -1737,6 +1746,7 @@ struct ImageReaderView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .frame(width: 20, height: 20)
                     }
+                    .frame(width: controlHeight, height: controlHeight)
                     .help(AppLocalization.localized(isFullScreen ? "退出全屏" : "进入全屏"))
                     .accessibilityLabel(AppLocalization.localized(isFullScreen ? "退出全屏" : "进入全屏"))
                     #endif
@@ -1746,6 +1756,7 @@ struct ImageReaderView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .frame(width: 20, height: 20)
                     }
+                    .frame(width: controlHeight, height: controlHeight)
                     .help("阅读设置")
                     .accessibilityLabel("阅读设置")
                 }

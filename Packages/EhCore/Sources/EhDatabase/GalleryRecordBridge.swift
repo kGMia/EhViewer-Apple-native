@@ -67,6 +67,8 @@ public extension GalleryInfo {
             title: persistenceTitle,
             titleJpn: titleJpn,
             thumb: thumb,
+            thumbWidth: thumbWidth > 0 ? thumbWidth : nil,
+            thumbHeight: thumbHeight > 0 ? thumbHeight : nil,
             category: category.rawValue,
             posted: posted,
             uploader: uploader,
@@ -140,7 +142,9 @@ public extension FavoriteMetadataRecord {
             pages: pages,
             simpleTags: tags,
             simpleLanguage: simpleLanguage,
-            favoriteSlot: favoriteSlot
+            favoriteSlot: favoriteSlot,
+            thumbWidth: thumbWidth ?? 0,
+            thumbHeight: thumbHeight ?? 0
         )
     }
 }

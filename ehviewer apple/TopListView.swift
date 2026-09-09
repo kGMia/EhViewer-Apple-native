@@ -64,7 +64,14 @@ struct TopListView: View {
                     Text(name).tag(i)
                 }
             }
+            #if os(macOS)
+            // Segmented controls advertise the combined width of every label
+            // as a minimum, expanding the window when entering Search.
+            .pickerStyle(.menu)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            #else
             .pickerStyle(.segmented)
+            #endif
             .padding(.horizontal)
             .padding(.vertical, 8)
             .disabled(vm.categoryNames.isEmpty)
@@ -75,7 +82,14 @@ struct TopListView: View {
                     Text(periods[i]).tag(i)
                 }
             }
+            #if os(macOS)
+            // Segmented controls advertise the combined width of every label
+            // as a minimum, expanding the window when entering Search.
+            .pickerStyle(.menu)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            #else
             .pickerStyle(.segmented)
+            #endif
             .padding(.horizontal)
             .padding(.bottom, 8)
             .disabled(vm.categoryNames.isEmpty)
@@ -133,6 +147,7 @@ struct TopListView: View {
                 }
             }
         }
+        .frame(minWidth: 0, maxWidth: .infinity)
         .navigationTitle("排行榜")
         .onChange(of: vm.categoryNames) { _, names in
             if selectedCategory >= names.count {
@@ -157,6 +172,7 @@ struct TopListRow: View {
 
             Text(item.text)
                 .lineLimit(2)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
 
             Spacer()
 

@@ -38,6 +38,15 @@ public final class AppSettings: @unchecked Sendable {
         }
     }
 
+    /// Account for which the optional ExHentai switch prompt has already been
+    /// answered. Tying it to the member id allows a newly signed-in account to
+    /// receive the prompt once without bothering the same user every launch.
+    @ObservationIgnored
+    public var exHentaiPromptedMemberID: String? {
+        get { _defaults.string(forKey: "exhentai_prompted_member_id") }
+        set { _defaults.set(newValue, forKey: "exhentai_prompted_member_id") }
+    }
+
     // MARK: - 网络
     // 注意: Domain Fronting 在 iOS/macOS 的 URLSession 中无法正确工作
     // (URL 域名替换为 IP 会破坏 TLS SNI，导致 Cloudflare 返回错误证书)
@@ -130,6 +139,23 @@ public final class AppSettings: @unchecked Sendable {
             guard normalized != readCacheSize else { return }
             withMutation(keyPath: \.readCacheSize) {
                 _defaults.set(normalized, forKey: "read_cache_size")
+            }
+        }
+    }
+
+    /// Combined on-disk budget for list thumbnails and preview responses. The
+    /// app splits this budget between its shared thumbnail and API image stores.
+    public var thumbnailCacheSize: Int {
+        get {
+            access(keyPath: \.thumbnailCacheSize)
+            let value = _defaults.object(forKey: "thumbnail_cache_size") as? Int ?? 480
+            return max(120, min(960, value))
+        }
+        set {
+            let normalized = max(120, min(960, newValue))
+            guard normalized != thumbnailCacheSize else { return }
+            withMutation(keyPath: \.thumbnailCacheSize) {
+                _defaults.set(normalized, forKey: "thumbnail_cache_size")
             }
         }
     }
@@ -962,6 +988,8 @@ public enum AppAccentColor: String, Sendable, CaseIterable, Identifiable {
 public enum AppLocalization {
     public static var locale: Locale { AppSettings.shared.appLanguage.locale }
 
+    private static let bundleCache = LocalizationBundleCache()
+
     public static func localized(
         _ key: String,
         table: String? = nil,
@@ -969,8 +997,7 @@ public enum AppLocalization {
     ) -> String {
         let language = AppSettings.shared.appLanguage
         guard let resourceIdentifier = language.resourceIdentifier,
-              let path = Bundle.main.path(forResource: resourceIdentifier, ofType: "lproj"),
-              let bundle = Bundle(path: path) else {
+              let bundle = bundleCache.bundle(for: resourceIdentifier) else {
             return NSLocalizedString(
                 key,
                 tableName: table,
@@ -984,6 +1011,31 @@ public enum AppLocalization {
 
     public static func format(_ key: String, _ arguments: CVarArg...) -> String {
         String(format: localized(key), locale: locale, arguments: arguments)
+    }
+}
+
+/// Bundle(path:) performs filesystem/resource discovery. SwiftUI context menus
+/// create their labels lazily on the first press, so recreating the Bundle for
+/// every label made that first interaction visibly stall. Cache one per locale;
+/// the lock also keeps background error formatting safe.
+private final class LocalizationBundleCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bundles: [String: Bundle] = [:]
+
+    func bundle(for resourceIdentifier: String) -> Bundle? {
+        lock.lock()
+        if let cached = bundles[resourceIdentifier] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        guard let path = Bundle.main.path(forResource: resourceIdentifier, ofType: "lproj"),
+              let bundle = Bundle(path: path) else { return nil }
+        lock.lock()
+        bundles[resourceIdentifier] = bundle
+        lock.unlock()
+        return bundle
     }
 }
 

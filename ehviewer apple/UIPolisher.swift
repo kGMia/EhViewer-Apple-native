@@ -10,6 +10,9 @@ import SwiftUI
 #if canImport(UIKit)
 import UIKit
 #endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 // MARK: - Haptic Feedback Engine
 
@@ -31,6 +34,11 @@ enum Haptics {
     /// while the app is idle, instead of during the first long press.
     @MainActor
     static func prepareForInteraction() {
+        let symbolNames = [
+            "bookmark", "bookmark.slash", "heart", "heart.slash",
+            "arrow.down.circle", "arrow.down.to.line", "doc.on.doc",
+            "square.and.arrow.up", "magnifyingglass"
+        ]
         #if os(iOS)
         light.prepare()
         medium.prepare()
@@ -39,13 +47,21 @@ enum Haptics {
         rigid.prepare()
         selection.prepare()
         notification.prepare()
-        for name in [
-            "bookmark", "bookmark.slash", "heart", "heart.slash",
-            "arrow.down.circle", "arrow.down.to.line", "doc.on.doc",
-            "square.and.arrow.up"
-        ] {
+        for name in symbolNames {
             _ = UIImage(systemName: name)
         }
+        // Context-menu classes and actions are otherwise initialized during
+        // the first long press. Constructing a tiny unattached menu primes the
+        // native path without installing custom gesture handling.
+        _ = UIMenu(children: [
+            UIAction(title: "", image: UIImage(systemName: "bookmark")) { _ in }
+        ])
+        #elseif os(macOS)
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: symbolNames[0], accessibilityDescription: nil)
+        menu.addItem(item)
+        _ = menu.items
         #endif
     }
 

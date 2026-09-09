@@ -695,3 +695,29 @@
 "未能检查" = "Unable to Check";
 "Missing gallery metadata" = "Missing gallery metadata";
 "Invalid gallery version metadata" = "Invalid gallery version metadata";
+"缓存总计" = "Total Cache";
+"网页与元数据" = "Pages & Metadata";
+"缩略图" = "Thumbnails";
+"阅读图片" = "Reader Images";
+"清理磁盘缓存" = "Clear Disk Cache";
+"清除网页与元数据" = "Clear Pages & Metadata";
+"清除缩略图" = "Clear Thumbnails";
+"清除阅读图片" = "Clear Reader Images";
+"清除全部磁盘缓存" = "Clear All Disk Caches";
+"当前站点：%@" = "Current site: %@";
+"登录 Cookie：有效" = "Login cookie: Valid";
+"登录 Cookie：未检测到" = "Login cookie: Not found";
+"⚠ ExHentai 返回内容异常，可能需要重新登录" = "⚠ ExHentai returned unexpected content; you may need to sign in again";
+"需要重新登录" = "Sign In Again";
+"登录状态已失效，或当前账号没有访问该站点的权限。" = "Your session expired, or this account cannot access the selected site.";
+"请求过于频繁" = "Too Many Requests";
+"服务器正在限制请求，请稍后再试。" = "The server is rate-limiting requests. Try again later.";
+"服务器暂时不可用" = "Server Temporarily Unavailable";
+"服务端返回 HTTP %lld，请稍后重试。" = "The server returned HTTP %lld. Try again later.";
+"请求失败" = "Request Failed";
+"缩略图缓存上限" = "Thumbnail Cache Limit";
+"翻译" = "Translate";
+
+"高级搜索" = "Advanced Search";
+
+"加载上一页" = "Load Previous Page";

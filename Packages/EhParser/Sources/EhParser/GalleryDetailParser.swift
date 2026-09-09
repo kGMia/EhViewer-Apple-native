@@ -65,6 +65,32 @@ public enum GalleryDetailParser {
     private static let piningString = "<p>This gallery is pining for the fjords.</p>"
     private static let unavailableString = "This gallery is unavailable"
 
+    /// Compile the detail-page regular expressions and initialize SwiftSoup
+    /// away from the first gallery navigation. These lazily initialized
+    /// objects otherwise make the first parse substantially more expensive
+    /// than every subsequent one.
+    public static func prepare() {
+        _ = detailUrlRegex
+        _ = detailJsRegex
+        _ = torrentRegex
+        _ = archiveRegex
+        _ = averageRatingRegex
+        _ = ratingCountRegex
+        _ = favCountRegex
+        _ = commentIdRegex
+        _ = pagesBodyRegex
+        _ = errorRegex
+        _ = largePreviewNewRegex
+        _ = largePreviewRegex
+        _ = smallPreviewRegex
+        _ = smallPreviewWithLabelRegex
+        _ = normalPreviewNewRegex
+        _ = normalPreviewNewWithLabelRegex
+        _ = normalPreviewOldRegex
+        _ = apiParamsRegex
+        _ = try? SwiftSoup.parse("<html><body></body></html>")
+    }
+
     // MARK: - 解析入口
 
     /// 解析画廊详情页面 HTML (对齐 Android GalleryDetailParser.parse)

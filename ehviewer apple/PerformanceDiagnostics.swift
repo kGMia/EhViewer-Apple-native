@@ -38,3 +38,20 @@ enum PerformanceDiagnostics {
         signposter.emitEvent(name)
     }
 }
+
+/// Launch-only controls for cold-start A/B captures. No production preference
+/// or menu behavior changes unless a DEBUG launch explicitly selects a probe.
+enum GalleryPreviewDiagnostics {
+    #if DEBUG
+    private static let arguments = ProcessInfo.processInfo.arguments
+    static let omitShareLink = arguments.contains("-EHPreviewWithoutShare")
+    static let useSystemSnapshot = arguments.contains("-EHPreviewSystemSnapshot")
+    static let useStaticTitle = arguments.contains("-EHPreviewStaticTitle")
+    static let skipInteractionWarmup = arguments.contains("-EHSkipInteractionWarmup")
+    #else
+    static let omitShareLink = false
+    static let useSystemSnapshot = false
+    static let useStaticTitle = false
+    static let skipInteractionWarmup = false
+    #endif
+}

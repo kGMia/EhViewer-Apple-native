@@ -8,6 +8,7 @@
 import SwiftUI
 import EhSettings
 import EhAPI
+import EhCookie
 import EhDownload
 import EhDatabase
 import EhSpider
@@ -654,6 +655,18 @@ struct SettingsView: View {
 
     private var cacheSection: some View {
         Section("缓存") {
+            Picker("缩略图缓存上限", selection: settingBinding(\.thumbnailCacheSize)) {
+                Text("240 MB").tag(240)
+                Text("480 MB").tag(480)
+                Text("640 MB").tag(640)
+                Text("960 MB").tag(960)
+            }
+            .onChange(of: AppSettings.shared.thumbnailCacheSize) { _, megabytes in
+                URLCache.shared.diskCapacity = megabytes * 1024 * 1024 * 2 / 3
+                Task { await EhAPI.shared.updateImageCacheBudget(totalMegabytes: megabytes) }
+                vm.calculateCacheSize()
+            }
+
             // 阅读缓存大小 (对齐 Android Settings.KEY_READ_CACHE_SIZE)
             Picker("阅读缓存大小", selection: settingBinding(\.readCacheSize)) {
                 Text("40 MB").tag(40)
@@ -671,19 +684,30 @@ struct SettingsView: View {
             }
 
             HStack {
-                Text("磁盘缓存")
+                Text("缓存总计")
                 Spacer()
                 Text(vm.diskCacheSize)
                     .foregroundStyle(.secondary)
             }
+
+            LabeledContent("网页与元数据", value: vm.documentCacheSize)
+                .foregroundStyle(.secondary)
+            LabeledContent("缩略图", value: vm.thumbnailCacheSize)
+                .foregroundStyle(.secondary)
+            LabeledContent("阅读图片", value: vm.readerCacheSize)
+                .foregroundStyle(.secondary)
 
             // 清除内存缓存 (对齐 Android: clear_memory_cache)
             Button("清除内存缓存") {
                 vm.clearMemoryCache()
             }
 
-            Button("清除磁盘缓存") {
-                vm.clearCache()
+            Menu("清理磁盘缓存") {
+                Button("清除网页与元数据") { vm.clearDocumentCache() }
+                Button("清除缩略图") { vm.clearThumbnailCache() }
+                Button("清除阅读图片") { vm.clearReaderCache() }
+                Divider()
+                Button("清除全部磁盘缓存", role: .destructive) { vm.clearCache() }
             }
             .disabled(vm.isClearingDiskCache)
         }
@@ -1410,6 +1434,9 @@ class SettingsViewModel {
     var diagnosisSuccess = false
 
     var diskCacheSize: String = AppLocalization.localized("计算中...")
+    var documentCacheSize = "—"
+    var thumbnailCacheSize = "—"
+    var readerCacheSize = "—"
     var isClearingDiskCache = false
     @ObservationIgnored private var cacheSizeRequest = 0
 
@@ -1418,19 +1445,35 @@ class SettingsViewModel {
         cacheSizeRequest &+= 1
         let request = cacheSizeRequest
         Task { [weak self] in
-            let size = await Task.detached(priority: .utility) {
-                Int64(URLCache.shared.currentDiskUsage) + SpiderDen.readCacheUsage()
+            async let apiUsage = EhAPI.shared.cacheUsage()
+            async let localUsage = Task.detached(priority: .utility) {
+                (
+                    thumbnails: Int64(URLCache.shared.currentDiskUsage),
+                    reader: SpiderDen.readCacheUsage()
+                )
             }.value
+            let (api, local) = await (apiUsage, localUsage)
             guard let self, self.cacheSizeRequest == request else { return }
-            self.updateCacheSize(size)
+            self.updateCacheSize(api: api, thumbnails: local.thumbnails, reader: local.reader)
         }
     }
 
-    private func updateCacheSize(_ bytes: Int64) {
+    private func formattedSize(_ bytes: Int64) -> String {
         let byteFormatter = ByteCountFormatter()
         byteFormatter.allowedUnits = [.useMB, .useGB]
         byteFormatter.countStyle = .file
-        diskCacheSize = byteFormatter.string(fromByteCount: bytes)
+        return byteFormatter.string(fromByteCount: bytes)
+    }
+
+    private func updateCacheSize(
+        api: EhAPI.CacheUsage,
+        thumbnails: Int64,
+        reader: Int64
+    ) {
+        documentCacheSize = formattedSize(api.documents)
+        thumbnailCacheSize = formattedSize(thumbnails + api.images)
+        readerCacheSize = formattedSize(reader)
+        diskCacheSize = formattedSize(api.total + thumbnails + reader)
     }
 
     func clearCache() {
@@ -1443,14 +1486,48 @@ class SettingsViewModel {
         ThumbnailMemoryCache.shared.removeAll()
         ReaderViewModel.clearDecodedImageCache()
         Task { [weak self] in
-            let size = await Task.detached(priority: .utility) {
+            await EhAPI.shared.clearNetworkCaches()
+            await Task.detached(priority: .utility) {
                 URLCache.shared.removeAllCachedResponses()
                 SpiderDen.clearReadCache()
-                return Int64(URLCache.shared.currentDiskUsage) + SpiderDen.readCacheUsage()
             }.value
             guard let self else { return }
-            self.updateCacheSize(size)
             self.isClearingDiskCache = false
+            self.calculateCacheSize()
+        }
+    }
+
+    func clearDocumentCache() {
+        GalleryCache.shared.clearAll()
+        performCacheClear { await EhAPI.shared.clearDocumentCache() }
+    }
+
+    func clearThumbnailCache() {
+        ThumbnailMemoryCache.shared.removeAll()
+        performCacheClear {
+            await EhAPI.shared.clearImageResponseCache()
+            await Task.detached(priority: .utility) {
+                URLCache.shared.removeAllCachedResponses()
+            }.value
+        }
+    }
+
+    func clearReaderCache() {
+        ReaderViewModel.clearDecodedImageCache()
+        performCacheClear {
+            await Task.detached(priority: .utility) { SpiderDen.clearReadCache() }.value
+        }
+    }
+
+    private func performCacheClear(_ operation: @escaping @Sendable () async -> Void) {
+        guard !isClearingDiskCache else { return }
+        isClearingDiskCache = true
+        cacheSizeRequest &+= 1
+        Task { [weak self] in
+            await operation()
+            guard let self else { return }
+            self.isClearingDiskCache = false
+            self.calculateCacheSize()
         }
     }
 
@@ -1603,84 +1680,74 @@ class SettingsViewModel {
         isDiagnosing = true
         diagnosisResult = ""
         diagnosisSuccess = false
-        
+
+        let selectedSite = AppSettings.shared.gallerySite
+        let signedIn = EhCookieManager.shared.isSignedIn
         Task {
-            var results: [String] = []
-            var allSuccess = true
-            
-            // 1. DNS 解析测试
-            let hosts = ["e-hentai.org", "exhentai.org"]
-            for host in hosts {
-                let hostRef = CFHostCreateWithName(nil, host as CFString).takeRetainedValue()
-                var resolved = DarwinBoolean(false)
-                CFHostStartInfoResolution(hostRef, .addresses, nil)
-                if let addresses = CFHostGetAddressing(hostRef, &resolved)?.takeUnretainedValue() as? [Data], !addresses.isEmpty {
-                    // 提取 IP 地址
-                    if let addr = addresses.first {
-                        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        addr.withUnsafeBytes { ptr in
-                            let sockaddr = ptr.bindMemory(to: sockaddr.self).baseAddress!
-                            getnameinfo(sockaddr, socklen_t(addr.count), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
-                        }
-                        let ip = String(cString: hostname)
-                        results.append("✓ \(host) → \(ip)")
-                    }
-                } else {
-                    results.append(AppLocalization.format("✗ %@ DNS 解析失败", host))
-                    allSuccess = false
-                }
+            async let ehResult = Self.testEndpoint(host: "e-hentai.org")
+            async let exResult = Self.testEndpoint(host: "exhentai.org")
+            let (eh, ex) = await (ehResult, exResult)
+            guard !Task.isCancelled else { return }
+
+            var results = [
+                AppLocalization.format("当前站点：%@", selectedSite == .exHentai ? "ExHentai" : "E-Hentai"),
+                signedIn ? AppLocalization.localized("登录 Cookie：有效") : AppLocalization.localized("登录 Cookie：未检测到"),
+                eh.message,
+                ex.message,
+            ]
+            if selectedSite == .exHentai, ex.success, ex.responseBytes < 1_000 {
+                results.append(AppLocalization.localized("⚠ ExHentai 返回内容异常，可能需要重新登录"))
             }
-            
-            // 2. HTTPS 连接测试
-            for host in hosts {
-                let url = URL(string: "https://\(host)/")!
-                var request = URLRequest(url: url)
-                request.timeoutInterval = 10
-                request.httpMethod = "HEAD"
-                
-                do {
-                    let (_, response) = try await URLSession.shared.data(for: request)
-                    if let httpResponse = response as? HTTPURLResponse {
-                        if httpResponse.statusCode == 200 || httpResponse.statusCode == 302 {
-                            results.append(AppLocalization.format("✓ %@ HTTPS 连接正常", host))
-                        } else {
-                            results.append(AppLocalization.format("⚠ %@ HTTP %lld", host, httpResponse.statusCode))
-                        }
-                    }
-                } catch let error as NSError {
-                    if error.domain == NSURLErrorDomain {
-                        switch error.code {
-                        case NSURLErrorTimedOut:
-                            results.append(AppLocalization.format("✗ %@ 连接超时", host))
-                        case NSURLErrorCannotConnectToHost:
-                            results.append(AppLocalization.format("✗ %@ 无法连接", host))
-                        case NSURLErrorSecureConnectionFailed:
-                            results.append(AppLocalization.format("✗ %@ TLS 错误 (可能被阻断)", host))
-                        case NSURLErrorServerCertificateUntrusted:
-                            results.append(AppLocalization.format("✗ %@ 证书不受信任", host))
-                        default:
-                            results.append(AppLocalization.format("✗ %@ 错误: %@", host, error.localizedDescription))
-                        }
-                    } else {
-                        results.append(AppLocalization.format("✗ %@ 错误: %@", host, error.localizedDescription))
-                    }
-                    allSuccess = false
-                }
+            diagnosisResult = results.joined(separator: "\n")
+            diagnosisSuccess = eh.success && (selectedSite != .exHentai || ex.success)
+            isDiagnosing = false
+        }
+    }
+
+    private struct EndpointDiagnosis: Sendable {
+        let success: Bool
+        let responseBytes: Int
+        let message: String
+    }
+
+    /// URLSession performs DNS and TLS work away from the main actor. This
+    /// replaces the old synchronous CFHost call that could freeze Settings.
+    nonisolated private static func testEndpoint(host: String) async -> EndpointDiagnosis {
+        guard let url = URL(string: "https://\(host)/") else {
+            return EndpointDiagnosis(success: false, responseBytes: 0, message: "✗ \(host)")
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 10
+        configuration.timeoutIntervalForResource = 12
+        configuration.httpCookieStorage = .shared
+        configuration.waitsForConnectivity = false
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        request.setValue(EhRequestBuilder.userAgent, forHTTPHeaderField: "User-Agent")
+        let start = ContinuousClock.now
+        do {
+            let (data, response) = try await session.data(for: request)
+            let elapsed = start.duration(to: .now)
+            let milliseconds = elapsed.components.seconds * 1_000
+                + Int64(elapsed.components.attoseconds / 1_000_000_000_000_000)
+            guard let http = response as? HTTPURLResponse else {
+                return EndpointDiagnosis(success: false, responseBytes: data.count, message: "✗ \(host) invalid response")
             }
-            
-            // 3. 代理检测
-            #if os(iOS)
-            let proxySettings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any]
-            if let httpProxy = proxySettings?["HTTPProxy"] as? String, !httpProxy.isEmpty {
-                results.append(AppLocalization.format("ℹ 检测到 HTTP 代理: %@", httpProxy))
-            }
-            #endif
-            
-            await MainActor.run {
-                self.diagnosisResult = results.joined(separator: "\n")
-                self.diagnosisSuccess = allSuccess
-                self.isDiagnosing = false
-            }
+            let success = (200...399).contains(http.statusCode)
+            let mark = success ? "✓" : "⚠"
+            return EndpointDiagnosis(
+                success: success,
+                responseBytes: data.count,
+                message: "\(mark) \(host) · HTTP \(http.statusCode) · \(milliseconds) ms"
+            )
+        } catch {
+            return EndpointDiagnosis(
+                success: false,
+                responseBytes: 0,
+                message: "✗ \(host) · \(EhError.localizedMessage(for: error))"
+            )
         }
     }
 
@@ -1931,7 +1998,7 @@ class SettingsViewModel {
     private static let portableSettingKeys: Set<String> = [
         "gallery_site", "multi_thread_download", "preload_image",
         "download_delay", "download_timeout", "download_origin_image",
-        "read_cache_size", "list_mode", "show_jpn_title",
+        "read_cache_size", "thumbnail_cache_size", "list_mode", "show_jpn_title",
         "show_tag_translations", "show_gallery_comment", "show_gallery_pages",
         "show_gallery_rating", "wide_screen_list_mode", "default_categories",
         "blocked_gallery_tags", "reading_direction", "page_scaling",

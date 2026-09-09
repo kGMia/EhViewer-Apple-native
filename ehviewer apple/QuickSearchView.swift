@@ -8,6 +8,7 @@
 import SwiftUI
 import EhModels
 import EhDatabase
+import EhSettings
 
 enum SearchPanelKeyboardAction: Equatable {
     case previous
@@ -23,8 +24,10 @@ struct SearchPanelKeyboardCommand: Equatable {
 /// 统一搜索记录下拉面板：直接显示在搜索框下方，搜索历史在上、
 /// 已保存搜索在下。保留数据库格式与应用逻辑，但不再创建侧边抽屉。
 struct SearchRecordsPanelContent: View {
-    @State private var vm = QuickSearchViewModel()
+    @Bindable var vm: QuickSearchViewModel
     @State private var selectedKeyboardIndex: Int?
+    @ScaledMetric(relativeTo: .body) private var rowHeight: CGFloat = 44
+    @ScaledMetric(relativeTo: .caption) private var sectionHeight: CGFloat = 30
     @Binding var selectedSearch: QuickSearchRecord?
     let searchHistory: [String]
     let currentSearch: QuickSearchRecord
@@ -37,79 +40,87 @@ struct SearchRecordsPanelContent: View {
     let onDismiss: () -> Void
     let keyboardCommand: SearchPanelKeyboardCommand?
     var canSaveCurrentSearch = true
+    var maximumHeight: CGFloat = 320
 
     var body: some View {
         VStack(spacing: 0) {
-            List {
-                if currentKeyword.isEmpty {
-                    Section {
-                        if searchHistory.isEmpty {
-                            emptyRow("暂无搜索历史")
-                        } else {
-                            ForEach(recentSearchHistory, id: \.self) { term in
-                                historyRow(term, item: .history(term))
-                            }
-                        }
-                    } header: {
-                        sectionHeader("搜索历史", systemImage: "clock")
-                    }
-
-                    Section {
-                        if vm.searches.isEmpty {
-                            emptyRow("暂无已保存搜索")
-                        } else {
-                            ForEach(vm.searches, id: \.id) { search in
-                                savedSearchRow(search, item: .saved(search))
-                            }
-                        }
-                    } header: {
-                        sectionHeader("已保存的搜索", systemImage: "bookmark")
-                    }
-                } else {
-                    if !matchingHistory.isEmpty {
+            ScrollViewReader { scroll in
+                List {
+                    if currentKeyword.isEmpty {
                         Section {
-                            ForEach(matchingHistory, id: \.self) { term in
-                                historyRow(term, item: .history(term))
+                            if searchHistory.isEmpty {
+                                emptyRow("暂无搜索历史")
+                            } else {
+                                ForEach(recentSearchHistory, id: \.self) { term in
+                                    historyRow(term, item: .history(term))
+                                }
                             }
                         } header: {
                             sectionHeader("搜索历史", systemImage: "clock")
                         }
-                    }
 
-                    if !matchingSavedSearches.isEmpty {
                         Section {
-                            ForEach(matchingSavedSearches, id: \.id) { search in
-                                savedSearchRow(search, item: .saved(search))
+                            if vm.searches.isEmpty {
+                                emptyRow("暂无已保存搜索")
+                            } else {
+                                ForEach(vm.searches, id: \.id) { search in
+                                    savedSearchRow(search, item: .saved(search))
+                                }
                             }
                         } header: {
                             sectionHeader("已保存的搜索", systemImage: "bookmark")
                         }
-                    }
-
-                    if !suggestions.isEmpty {
-                        Section {
-                            ForEach(Array(suggestions.enumerated()), id: \.offset) { _, suggestion in
-                                suggestionRow(
-                                    suggestion,
-                                    item: .suggestion(
-                                        chinese: suggestion.chinese,
-                                        english: suggestion.english
-                                    )
-                                )
+                    } else {
+                        if !matchingHistory.isEmpty {
+                            Section {
+                                ForEach(matchingHistory, id: \.self) { term in
+                                    historyRow(term, item: .history(term))
+                                }
+                            } header: {
+                                sectionHeader("搜索历史", systemImage: "clock")
                             }
-                        } header: {
-                            sectionHeader("候选搜索", systemImage: "sparkle.magnifyingglass")
                         }
-                    } else if !hasMatchingRecord {
-                        emptyRow("暂无候选搜索")
+
+                        if !matchingSavedSearches.isEmpty {
+                            Section {
+                                ForEach(matchingSavedSearches, id: \.id) { search in
+                                    savedSearchRow(search, item: .saved(search))
+                                }
+                            } header: {
+                                sectionHeader("已保存的搜索", systemImage: "bookmark")
+                            }
+                        }
+
+                        if !suggestions.isEmpty {
+                            Section {
+                                ForEach(Array(suggestions.enumerated()), id: \.offset) { _, suggestion in
+                                    suggestionRow(
+                                        suggestion,
+                                        item: .suggestion(
+                                            chinese: suggestion.chinese,
+                                            english: suggestion.english
+                                        )
+                                    )
+                                }
+                            } header: {
+                                sectionHeader("候选搜索", systemImage: "sparkle.magnifyingglass")
+                            }
+                        } else if !hasMatchingRecord {
+                            emptyRow("暂无候选搜索")
+                        }
                     }
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .scrollBounceBehavior(.basedOnSize)
+                .environment(\.defaultMinListRowHeight, rowHeight)
+                .contentMargins(.vertical, 6, for: .scrollContent)
+                .frame(height: panelHeight)
+                .onChange(of: selectedKeyboardIndex) { _, index in
+                    guard let index, keyboardItems.indices.contains(index) else { return }
+                    scroll.scrollTo(keyboardItems[index].scrollID, anchor: .center)
+                }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .scrollBounceBehavior(.always)
-            .contentMargins(.vertical, 6, for: .scrollContent)
-            .frame(maxHeight: 320)
 
             if canSaveCurrentSearch && !currentKeyword.isEmpty && !isCurrentSearchSaved {
                 Divider()
@@ -120,6 +131,7 @@ struct SearchRecordsPanelContent: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(vm.isMutating)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)
                 .background(isKeyboardSelected(.save) ? Color.accentColor.opacity(0.13) : Color.clear)
@@ -129,11 +141,15 @@ struct SearchRecordsPanelContent: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .background {
+            SearchElasticSurface(isField: false)
+                .allowsHitTesting(false)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .padding(.horizontal, 10)
         .padding(.top, 4)
         .accessibilityIdentifier("quickSearch.panel")
-        .task { vm.loadSearches() }
+        .task { await vm.loadSearches() }
         .onChange(of: searchText) { _, _ in selectedKeyboardIndex = nil }
         .onChange(of: keyboardItems.count) { _, count in
             if let selectedKeyboardIndex, selectedKeyboardIndex >= count {
@@ -146,19 +162,36 @@ struct SearchRecordsPanelContent: View {
         }
     }
 
+    private var panelHeight: CGFloat {
+        let rows: Int
+        let sections: Int
+        if currentKeyword.isEmpty {
+            rows = max(1, recentSearchHistory.count) + max(1, vm.searches.count)
+            sections = 2
+        } else {
+            rows = max(1, matchingHistory.count + matchingSavedSearches.count + suggestions.count)
+            sections = (matchingHistory.isEmpty ? 0 : 1) + (matchingSavedSearches.isEmpty ? 0 : 1)
+                + (suggestions.isEmpty ? 0 : 1)
+        }
+        let footerHeight: CGFloat = canSaveCurrentSearch && !currentKeyword.isEmpty && !isCurrentSearchSaved ? rowHeight + 1 : 0
+        let available = max(rowHeight, maximumHeight - footerHeight - 4)
+        return min(available, CGFloat(rows) * rowHeight + CGFloat(sections) * sectionHeight + 12)
+    }
+
     private func sectionHeader(_ title: String, systemImage: String) -> some View {
-        Label(title, systemImage: systemImage)
+        Text(AppLocalization.localized(title))
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .textCase(nil)
     }
 
     private func emptyRow(_ title: String) -> some View {
-        Text(title)
+        Text(AppLocalization.localized(title))
             .font(.callout)
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 6)
+            .listRowBackground(Color.clear)
     }
 
     private var currentKeyword: String {
@@ -170,13 +203,13 @@ struct SearchRecordsPanelContent: View {
     }
 
     private var matchingHistory: [String] {
-        recentSearchHistory.filter { normalized($0) == normalized(currentKeyword) }
+        Array(searchHistory.filter { SearchRecordMatching.matches($0, query: currentKeyword) }.prefix(8))
     }
 
     private var matchingSavedSearches: [QuickSearchRecord] {
         vm.searches.filter { search in
-            normalized(search.keyword ?? "") == normalized(currentKeyword)
-                || normalized(search.name ?? "") == normalized(currentKeyword)
+            SearchRecordMatching.matches(search.keyword ?? "", query: currentKeyword)
+                || SearchRecordMatching.matches(search.name ?? "", query: currentKeyword)
         }
     }
 
@@ -209,6 +242,9 @@ struct SearchRecordsPanelContent: View {
         .padding(.trailing, 9)
         .padding(.vertical, 5)
         .listRowInsets(EdgeInsets())
+        .listRowBackground(Color.clear)
+        .listRowSeparatorTint(.primary.opacity(0.08))
+        .id(item.scrollID)
         .background(
             isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -247,13 +283,16 @@ struct SearchRecordsPanelContent: View {
             .buttonStyle(.plain)
 
             deleteButton(help: "删除已保存搜索") {
-                vm.delete(searches: [search])
+                Task { await vm.delete(searches: [search]) }
             }
         }
         .padding(.leading, 14)
         .padding(.trailing, 9)
         .padding(.vertical, 5)
         .listRowInsets(EdgeInsets())
+        .listRowBackground(Color.clear)
+        .listRowSeparatorTint(.primary.opacity(0.08))
+        .id(item.scrollID)
         .background(
             isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -291,6 +330,9 @@ struct SearchRecordsPanelContent: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 5)
         .listRowInsets(EdgeInsets())
+        .listRowBackground(Color.clear)
+        .listRowSeparatorTint(.primary.opacity(0.08))
+        .id(item.scrollID)
         .background(
             isKeyboardSelected(item) ? Color.accentColor.opacity(0.13) : Color.clear,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -304,21 +346,19 @@ struct SearchRecordsPanelContent: View {
         Button(role: .destructive, action: action) {
             Image(systemName: "xmark")
                 .font(.caption.weight(.semibold))
-                .frame(width: 26, height: 26)
+                .foregroundStyle(.secondary)
+                .frame(width: 34, height: 34)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .help(help)
         .accessibilityLabel(help)
+        .disabled(vm.isMutating)
     }
 
     private func saveCurrentSearch() {
         guard canSaveCurrentSearch, !currentKeyword.isEmpty, !isCurrentSearchSaved else { return }
-        vm.addSearch(currentSearch)
-    }
-
-    private func normalized(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        Task { await vm.addSearch(currentSearch) }
     }
 
     private enum KeyboardItem: Equatable {
@@ -326,6 +366,15 @@ struct SearchRecordsPanelContent: View {
         case saved(QuickSearchRecord)
         case suggestion(chinese: String, english: String)
         case save
+
+        var scrollID: String {
+            switch self {
+            case .history(let term): "history:\(term)"
+            case .saved(let search): "saved:\(search.id ?? 0)"
+            case .suggestion(_, let english): "suggestion:\(english)"
+            case .save: "save"
+            }
+        }
     }
 
     private var keyboardItems: [KeyboardItem] {
@@ -398,58 +447,92 @@ struct SearchRecordsPanelContent: View {
 
 // MARK: - ViewModel
 
-@Observable
-class QuickSearchViewModel {
-    var searches: [QuickSearchRecord] = []
+/// Disk operations run on this serial actor, never while laying out a panel.
+actor QuickSearchStore {
+    static let shared = QuickSearchStore()
+    private let database: EhDatabase?
 
-    func loadSearches() {
-        do {
-            searches = try EhDatabase.shared.getAllQuickSearches()
-        } catch {
-            debugLog("Failed to load quick searches: \(error)")
-        }
+    init(database: EhDatabase? = nil) { self.database = database }
+
+    func load() throws -> [QuickSearchRecord] {
+        try (database ?? .shared).getAllQuickSearches()
     }
 
-    func addSearch(_ record: QuickSearchRecord) {
-        guard !searches.contains(where: { isEquivalent($0, to: record) }) else { return }
-        do {
-            try EhDatabase.shared.insertQuickSearch(record)
-            loadSearches()
-        } catch {
-            debugLog("Failed to add quick search: \(error)")
+    func add(_ record: QuickSearchRecord) throws -> [QuickSearchRecord] {
+        let database = database ?? .shared
+        if try !database.getAllQuickSearches().contains(where: { SearchRecordMatching.equivalent($0, record) }) {
+            try database.insertQuickSearch(record)
         }
+        return try database.getAllQuickSearches()
+    }
+
+    func delete(_ ids: Set<Int64>) throws -> [QuickSearchRecord] {
+        let database = database ?? .shared
+        for id in ids { try database.deleteQuickSearch(id: id) }
+        return try database.getAllQuickSearches()
+    }
+}
+
+enum SearchRecordMatching {
+    nonisolated static func matches(_ value: String, query: String) -> Bool {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !query.isEmpty && value.localizedStandardContains(query)
+    }
+
+    nonisolated static func equivalent(_ lhs: QuickSearchRecord, _ rhs: QuickSearchRecord) -> Bool {
+        lhs.mode == rhs.mode && lhs.category == rhs.category
+            && lhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == rhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+            && lhs.advanceSearch == rhs.advanceSearch && lhs.minRating == rhs.minRating
+            && lhs.pageFrom == rhs.pageFrom && lhs.pageTo == rhs.pageTo
+    }
+}
+
+@MainActor
+@Observable
+final class QuickSearchViewModel {
+    private(set) var searches: [QuickSearchRecord] = []
+    private(set) var isMutating = false
+    @ObservationIgnored private let store: QuickSearchStore
+    @ObservationIgnored private var generation = 0
+
+    init(store: QuickSearchStore = .shared) { self.store = store }
+
+    func loadSearches() async {
+        guard !isMutating else { return }
+        generation &+= 1
+        let request = generation
+        do {
+            let records = try await store.load()
+            guard request == generation, !Task.isCancelled else { return }
+            searches = records
+        } catch { debugLog("Failed to load quick searches: \(error)") }
+    }
+
+    func addSearch(_ record: QuickSearchRecord) async {
+        guard !isMutating else { return }
+        isMutating = true
+        generation &+= 1 // invalidate a panel load already in flight
+        defer { isMutating = false }
+        do { searches = try await store.add(record) }
+        catch { debugLog("Failed to add quick search: \(error)") }
     }
 
     func isEquivalent(_ lhs: QuickSearchRecord, to rhs: QuickSearchRecord) -> Bool {
-        lhs.mode == rhs.mode
-            && lhs.category == rhs.category
-            && lhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
-                == rhs.keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
-            && lhs.advanceSearch == rhs.advanceSearch
-            && lhs.minRating == rhs.minRating
-            && lhs.pageFrom == rhs.pageFrom
-            && lhs.pageTo == rhs.pageTo
+        SearchRecordMatching.equivalent(lhs, rhs)
     }
 
-    func delete(at offsets: IndexSet) {
-        let records = offsets.compactMap { index in
-            searches.indices.contains(index) ? searches[index] : nil
-        }
-        delete(searches: records)
-    }
-
-    func delete(searches records: [QuickSearchRecord]) {
-        let ids = Set(records.compactMap(\.id))
-        for id in ids {
-            do {
-                try EhDatabase.shared.deleteQuickSearch(id: id)
-            } catch {
-                debugLog("Failed to delete quick search: \(error)")
-            }
-        }
-        searches.removeAll { record in
-            guard let id = record.id else { return false }
-            return ids.contains(id)
+    func delete(searches records: [QuickSearchRecord]) async {
+        guard !isMutating else { return }
+        isMutating = true
+        generation &+= 1
+        defer { isMutating = false }
+        do { searches = try await store.delete(Set(records.compactMap(\.id))) }
+        catch {
+            // Reload after a possible partial failure, so the UI agrees with
+            // what was actually deleted. Never automatically retry a write.
+            debugLog("Failed to delete quick search: \(error)")
+            if let remaining = try? await store.load() { searches = remaining }
         }
     }
 }

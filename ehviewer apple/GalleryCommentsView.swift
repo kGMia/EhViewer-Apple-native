@@ -10,6 +10,12 @@ import EhModels
 import EhAPI
 import EhCookie
 import EhSettings
+import Translation
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 struct GalleryCommentsView: View {
     let gid: Int64
@@ -18,12 +24,14 @@ struct GalleryCommentsView: View {
     let apiKey: String
     let initialComments: [GalleryComment]
     let hasMore: Bool
-    var onCommentsChange: ((GalleryCommentList) -> Void)? = nil
+    var onCommentsChange: ((GalleryCommentList) async -> Void)? = nil
     var onClose: (() -> Void)? = nil
     
     @State private var vm = GalleryCommentsViewModel()
     @State private var commentText = ""
     @State private var linkedGallery: GalleryInfo?
+    @State private var translationText = ""
+    @State private var showsTranslation = false
     @Environment(\.responsiveLayout) private var responsiveLayout
 
     private var horizontalContentInset: CGFloat {
@@ -77,6 +85,10 @@ struct GalleryCommentsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
         #endif
+        .translationPresentation(
+            isPresented: $showsTranslation,
+            text: translationText
+        )
         .task(id: gid) {
             vm.setInitialComments(initialComments, hasMore: hasMore)
             vm.isSignedIn = EhCookieManager.shared.isSignedIn
@@ -103,7 +115,7 @@ struct GalleryCommentsView: View {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .semibold))
-                        .frame(width: 30, height: 30)
+                        .frame(width: 38, height: 38)
                         .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
@@ -116,7 +128,7 @@ struct GalleryCommentsView: View {
                     .textFieldStyle(.plain)
                     .lineLimit(1...3)
                     .padding(.horizontal, 8)
-                    .frame(minHeight: 32)
+                    .frame(minHeight: 38)
 
                 Button {
                     let submittedText = commentText
@@ -127,20 +139,39 @@ struct GalleryCommentsView: View {
                             token: token
                         ) {
                             commentText = ""
-                            onCommentsChange?(updated)
+                            await onCommentsChange?(updated)
                         }
                     }
                 } label: {
                     if vm.isPostingComment {
                         ProgressView()
                             .controlSize(.small)
-                            .frame(width: 70)
+                            #if os(iOS)
+                            .frame(width: 38, height: 38)
+                            #else
+                            .frame(width: 70, height: 38)
+                            #endif
                     } else {
+                        #if os(iOS)
+                        Image(systemName: "paperplane.fill")
+                            .frame(width: 38, height: 38)
+                            .accessibilityLabel("发表评论")
+                        #else
                         Label("发表评论", systemImage: "paperplane.fill")
+                            .padding(.horizontal, 12)
+                            .frame(height: 38)
+                        #endif
                     }
                 }
-                .buttonStyle(.glassProminent)
-                .controlSize(.small)
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                #if os(iOS)
+                .glassEffect(.regular.tint(Color.accentColor).interactive(), in: .circle)
+                .frame(width: 38, height: 38)
+                #else
+                .glassEffect(.regular.tint(Color.accentColor).interactive(), in: .capsule)
+                .frame(height: 38)
+                #endif
                 .disabled(
                     vm.isPostingComment
                         || commentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -153,14 +184,17 @@ struct GalleryCommentsView: View {
             }
         }
         .padding(7)
-        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+        .glassEffect(.regular, in: .capsule)
         .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
     }
     
     // MARK: - 单条评论
     
     private func commentRow(_ comment: GalleryComment) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let attributedComment = vm.attributedText(for: comment)
+        let plainComment = String(attributedComment.characters)
+
+        return VStack(alignment: .leading, spacing: 8) {
             // 头部：用户名、时间、分数
             HStack {
                 Text(comment.user)
@@ -184,10 +218,30 @@ struct GalleryCommentsView: View {
             }
             
             // 评论内容 (HTML 转纯文本，完整显示)
-            Text(vm.attributedText(for: comment))
+            Text(attributedComment)
                 .font(.subheadline)
                 .foregroundStyle(.primary)
                 .textSelection(.enabled)
+                .contextMenu {
+                    Button {
+                        copyComment(plainComment)
+                    } label: {
+                        Label("复制", systemImage: "doc.on.doc")
+                    }
+
+                    ShareLink(item: plainComment) {
+                        Label("分享", systemImage: "square.and.arrow.up")
+                    }
+
+                    Divider()
+
+                    Button {
+                        translationText = plainComment
+                        showsTranslation = true
+                    } label: {
+                        Label("翻译", systemImage: "translate")
+                    }
+                }
                 .environment(\.openURL, OpenURLAction { url in
                     guard let gallery = GalleryCommentLinks.gallery(from: url) else {
                         return .systemAction
@@ -258,6 +312,15 @@ struct GalleryCommentsView: View {
             }
         }
         .padding()
+    }
+
+    private func copyComment(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
     }
 }
 

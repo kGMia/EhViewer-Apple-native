@@ -3,7 +3,7 @@ import EhModels
 
 /// 评论中的 EH/EX 画廊链接。显示文本仍保留原网址，但点击时
 /// 使用应用内部 scheme，避免先跳 Safari 再回到应用。
-enum GalleryCommentLinks {
+nonisolated enum GalleryCommentLinks {
     private static let anchorRegex = try! NSRegularExpression(
         pattern: #"<a\b[^>]*href\s*=\s*[\"'](https?://(?:e-hentai\.org|exhentai\.org)/g/\d+/[A-Za-z0-9]+/?[^\"']*)[\"'][^>]*>(.*?)</a>"#,
         options: [.caseInsensitive, .dotMatchesLineSeparators]
@@ -53,6 +53,7 @@ enum GalleryCommentLinks {
         return attributed
     }
 
+    @MainActor
     static func gallery(from url: URL) -> GalleryInfo? {
         guard url.scheme == "ehviewer-gallery",
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),

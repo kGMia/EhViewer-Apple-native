@@ -14,6 +14,7 @@ import EhSettings
 import EhDatabase
 import EhAPI
 import EhCookie
+import EhParser
 #if os(iOS)
 import UIKit
 #elseif os(macOS)
@@ -260,13 +261,15 @@ final class ApplicationBootstrap {
 
     private var hasStarted = false
     private var hasScheduledMaintenance = false
+    private var interactionWarmupTask: Task<Void, Never>?
     private var deferredServicesTask: Task<Void, Never>?
     private let requestServicesTask = Task.detached(priority: .utility) {
         // Constructing a disk URLCache may read its index. Doing this in
         // EhViewerApp.init caused cold-launch stalls as that index grew.
+        let thumbnailBudget = AppSettings.shared.thumbnailCacheSize * 1024 * 1024 * 2 / 3
         URLCache.shared = URLCache(
             memoryCapacity: 20 * 1024 * 1024,
-            diskCapacity: 320 * 1024 * 1024,
+            diskCapacity: thumbnailBudget,
             directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
                 .appendingPathComponent("url_cache")
         )
@@ -284,7 +287,19 @@ final class ApplicationBootstrap {
         guard !hasStarted else { return }
         hasStarted = true
 
+        interactionWarmupTask = Task { @MainActor in
+            // Prepare feedback after the first frame. Context-menu and share
+            // presentation now remain entirely in the system's native path.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            guard !GalleryPreviewDiagnostics.skipInteractionWarmup else { return }
+            let interval = PerformanceDiagnostics.begin("InteractionWarmup")
+            Haptics.prepareForInteraction()
+            interval.end()
+        }
+
         Task.detached(priority: .background) {
+            GalleryDetailParser.prepare()
             try? await Task.sleep(for: .seconds(2))
             do {
                 try await EhTagDatabase.shared.updateDatabase(forceUpdate: false)
@@ -300,7 +315,6 @@ final class ApplicationBootstrap {
             try? await Task.sleep(for: .milliseconds(1_500))
             guard !Task.isCancelled else { return }
 
-            Haptics.prepareForInteraction()
             UNUserNotificationCenter.current().delegate = DownloadNotificationService.shared
             await Task.yield()
 

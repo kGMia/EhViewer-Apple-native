@@ -71,11 +71,13 @@ struct GalleryListView: View {
     @State private var imageSearchRoute: NativeImageSearchRoute?
     @State private var advancedSearch = AdvancedSearchState()
     @State private var selectedQuickSearch: QuickSearchRecord?
+    @State private var quickSearchModel = QuickSearchViewModel()
     @State private var favoritePickerGallery: GalleryInfo?
     @State private var searchPanelKeyboardCommand: SearchPanelKeyboardCommand?
     @State private var selectedGallery: GalleryInfo?
     @State private var primaryFeed: PrimaryFeed
     @FocusState private var isSearchFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var searchReduceMotion
     @Environment(\.contentRouteBackAction) private var contentRouteBackAction
     @Environment(\.gallerySearchNavigationAction) private var gallerySearchNavigationAction
     /// 跳页模式切换 (对齐 Android JumpDateSelector: DATE_PICKER_TYPE / DATE_NODE_TYPE)
@@ -694,6 +696,8 @@ struct GalleryListView: View {
             }(),
             isLoading: viewModel.isLoading,
             hasMore: viewModel.hasMore,
+            hasPreviousPage: viewModel.hasPreviousPage,
+            scrollRetention: viewModel.scrollRetention,
             onRefresh: { await viewModel.refreshOrLoadPrevious(mode: effectiveMode) },
             onLoadMore: { await viewModel.loadMore(mode: effectiveMode) }
         ) { gallery in
@@ -734,6 +738,13 @@ struct GalleryListView: View {
                     .listRowSeparator(.hidden)
             }
 
+            if viewModel.hasPreviousPage {
+                GalleryPreviousPageButton(isLoading: viewModel.isLoading) {
+                    await viewModel.refreshOrLoadPrevious(mode: effectiveMode)
+                }
+                .listRowSeparator(.hidden)
+            }
+
             // 内联加载指示器 (不阻塞界面，用户可正常操作其他 Tab 和功能)
             if viewModel.isLoading && viewModel.galleries.isEmpty {
                 VStack(spacing: 8) {
@@ -748,50 +759,36 @@ struct GalleryListView: View {
             }
 
             ForEach(displayedGalleries, id: \.gid) { gallery in
-                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
-                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
-                Button {
-                    selectedGallery = gallery
-                } label: {
-                    GalleryRow(
-                        gallery: gallery,
-                        showJpnTitle: showJpn,
-                        fixThumbUrl: fixThumb,
-                        showRating: showRating,
-                        showPages: showPages,
-                        isSelected: false
-                    )
-                }
-                .buttonStyle(.plain)
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Group {
+                    let isFavorited = GalleryActionService.shared.isFavorited(gallery)
                     Button {
-                        performFavoriteToggle(gallery)
+                        selectedGallery = gallery
                     } label: {
-                        Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
+                        GalleryRow(
+                            gallery: gallery,
+                            showJpnTitle: showJpn,
+                            fixThumbUrl: fixThumb,
+                            showRating: showRating,
+                            showPages: showPages,
+                            isSelected: false
+                        )
                     }
-                    .tint(isFavorited ? .gray : .red)
+                    .buttonStyle(.plain)
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button {
+                            performFavoriteToggle(gallery)
+                        } label: {
+                            Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
+                        }
+                        .tint(isFavorited ? .gray : .red)
 
-                    if !isWatchLater {
-                        Button {
-                            Task { await GalleryActionService.shared.addToWatchLater(gallery) }
-                        } label: {
-                            Label("稍后再看", systemImage: "bookmark")
-                        }
-                        .tint(.orange)
+                        GalleryWatchLaterSwipeButton(gallery: gallery)
                     }
+                    .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                    .listRowSeparator(.hidden)
                 }
-                .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                    if isWatchLater {
-                        Button {
-                            Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
-                        } label: {
-                            Label("移除稍后再看", systemImage: "bookmark.slash")
-                        }
-                        .tint(.orange)
-                    }
-                }
-                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
-                .listRowSeparator(.hidden)
+                .id(gallery.gid)
+                .modifier(GalleryScrollAnchorRow(retention: viewModel.scrollRetention, id: gallery.gid))
             }
 
             // 加载更多
@@ -807,6 +804,9 @@ struct GalleryListView: View {
         }
         .listStyle(.plain)
         .scrollPosition(id: $viewModel.scrollPosition)
+        .modifier(GalleryScrollRetentionModifier(
+            retention: viewModel.scrollRetention
+        ))
         #if os(iOS)
         .scrollDismissesKeyboard(.immediately)
         #endif
@@ -848,6 +848,8 @@ struct GalleryListView: View {
                         showsContinueReading: false,
                         isLoading: viewModel.isLoading,
                         hasMore: viewModel.hasMore,
+                        hasPreviousPage: viewModel.hasPreviousPage,
+                        scrollRetention: viewModel.scrollRetention,
                         onRefresh: { await viewModel.refreshOrLoadPrevious(mode: effectiveMode) },
                         onLoadMore: { await viewModel.loadMore(mode: effectiveMode) }
                     ) { gallery in
@@ -880,6 +882,13 @@ struct GalleryListView: View {
                                 .accessibilityHidden(true)
                         }
 
+                        if viewModel.hasPreviousPage {
+                            GalleryPreviousPageButton(isLoading: viewModel.isLoading) {
+                                await viewModel.refreshOrLoadPrevious(mode: effectiveMode)
+                            }
+                            .listRowSeparator(.hidden)
+                        }
+
                         // 内联加载指示器 (不阻塞界面)
                         if viewModel.isLoading && viewModel.galleries.isEmpty {
                             VStack(spacing: 8) {
@@ -894,12 +903,26 @@ struct GalleryListView: View {
                         }
 
                         ForEach(displayedGalleries, id: \.gid) { gallery in
-                            let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
-                            let isFavorited = GalleryActionService.shared.isFavorited(gallery)
-                            #if os(macOS)
-                            Button {
-                                selectionBinding.wrappedValue = gallery
-                            } label: {
+                            Group {
+                                            let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                                #if os(macOS)
+                                Button {
+                                    selectionBinding.wrappedValue = gallery
+                                } label: {
+                                    GalleryRow(
+                                        gallery: gallery,
+                                        showJpnTitle: showJpn,
+                                        fixThumbUrl: fixThumb,
+                                        showRating: showRating,
+                                        showPages: showPages,
+                                        isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                                .listRowSeparator(.hidden)
+                                #else
                                 GalleryRow(
                                     gallery: gallery,
                                     showJpnTitle: showJpn,
@@ -908,51 +931,23 @@ struct GalleryListView: View {
                                     showPages: showPages,
                                     isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
                                 )
-                            }
-                            .buttonStyle(.plain)
-                            .listRowBackground(Color.clear)
-                            .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
-                            .listRowSeparator(.hidden)
-                            #else
-                            GalleryRow(
-                                gallery: gallery,
-                                showJpnTitle: showJpn,
-                                fixThumbUrl: fixThumb,
-                                showRating: showRating,
-                                showPages: showPages,
-                                isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
-                            )
-                                .tag(gallery)
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button {
-                                        performFavoriteToggle(gallery)
-                                    } label: {
-                                        Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
-                                    }
-                                    .tint(isFavorited ? .gray : .red)
+                                    .tag(gallery)
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                        Button {
+                                            performFavoriteToggle(gallery)
+                                        } label: {
+                                            Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
+                                        }
+                                        .tint(isFavorited ? .gray : .red)
 
-                                    if !isWatchLater {
-                                        Button {
-                                            Task { await GalleryActionService.shared.addToWatchLater(gallery) }
-                                        } label: {
-                                            Label("稍后再看", systemImage: "bookmark")
-                                        }
-                                        .tint(.orange)
+                                        GalleryWatchLaterSwipeButton(gallery: gallery)
                                     }
-                                }
-                                .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                                    if isWatchLater {
-                                        Button {
-                                            Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
-                                        } label: {
-                                            Label("移除稍后再看", systemImage: "bookmark.slash")
-                                        }
-                                        .tint(.orange)
-                                    }
-                                }
-                                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
-                                .listRowSeparator(.hidden)
-                            #endif
+                                    .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                                    .listRowSeparator(.hidden)
+                                #endif
+                            }
+                            .id(gallery.gid)
+                            .modifier(GalleryScrollAnchorRow(retention: viewModel.scrollRetention, id: gallery.gid))
                         }
 
                         if viewModel.hasMore {
@@ -965,6 +960,9 @@ struct GalleryListView: View {
                         }
                     }
                     .scrollPosition(id: $viewModel.scrollPosition)
+                    .modifier(GalleryScrollRetentionModifier(
+                        retention: viewModel.scrollRetention
+                    ))
                     #if os(macOS)
                     // This is the content/feed column, not the app sidebar.
                     // Keep materials on navigation and controls; gallery
@@ -1079,70 +1077,75 @@ struct GalleryListView: View {
                 .accessibilityLabel("切换首页与热门")
             }
 
-            HStack(spacing: 7) {
-                searchFieldControl
+            SearchElasticSurface(isField: true)
+                .frame(height: 44)
+                .frame(maxWidth: .infinity)
+                .onTapGesture { focusSearchFromCommand() }
+                // Add foreground after glass and transforms so glyphs
+                // never enter the refracting/scaled surface snapshot.
+                .overlay {
+                    HStack(spacing: 7) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        searchFieldControl
 
-                Button {
-                    isSearchFocused = false
-                    imageSearchRoute = NativeImageSearchRoute(initialData: nil)
-                } label: {
-                    Image(systemName: "photo")
-                        .foregroundStyle(.secondary)
-                        .frame(width: 28, height: 34)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("以图搜图")
-                .accessibilityLabel("以图搜图")
+                        Button {
+                            isSearchFocused = false
+                            imageSearchRoute = NativeImageSearchRoute(initialData: nil)
+                        } label: {
+                            Image(systemName: "photo")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 28, height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("以图搜图")
+                        .accessibilityLabel("以图搜图")
 
-                Button {
-                    if viewModel.searchText.isEmpty {
-                        isSearchFocused = false
-                        showAdvancedSearch = true
-                    } else {
-                        clearSearchText()
+                        Button {
+                            if viewModel.searchText.isEmpty {
+                                isSearchFocused = false
+                                showAdvancedSearch = true
+                            } else {
+                                clearSearchText()
+                            }
+                        } label: {
+                            Image(systemName: viewModel.searchText.isEmpty
+                                  ? (advancedSearch.isEnabled ? "plus.circle.fill" : "plus.circle")
+                                  : "xmark.circle.fill")
+                                .foregroundStyle(viewModel.searchText.isEmpty ? .primary : .secondary)
+                                .frame(width: 28, height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(AppLocalization.localized(viewModel.searchText.isEmpty ? "高级搜索" : "清除搜索"))
                     }
-                } label: {
-                    Image(systemName: viewModel.searchText.isEmpty
-                          ? (advancedSearch.isEnabled ? "plus.circle.fill" : "plus.circle")
-                          : "xmark.circle.fill")
-                        .foregroundStyle(viewModel.searchText.isEmpty ? .primary : .secondary)
+                    .padding(.horizontal, 12)
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-            .frame(maxWidth: .infinity)
-            // The text field is the interactive control. Applying an
-            // interactive glass container here can take first-responder taps
-            // away from UIKit's text input bridge on iOS/Simulator.
-            .glassEffect(.regular, in: .capsule)
 
-            if isSearchFocused {
-                Button {
+            Button {
+                if isSearchFocused {
                     isSearchFocused = false
-                } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 38, height: 38)
-                        .contentShape(Circle())
+                } else {
+                    toggleGalleryDisplayMode()
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .circle)
-                .help("结束搜索输入")
-                .accessibilityLabel("结束搜索输入")
-                .accessibilityIdentifier("gallery.search.dismiss")
-                .transition(.scale.combined(with: .opacity))
-            } else {
-                Button { toggleGalleryDisplayMode() } label: {
-                    Image(systemName: galleryDisplayMode == .list ? "rectangle.grid.2x2" : "list.bullet")
-                        .frame(width: 38, height: 38)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: .circle)
-                .help(AppLocalization.localized(galleryDisplayMode == .list ? "切换到瀑布流" : "切换到列表"))
-                .accessibilityIdentifier("gallery.display.toggle")
+            } label: {
+                Image(systemName: isSearchFocused ? "xmark" :
+                        (galleryDisplayMode == .list ? "rectangle.grid.2x2" : "list.bullet"))
+                    .contentTransition(searchReduceMotion ? .identity : .symbolEffect(.replace))
+                    .frame(width: 38, height: 38)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: .circle)
+            .help(AppLocalization.localized(isSearchFocused ? "结束搜索输入" :
+                    (galleryDisplayMode == .list ? "切换到瀑布流" : "切换到列表")))
+            .accessibilityLabel(AppLocalization.localized(isSearchFocused ? "结束搜索输入" :
+                    (galleryDisplayMode == .list ? "切换到瀑布流" : "切换到列表")))
+            .accessibilityIdentifier(isSearchFocused ? "gallery.search.dismiss" : "gallery.display.toggle")
 
+            if !isSearchFocused {
                 Button {
                     if maximumJumpPage > 0 {
                         viewModel.showGoToDialog = true
@@ -1159,14 +1162,15 @@ struct GalleryListView: View {
                 .disabled(viewModel.galleries.isEmpty || viewModel.imageSearchURL != nil)
                 .help("跳页")
                 .accessibilityIdentifier("gallery.search.jump")
-                .transition(.scale.combined(with: .opacity))
+                .transition(searchReduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity))
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: isSearchFocused)
+        .animation(searchReduceMotion ? nil : .spring(duration: 0.36, bounce: 0.18), value: isSearchFocused)
     }
 
-    private var searchRecordsPanel: some View {
+    private func searchRecordsPanel(maximumHeight: CGFloat) -> some View {
         SearchRecordsPanelContent(
+            vm: quickSearchModel,
             selectedSearch: $selectedQuickSearch,
             searchHistory: viewModel.searchHistory,
             currentSearch: viewModel.currentQuickSearchRecord(),
@@ -1185,7 +1189,8 @@ struct GalleryListView: View {
             },
             onDismiss: { isSearchFocused = false },
             keyboardCommand: searchPanelKeyboardCommand,
-            canSaveCurrentSearch: viewModel.imageSearchURL == nil
+            canSaveCurrentSearch: viewModel.imageSearchURL == nil,
+            maximumHeight: maximumHeight
         )
     }
 
@@ -1237,6 +1242,7 @@ struct GalleryListView: View {
                 return .handled
             }
             #else
+            .submitLabel(.search)
             .autocorrectionDisabled()
             .textInputAutocapitalization(.never)
             #endif
@@ -1263,27 +1269,19 @@ struct GalleryListView: View {
     private var searchAuxiliaryOverlay: some View {
         ZStack(alignment: .top) {
             if isSearchFocused {
-                // 聚焦时右侧只有一个 38pt 关闭按钮。46pt 同时包含按钮与
-                // 间距；面板自身 10pt 外边距与搜索栏的外边距完全一致。
-                searchRecordsPanel
-                    .padding(
-                        .leading,
-                        (contentRouteBackAction == nil ? 0 : 46)
-                            + (supportsPrimaryFeedSwitching ? 46 : 0)
-                    )
-                    .padding(.trailing, 46)
-                    .transition(
-                        .asymmetric(
-                            insertion: .move(edge: .top)
-                                .combined(with: .opacity)
-                                .combined(with: .scale(scale: 0.975, anchor: .top)),
-                            removal: .opacity
-                                .combined(with: .scale(scale: 0.985, anchor: .top))
+                GeometryReader { geometry in
+                    searchRecordsPanel(maximumHeight: min(320, geometry.size.height - 8))
+                        .padding(
+                            .leading,
+                            (contentRouteBackAction == nil ? 0 : 46)
+                                + (supportsPrimaryFeedSwitching ? 46 : 0)
                         )
-                    )
+                        .padding(.trailing, 46)
+                }
+                .transition(searchReduceMotion ? .opacity : .opacity.combined(with: .offset(y: -6)))
             }
         }
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: isSearchFocused)
+        .animation(searchReduceMotion ? nil : .spring(duration: 0.32, bounce: 0.1), value: isSearchFocused)
     }
 
     private var galleryDisplayMode: EhSettings.ListMode {
@@ -1705,58 +1703,61 @@ struct GalleryRow: View {
                 .padding(.vertical, 3)
         }
         .contentShape(Rectangle())
-        #if os(iOS)
-        .contentShape(
-            .contextMenuPreview,
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+        #if os(macOS)
+        // Keep the AppKit hit-test surface above the SwiftUI Button/List row.
+        // It accepts only secondary clicks, so ordinary selection still goes
+        // through to the SwiftUI content below it.
+        .overlay {
+            NativeGalleryContextMenu(
+                isWatchLater: GalleryActionService.shared.isInWatchLater(gid: gallery.gid),
+                isFavorited: GalleryActionService.shared.isFavorited(gallery),
+                shareURL: URL(string: GalleryActionService.shared.galleryURL(
+                    gid: gallery.gid,
+                    token: gallery.token
+                )),
+                toggleWatchLater: {
+                    if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                        Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                    } else {
+                        Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                    }
+                },
+                download: {
+                    Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
+                },
+                toggleFavorite: { performFavoriteToggle(gallery) },
+                copyLink: {
+                    GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+                }
+            )
+        }
+        #else
+        .modifier(
+            GalleryActionMenu(
+                title: gallery.suitableTitle(preferJpn: showJpnTitle),
+                isWatchLater: GalleryActionService.shared.isInWatchLater(gid: gallery.gid),
+                isFavorited: GalleryActionService.shared.isFavorited(gallery),
+                shareURL: URL(string: GalleryActionService.shared.galleryURL(
+                    gid: gallery.gid,
+                    token: gallery.token
+                )),
+                toggleWatchLater: {
+                    if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                        Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                    } else {
+                        Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                    }
+                },
+                download: {
+                    Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
+                },
+                toggleFavorite: { performFavoriteToggle(gallery) },
+                copyLink: {
+                    GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+                }
+            )
         )
         #endif
-        .contextMenu {
-            Button {
-                if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
-                    Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
-                } else {
-                    Task { await GalleryActionService.shared.addToWatchLater(gallery) }
-                }
-            } label: {
-                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
-                Label(
-                    AppLocalization.localized(isWatchLater ? "从稍后再看移除" : "稍后再看"),
-                    systemImage: isWatchLater ? "bookmark.slash" : "bookmark"
-                )
-            }
-
-            // 下载
-            Button {
-                Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
-            } label: {
-                Label("下载", systemImage: "arrow.down.circle")
-            }
-
-            // 收藏
-            Button {
-                performFavoriteToggle(gallery)
-            } label: {
-                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
-                Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
-            }
-
-            Divider()
-
-            // 复制链接
-            Button {
-                GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
-            } label: {
-                Label("复制链接", systemImage: "doc.on.doc")
-            }
-
-            // 分享 (仅 iOS)
-            #if os(iOS)
-            ShareLink(item: URL(string: GalleryActionService.shared.galleryURL(gid: gallery.gid, token: gallery.token))!) {
-                Label("分享", systemImage: "square.and.arrow.up")
-            }
-            #endif
-        }
         .sheet(item: $favoritePickerGallery) { selectedGallery in
             listFavoritePicker(for: selectedGallery)
         }
@@ -1805,7 +1806,9 @@ struct GalleryRow: View {
     }
 
     private var galleryCover: some View {
-        CachedAsyncImage(url: thumbURL) { image in
+        CachedAsyncImage(
+            url: thumbURL
+        ) { image in
             image
                 .resizable()
                 .aspectRatio(contentMode: .fill)
@@ -1834,16 +1837,40 @@ struct GalleryRow: View {
 
 // MARK: - Adaptive Waterfall Feed
 
-private struct GalleryWaterfallLayoutKey: Hashable, Sendable {
+/// Compare the complete ordered input, including dimensions and metadata.
+/// Sampling IDs misses interior reorders and can retain stale gallery values.
+nonisolated struct GalleryWaterfallLayoutKey: Hashable, Sendable {
     let columnCount: Int
-    let itemCount: Int
     let revision: Int
-    let firstGID: Int64?
-    let middleGID: Int64?
-    let lastGID: Int64?
+    let galleries: [GalleryInfo]
+    var columnWidth: CGFloat = 0
+
+    /// Append-only updates keep lazy-stack measurements and scroll anchors.
+    /// Sorting, replacement, and resizing must discard those measurements.
+    func preservesMeasurements(from previous: Self) -> Bool {
+        columnCount == previous.columnCount
+            && columnWidth == previous.columnWidth
+            && revision == previous.revision
+            && galleries.count >= previous.galleries.count
+            && galleries.prefix(previous.galleries.count).elementsEqual(previous.galleries)
+    }
 }
 
-private enum GalleryWaterfallLayoutBuilder {
+struct GalleryWaterfallSnapshot {
+    let key: GalleryWaterfallLayoutKey
+    let columns: [[GalleryInfo]]
+    let generation: Int
+
+    init(key: GalleryWaterfallLayoutKey, columns: [[GalleryInfo]], previous: Self?) {
+        self.key = key
+        self.columns = columns
+        generation = previous.map {
+            key.preservesMeasurements(from: $0.key) ? $0.generation : $0.generation &+ 1
+        } ?? 0
+    }
+}
+
+enum GalleryWaterfallLayoutBuilder {
     nonisolated static func columns(
         for galleries: [GalleryInfo],
         columnCount: Int
@@ -1852,7 +1879,8 @@ private enum GalleryWaterfallLayoutBuilder {
         var result = Array(repeating: [GalleryInfo](), count: columnCount)
         var estimatedHeights = Array(repeating: CGFloat.zero, count: columnCount)
 
-        for gallery in galleries {
+        for (index, gallery) in galleries.enumerated() {
+            if index.isMultiple(of: 256), Task.isCancelled { return [] }
             let targetColumn = estimatedHeights.indices.min {
                 estimatedHeights[$0] < estimatedHeights[$1]
             } ?? 0
@@ -1875,13 +1903,15 @@ struct GalleryWaterfallView<ItemContent: View>: View {
     let isLoading: Bool
     let hasMore: Bool
     var layoutRevision: Int = 0
+    var hasPreviousPage: Bool = false
+    var scrollRetention: GalleryScrollRetention? = nil
     let onRefresh: () async -> Void
     let onLoadMore: () async -> Void
     @ViewBuilder let itemContent: (GalleryInfo) -> ItemContent
 
     @Environment(\.responsiveLayout) private var layout
-    @State private var preparedLayoutKey: GalleryWaterfallLayoutKey?
-    @State private var preparedColumns: [[GalleryInfo]] = []
+    @State private var preparedLayout: GalleryWaterfallSnapshot?
+    @State private var isLoadMoreVisible = false
 
     private let spacing: CGFloat = 12
     private let minimumColumnWidth: CGFloat = 164
@@ -1905,28 +1935,30 @@ struct GalleryWaterfallView<ItemContent: View>: View {
             )
             let layoutKey = GalleryWaterfallLayoutKey(
                 columnCount: columnCount,
-                itemCount: galleries.count,
                 revision: layoutRevision,
-                firstGID: galleries.first?.gid,
-                middleGID: galleries.isEmpty ? nil : galleries[galleries.count / 2].gid,
-                lastGID: galleries.last?.gid
+                galleries: galleries,
+                columnWidth: columnWidth
             )
-            let columns = galleries.count <= synchronousLayoutLimit
-                ? GalleryWaterfallLayoutBuilder.columns(
-                    for: galleries,
-                    columnCount: columnCount
+            let displayedLayout = galleries.count <= synchronousLayoutLimit
+                ? GalleryWaterfallSnapshot(
+                    key: layoutKey,
+                    columns: GalleryWaterfallLayoutBuilder.columns(for: galleries, columnCount: columnCount),
+                    previous: preparedLayout
                 )
-                // While a new page is being distributed, keep the preceding
-                // complete layout visible instead of flashing an empty feed.
-                : (preparedLayoutKey?.columnCount == columnCount ? preparedColumns : [])
+                : preparedLayout
+            let columns = displayedLayout?.columns ?? []
 
             ScrollView {
-                LazyVStack(spacing: 14) {
+                VStack(spacing: 14) {
                     if topInset > 0 {
                         Color.clear
                             .frame(height: topInset)
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
+                    }
+
+                    if hasPreviousPage {
+                        GalleryPreviousPageButton(isLoading: isLoading, action: onRefresh)
                     }
 
                     if showsContinueReading {
@@ -1953,17 +1985,22 @@ struct GalleryWaterfallView<ItemContent: View>: View {
                     if !columns.isEmpty {
                         HStack(alignment: .top, spacing: spacing) {
                             ForEach(columns.indices, id: \.self) { columnIndex in
-                                VStack(spacing: spacing) {
+                                LazyVStack(spacing: spacing) {
                                     ForEach(columns[columnIndex], id: \.gid) { gallery in
                                         itemContent(gallery)
                                             .frame(width: columnWidth)
                                             .id(gallery.gid)
+                                            .modifier(GalleryScrollAnchorRow(retention: scrollRetention, id: gallery.gid))
                                     }
                                 }
                                 .scrollTargetLayout()
                                 .frame(width: columnWidth, alignment: .top)
                             }
                         }
+                        // Publish the new columns and their identity together.
+                        // Reusing old LazyVStack measurements across a sort can
+                        // leave covers at stale offsets, overlapping each other.
+                        .id(displayedLayout?.generation ?? 0)
                         .frame(width: availableWidth, alignment: .leading)
                         .transaction { transaction in
                             if layoutRevision != 0 {
@@ -1977,13 +2014,21 @@ struct GalleryWaterfallView<ItemContent: View>: View {
                         ProgressView()
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 12)
-                            .task { await onLoadMore() }
+                            .onScrollVisibilityChange { isLoadMoreVisible = $0 }
+                            .task(id: isLoadMoreVisible) {
+                                guard isLoadMoreVisible else { return }
+                                await onLoadMore()
+                            }
+                            .onDisappear { isLoadMoreVisible = false }
                     }
                 }
                 .padding(.horizontal, horizontalInset)
                 .padding(.bottom, 16)
             }
             .scrollPosition(id: $scrollPosition)
+            .modifier(GalleryScrollRetentionModifier(
+                retention: scrollRetention, isLayoutReady: displayedLayout?.key == layoutKey
+            ))
             #if os(macOS)
             .scrollEdgeEffectStyle(.soft, for: .top)
             #else
@@ -1991,26 +2036,28 @@ struct GalleryWaterfallView<ItemContent: View>: View {
             #endif
             .refreshable { await onRefresh() }
             .task(id: layoutKey) {
-                guard galleries.count > synchronousLayoutLimit else {
-                    preparedLayoutKey = nil
-                    preparedColumns = []
-                    return
+                let computed: [[GalleryInfo]]
+                if galleries.count <= synchronousLayoutLimit {
+                    computed = GalleryWaterfallLayoutBuilder.columns(for: galleries, columnCount: columnCount)
+                } else {
+                    let source = galleries
+                    let computation = Task.detached(priority: .userInitiated) {
+                        GalleryWaterfallLayoutBuilder.columns(for: source, columnCount: columnCount)
+                    }
+                    computed = await withTaskCancellationHandler {
+                        await computation.value
+                    } onCancel: {
+                        computation.cancel()
+                    }
                 }
-
-                let source = galleries
-                let computed = await Task.detached(priority: .userInitiated) {
-                    GalleryWaterfallLayoutBuilder.columns(
-                        for: source,
-                        columnCount: columnCount
-                    )
-                }.value
                 guard !Task.isCancelled else { return }
 
                 var transaction = Transaction(animation: nil)
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
-                    preparedColumns = computed
-                    preparedLayoutKey = layoutKey
+                    preparedLayout = GalleryWaterfallSnapshot(
+                        key: layoutKey, columns: computed, previous: preparedLayout
+                    )
                 }
             }
         }
@@ -2030,6 +2077,15 @@ struct GalleryWaterfallCard: View {
     let isSelected: Bool
 
     @State private var isHovered = false
+    @State private var loadedCoverSize: CGSize?
+
+    private var coverAspectRatio: CGFloat {
+        let size = loadedCoverSize ?? thumbURL.flatMap { ThumbnailMemoryCache.shared.get($0)?.size }
+        if let size, size.width > 0, size.height > 0 {
+            return size.width / size.height
+        }
+        return gallery.waterfallAspectRatio
+    }
     @State private var favoritePickerGallery: GalleryInfo?
 
     private var thumbURL: URL? {
@@ -2042,19 +2098,7 @@ struct GalleryWaterfallCard: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            CachedAsyncImage(url: thumbURL, showProgress: false) { image in
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } placeholder: {
-                Color(.secondarySystemBackground)
-                    .overlay {
-                        Image(systemName: "photo")
-                            .foregroundStyle(.tertiary)
-                    }
-            }
-            .aspectRatio(gallery.waterfallAspectRatio, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            waterfallCover
 
             HStack(spacing: 5) {
                 Circle()
@@ -2120,58 +2164,93 @@ struct GalleryWaterfallCard: View {
         .animation(.snappy(duration: 0.2), value: isHovered)
         .onHover { isHovered = $0 }
         #else
-        // iPad 指针悬浮时使用与 macOS 相同的标题跑马灯；触控长按仍交给
-        // 系统 context menu，避免自定义长按手势抢走列表点击/滚动。
+        // Pointer hover and the system context-menu lift share the same card.
         .hoverEffect(.lift)
         .onHover { isHovered = $0 }
         #endif
         .contentShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         .help(gallery.suitableTitle(preferJpn: showJpnTitle))
-        #if os(iOS)
-        .contentShape(
-            .contextMenuPreview,
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+        #if os(macOS)
+        .overlay {
+            NativeGalleryContextMenu(
+                isWatchLater: GalleryActionService.shared.isInWatchLater(gid: gallery.gid),
+                isFavorited: GalleryActionService.shared.isFavorited(gallery),
+                shareURL: URL(string: GalleryActionService.shared.galleryURL(
+                    gid: gallery.gid,
+                    token: gallery.token
+                )),
+                toggleWatchLater: {
+                    if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                        Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                    } else {
+                        Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                    }
+                },
+                download: {
+                    Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
+                },
+                toggleFavorite: { performFavoriteToggle(gallery) },
+                copyLink: {
+                    GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+                }
+            )
+        }
+        #else
+        .modifier(
+            GalleryActionMenu(
+                title: gallery.suitableTitle(preferJpn: showJpnTitle),
+                isWatchLater: GalleryActionService.shared.isInWatchLater(gid: gallery.gid),
+                isFavorited: GalleryActionService.shared.isFavorited(gallery),
+                shareURL: URL(string: GalleryActionService.shared.galleryURL(
+                    gid: gallery.gid,
+                    token: gallery.token
+                )),
+                toggleWatchLater: {
+                    if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
+                        Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
+                    } else {
+                        Task { await GalleryActionService.shared.addToWatchLater(gallery) }
+                    }
+                },
+                download: {
+                    Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
+                },
+                toggleFavorite: { performFavoriteToggle(gallery) },
+                copyLink: {
+                    GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+                },
+                waterfallPreview: GalleryWaterfallPreview(
+                    title: gallery.suitableTitle(preferJpn: showJpnTitle),
+                    thumbnailURL: thumbURL,
+                    aspectRatio: coverAspectRatio
+                )
+            )
         )
         #endif
-        .contextMenu {
-            Button {
-                if GalleryActionService.shared.isInWatchLater(gid: gallery.gid) {
-                    Task { await GalleryActionService.shared.removeFromWatchLater(gid: gallery.gid) }
-                } else {
-                    Task { await GalleryActionService.shared.addToWatchLater(gallery) }
-                }
-            } label: {
-                let isWatchLater = GalleryActionService.shared.isInWatchLater(gid: gallery.gid)
-                Label(
-                    AppLocalization.localized(isWatchLater ? "从稍后再看移除" : "稍后再看"),
-                    systemImage: isWatchLater ? "bookmark.slash" : "bookmark"
-                )
-            }
-
-            Button {
-                Task { await GalleryActionService.shared.startDownload(gallery: gallery) }
-            } label: {
-                Label("下载", systemImage: "arrow.down.circle")
-            }
-
-            Button {
-                performFavoriteToggle(gallery)
-            } label: {
-                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
-                Label(AppLocalization.localized(isFavorited ? "取消收藏" : "收藏"), systemImage: isFavorited ? "heart.slash" : "heart")
-            }
-
-            Divider()
-
-            Button {
-                GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
-            } label: {
-                Label("复制链接", systemImage: "doc.on.doc")
-            }
-        }
         .sheet(item: $favoritePickerGallery) { selectedGallery in
             listFavoritePicker(for: selectedGallery)
         }
+    }
+
+    private var waterfallCover: some View {
+        // Persisted dimensions reserve the right space. Legacy records lack
+        // those dimensions, so adopt the decoded image ratio when available.
+        // Fit the whole image even while a placeholder ratio is being corrected.
+        Color(.secondarySystemBackground)
+            .aspectRatio(coverAspectRatio, contentMode: .fit)
+            .overlay {
+                CachedAsyncImage(url: thumbURL, showProgress: false, animatedContentMode: .fit, onImageSize: { size in
+                    guard size.width > 0, size.height > 0, loadedCoverSize != size else { return }
+                    loadedCoverSize = size
+                }) { image in
+                    image.resizable().scaledToFit()
+                } placeholder: {
+                    Image(systemName: "photo")
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .onChange(of: thumbURL) { _, _ in loadedCoverSize = nil }
     }
 
     private func performFavoriteToggle(_ selectedGallery: GalleryInfo) {
@@ -2246,6 +2325,8 @@ private struct HoverMarqueeTitle: View {
     let title: String
     let isHovering: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ScaledMetric(relativeTo: .caption) private var titleHeight: CGFloat = 16
     @State private var textWidth: CGFloat = 0
     @State private var containerWidth: CGFloat = 0
     @State private var offset: CGFloat = 0
@@ -2279,10 +2360,11 @@ private struct HoverMarqueeTitle: View {
                 }
         }
             .frame(minWidth: 0, maxWidth: .infinity)
-            .frame(height: 16)
+            .frame(height: titleHeight)
             .clipped()
             .accessibilityLabel(title)
             .onChange(of: isHovering) { _, _ in updateAnimation() }
+            .onChange(of: reduceMotion) { _, _ in updateAnimation() }
             .onChange(of: title) { _, _ in
                 offset = 0
                 updateAnimation()
@@ -2313,8 +2395,8 @@ private struct HoverMarqueeTitle: View {
 
     private func updateAnimation() {
         let distance = max(textWidth - containerWidth, 0)
-        guard isHovering, distance > 1 else {
-            withAnimation(.snappy(duration: 0.18)) { offset = 0 }
+        guard isHovering, !reduceMotion, distance > 1 else {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { offset = 0 }
             return
         }
         withAnimation(.linear(duration: max(1.2, distance / 28)).delay(0.28)) {
@@ -2344,6 +2426,8 @@ class GalleryListViewModel {
     var scrollPosition: Int64?
     private var pagination = GalleryPaginationState()
     var hasMore: Bool { pagination.hasMore }
+    var hasPreviousPage: Bool { pagination.prevHref != nil }
+    let scrollRetention = GalleryScrollRetention()
     var totalPages: Int { pagination.totalPages }
     var showGoToDialog = false // 跳页对话框 (页码模式，仅 TopList 使用)
     var goToPageInput: String = "" // 跳页输入
@@ -2473,7 +2557,7 @@ class GalleryListViewModel {
     var dedicatedSearchRestorationGeneration = 0
     private(set) var dedicatedSearchRestorationAnchor: Int64?
 
-    private struct DedicatedSearchSession: Codable, Sendable {
+    private nonisolated struct DedicatedSearchSession: Codable, Sendable {
         let site: Int
         let search: QuickSearchRecord
         let galleries: [GalleryInfo]
@@ -2483,7 +2567,7 @@ class GalleryListViewModel {
         let imageSearchURL: URL?
     }
 
-    private static let dedicatedSearchSessionKey = "ehDedicatedSearchSession.v1"
+    private nonisolated static let dedicatedSearchSessionKey = "ehDedicatedSearchSession.v1"
 
     var canRestorePreviousDedicatedSearch: Bool {
         !dedicatedSearchBackStack.isEmpty
@@ -2919,19 +3003,16 @@ class GalleryListViewModel {
     private func fetchPreviousPage(_ href: String) async {
         guard !isLoading else { return }
         isLoading = true
+        defer { isLoading = false }
         errorMessage = nil
         let targetPage = max(pagination.firstLoadedPage - 1, 0)
-        // Prefer the item that is actually pinned to the scroll viewport. The
-        // first loaded item can already be well above the visible region after
-        // several page loads, and restoring to it would look like a jump to the
-        // top of the list.
-        let retainedAnchor = scrollPosition ?? galleries.first?.gid
 
         do {
             let result = try await EhAPI.shared.getGalleryList(url: resolvedListHref(href))
             try Task.checkCancellation()
             let pageGalleries = try await enrichedGalleries(result.galleries)
             let prependedGalleries = pagination.merge(pageGalleries, replacing: false)
+            let retainedAnchor = scrollRetention.capture()
             if !prependedGalleries.isEmpty {
                 galleries.insert(contentsOf: prependedGalleries, at: 0)
             }
@@ -2942,23 +3023,13 @@ class GalleryListViewModel {
                 loadedPage: targetPage,
                 prependedCount: prependedGalleries.count
             )
-            // Keep the former first row/card stationary after inserting the
-            // previous page above it. The user can then continue scrolling
-            // upward without a visual jump.
-            if let retainedAnchor {
-                await Task.yield()
-                var transaction = Transaction(animation: nil)
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    scrollPosition = retainedAnchor
-                }
+            if !prependedGalleries.isEmpty, let retainedAnchor {
+                scrollRetention.request = .init(anchor: retainedAnchor)
             }
-            isLoading = false
             scheduleDedicatedSearchPersistence()
         } catch {
             if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
             errorMessage = EhError.localizedMessage(for: error)
-            isLoading = false
         }
     }
 

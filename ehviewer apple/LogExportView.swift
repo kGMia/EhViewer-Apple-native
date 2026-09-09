@@ -9,13 +9,32 @@ import SwiftUI
 import UniformTypeIdentifiers
 import EhSettings
 
+private nonisolated struct DiagnosticLogDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.plainText] }
+
+    var data = Data()
+
+    init(data: Data = Data()) {
+        self.data = data
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
 struct LogExportView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var logContent: String = AppLocalization.localized("加载中...")
     @State private var logSize: String = ""
     @State private var logFiles: [URL] = []
-    @State private var showShareSheet = false
-    @State private var exportURL: URL?
+    @State private var isExporting = false
+    @State private var exportDocument = DiagnosticLogDocument()
+    @State private var exportFilename = "EhViewer-Diagnostics"
 
     var body: some View {
         NavigationStack {
@@ -66,13 +85,20 @@ struct LogExportView: View {
                 }
             }
             .task { loadLogs() }
-            #if os(iOS)
-            .sheet(isPresented: $showShareSheet) {
-                if let url = exportURL {
-                    ShareSheet(items: [url])
+            .fileExporter(
+                isPresented: $isExporting,
+                document: exportDocument,
+                contentType: .plainText,
+                defaultFilename: exportFilename
+            ) { result in
+                if case .failure(let error) = result {
+                    // Cancellation is intentionally silent; genuine exporter
+                    // failures still flow through the app-wide error surface.
+                    let nsError = error as NSError
+                    guard nsError.code != NSUserCancelledError else { return }
+                    ErrorHandler.shared.handle(error, context: "LogExport")
                 }
             }
-            #endif
         }
     }
 
@@ -106,32 +132,12 @@ struct LogExportView: View {
 
     private func exportLog() {
         guard let url = LogManager.shared.exportCombinedLog() else { return }
-
-        #if os(iOS)
-        exportURL = url
-        showShareSheet = true
-        #elseif os(macOS)
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = url.lastPathComponent
-        panel.title = AppLocalization.localized("导出诊断日志")
-        if panel.runModal() == .OK, let dest = panel.url {
-            try? FileManager.default.copyItem(at: url, to: dest)
+        do {
+            exportDocument = DiagnosticLogDocument(data: try Data(contentsOf: url))
+            exportFilename = url.deletingPathExtension().lastPathComponent
+            isExporting = true
+        } catch {
+            ErrorHandler.shared.handle(error, context: "LogExportPreparation")
         }
-        #endif
     }
 }
-
-// MARK: - iOS ShareSheet wrapper
-
-#if os(iOS)
-struct ShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
-}
-#endif

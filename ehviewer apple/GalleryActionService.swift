@@ -181,16 +181,11 @@ final class GalleryActionService {
     // MARK: - 站点工具
 
     /// 统一站点 URL — 替代分散在 4 个文件中的 getSite() 重复代码
-    /// 包含 ExHentai cookie 验证回退逻辑 (对齐 Android: 检查 igneous cookie)
+    /// Cookie validation belongs to the request/authentication layer. Reading
+    /// HTTPCookieStorage synchronously here blocked first detail presentation
+    /// and ShareLink's first context-menu construction.
     static var siteBaseURL: String {
-        switch AppSettings.shared.gallerySite {
-        case .exHentai:
-            let cookies = HTTPCookieStorage.shared.cookies(for: URL(string: "https://exhentai.org")!) ?? []
-            let hasEX = cookies.contains { $0.name == "igneous" && !$0.value.isEmpty && $0.value != "mystery" }
-            return hasEX ? "https://exhentai.org/" : "https://e-hentai.org/"
-        case .eHentai:
-            return "https://e-hentai.org/"
-        }
+        EhURL.host(for: AppSettings.shared.gallerySite)
     }
 }
 

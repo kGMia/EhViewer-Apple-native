@@ -546,10 +546,13 @@ struct GalleryDetailView: View {
             isCompactHeaderVisible = false
             coverGlowPalette = nil
             coverGlowSamplingKey = nil
-            async let detailLoad: Void = vm.loadDetail(gid: loadingGID, token: gallery.token)
+            // Detail owns the critical path. My Tags and Spotlight used to
+            // compete with its first network request and delayed presentation.
+            await vm.loadDetail(gid: loadingGID, token: gallery.token)
+            guard !Task.isCancelled else { return }
             async let tagLoad: Void = vm.loadMyTags()
-            _ = await (detailLoad, tagLoad)
-            await SystemGalleryIntegration.index(vm.detail?.info ?? gallery)
+            async let indexing: Void = SystemGalleryIntegration.index(vm.detail?.info ?? gallery)
+            _ = await (tagLoad, indexing)
         }
         .userActivity(SystemGalleryIntegration.activityType, isActive: true) { activity in
             SystemGalleryIntegration.configure(activity, gallery: vm.detail?.info ?? gallery)
@@ -645,19 +648,18 @@ struct GalleryDetailView: View {
         .overlay(alignment: .top) {
             if isCompactHeaderVisible {
                 compactHeader
-                    .background {
-                        Rectangle()
-                            .fill(.clear)
-                            .glassEffect(.regular, in: .rect(cornerRadius: 0))
-                            // Paint through the transparent titlebar/safe-area
-                            // without shifting the compact header's controls.
-                            .ignoresSafeArea(.container, edges: .top)
-                    }
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    // A single, bounded glass surface provides both the lens
+                    // and its continuous rounded edge. Never refract through a
+                    // zero-radius rectangle extended behind the safe area.
+                    .glassEffect(.regular, in: .rect(cornerRadius: 24))
+                    .padding(.horizontal, 8)
+                    .padding(.top, 6)
+                    .transition(.opacity.combined(with: .offset(y: reduceMotion ? 0 : -8)))
                     .zIndex(10)
             }
         }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isCompactHeaderVisible)
+        .scrollEdgeEffectStyle(.soft, for: .top)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: isCompactHeaderVisible)
     }
 
     private var portraitTabletContentInset: CGFloat {
@@ -799,16 +801,17 @@ struct GalleryDetailView: View {
                                 Task { await vm.startDownload(gallery: gallery) }
                             }
                         }
-                        ShareLink(item: GalleryActionService.shared.galleryURL(
+                        GalleryShareLink(urlString: GalleryActionService.shared.galleryURL(
                             gid: gallery.gid,
                             token: gallery.token
-                        )) {
+                        ), title: gallery.suitableTitle(preferJpn: AppSettings.shared.showJpnTitle)) {
                             Image(systemName: "square.and.arrow.up")
-                                .frame(width: 27, height: 27)
+                                .frame(width: compactActionSize, height: compactActionSize)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
                         .help("分享")
+                        .accessibilityLabel("分享")
                     }
                 }
                 .padding(.top, 2)
@@ -821,6 +824,14 @@ struct GalleryDetailView: View {
         .frame(minHeight: 108)
     }
 
+    private var compactActionSize: CGFloat {
+        #if os(iOS)
+        44
+        #else
+        27
+        #endif
+    }
+
     private func compactActionButton(
         icon: String,
         help: String,
@@ -828,11 +839,12 @@ struct GalleryDetailView: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .frame(width: 27, height: 27)
+                .frame(width: compactActionSize, height: compactActionSize)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .help(help)
+        .accessibilityLabel(AppLocalization.localized(help))
     }
 
     @ViewBuilder
@@ -972,7 +984,6 @@ struct GalleryDetailView: View {
         }
         // 为扩散层预留真实绘制空间，避免外沿被父布局过早裁切。
         .frame(width: width * 1.96, height: height * 1.70)
-        .compositingGroup()
 
         return Button {
             Haptics.tap()
@@ -1020,29 +1031,30 @@ struct GalleryDetailView: View {
                 .blur(radius: max(5, width * 0.105))
                 .opacity(strength * nearOpacity)
         }
-        .compositingGroup()
         .allowsHitTesting(false)
     }
 
-    /// 3×3 连续色场的八个边界节点与八个局部采样区域完全一致。
-    /// 当四边同为白色时，整个场严格为均匀白色；不同颜色时由 MeshGradient
-    /// 在内部平滑插值，再由统一轮廓模糊自然扩散到背景。
-    private func coverLightField(_ palette: CoverGlowPalette) -> MeshGradient {
-        let center = palette.averageColor
-
-        return MeshGradient(
-            width: 3,
-            height: 3,
-            points: [
-                SIMD2<Float>(0, 0), SIMD2<Float>(0.5, 0), SIMD2<Float>(1, 0),
-                SIMD2<Float>(0, 0.5), SIMD2<Float>(0.5, 0.5), SIMD2<Float>(1, 0.5),
-                SIMD2<Float>(0, 1), SIMD2<Float>(0.5, 1), SIMD2<Float>(1, 1),
-            ],
+    /// The cover hides the centre of this field, so a conic interpolation can
+    /// map every sampled edge directly to the corresponding outer direction.
+    /// Unlike MeshGradient this uses the system's long-established gradient
+    /// pipeline and avoids compiling a mesh shader during the first detail
+    /// presentation.
+    private func coverLightField(_ palette: CoverGlowPalette) -> AngularGradient {
+        AngularGradient(
             colors: [
-                palette.topLeading.color, palette.top.color, palette.topTrailing.color,
-                palette.leading.color, center.color, palette.trailing.color,
-                palette.bottomLeading.color, palette.bottom.color, palette.bottomTrailing.color,
-            ]
+                palette.trailing.color,
+                palette.bottomTrailing.color,
+                palette.bottom.color,
+                palette.bottomLeading.color,
+                palette.leading.color,
+                palette.topLeading.color,
+                palette.top.color,
+                palette.topTrailing.color,
+                palette.trailing.color,
+            ],
+            center: .center,
+            startAngle: .degrees(0),
+            endAngle: .degrees(360)
         )
     }
 
@@ -1264,10 +1276,10 @@ struct GalleryDetailView: View {
                 }
             }
             Divider().frame(height: 32)
-            ShareLink(item: GalleryActionService.shared.galleryURL(
+            GalleryShareLink(urlString: GalleryActionService.shared.galleryURL(
                 gid: gallery.gid,
                 token: gallery.token
-            )) {
+            ), title: gallery.suitableTitle(preferJpn: AppSettings.shared.showJpnTitle)) {
                 actionButtonLabel(icon: "square.and.arrow.up", title: AppLocalization.localized("分享"))
             }
             .buttonStyle(.plain)
@@ -1900,7 +1912,7 @@ class GalleryDetailViewModel {
     // MARK: - Processed Comment (Perf P0-4)
 
     /// 预处理后的评论结构体 — 在 loadDetail 成功后后台计算
-    struct ProcessedComment: Identifiable {
+    nonisolated struct ProcessedComment: Identifiable, Sendable {
         let id: Int64
         let user: String
         let time: Date
@@ -2075,18 +2087,18 @@ class GalleryDetailViewModel {
 
         // 1) 先查内存缓存 (对标 Android: EhApplication.getGalleryDetailCache().get(gid))
         if let cached = GalleryCache.shared.getDetail(gid: gid) {
-            // 查询下载状态 (对齐 Android: DownloadManager 状态查询)
-            let dlState = await DownloadManager.shared.getTaskState(gid: gid)
-            guard isCurrentDetailLoad(generation) else { return }
             self.detail = cached
             self.isFavorited = cached.isFavorited
             self.displayRating = cached.info.rating
-            self.downloadState = dlState
             self.isLoading = false
-            // Perf P0-4: 预处理评论 HTML
-            preprocessComments(cached.comments.comments)
-            // Perf P0-5: 一次性检查阅读进度
             checkReadingProgress(gid: gid)
+            // Publish the cached page before touching download persistence or
+            // compiling the comment-link parser for the first time.
+            async let dlState = DownloadManager.shared.getTaskState(gid: gid)
+            async let comments: Void = preprocessComments(cached.comments.comments)
+            let (resolvedDownloadState, _) = await (dlState, comments)
+            guard isCurrentDetailLoad(generation) else { return }
+            self.downloadState = resolvedDownloadState
             debugLog("Loaded from cache - Comments: \(cached.comments.comments.count), HasMore: \(cached.comments.hasMore)")
             return
         }
@@ -2102,24 +2114,25 @@ class GalleryDetailViewModel {
             // 2) 存入缓存 (对标 Android: EhApplication.getGalleryDetailCache().put(result.gid, result))
             GalleryCache.shared.putDetail(result)
 
+            // Make the detail visible immediately. Download state, local
+            // favorite lookup and comment transformation are secondary.
+            self.detail = result
+            self.isFavorited = result.isFavorited
+            self.displayRating = result.info.rating
+            self.isLoading = false
+            checkReadingProgress(gid: gid)
+
             // 下载状态与本地收藏互不依赖，并行查询以缩短详情首屏等待时间。
             async let dlState = DownloadManager.shared.getTaskState(gid: gid)
             async let hasLocalFav: Bool = Task.detached(priority: .userInitiated) {
                 (try? EhDatabase.shared.containsLocalFavorite(gid: gid)) ?? false
             }.value
-            let (resolvedDownloadState, resolvedLocalFavorite) = await (dlState, hasLocalFav)
+            async let comments: Void = preprocessComments(result.comments.comments)
+            let (resolvedDownloadState, resolvedLocalFavorite, _) = await (dlState, hasLocalFav, comments)
             guard isCurrentDetailLoad(generation) else { return }
 
-            self.detail = result
             self.isFavorited = result.isFavorited || resolvedLocalFavorite
-            self.displayRating = result.info.rating
             self.downloadState = resolvedDownloadState
-            self.isLoading = false
-
-            // Perf P0-4: 预处理评论 HTML
-            preprocessComments(result.comments.comments)
-            // Perf P0-5: 一次性检查阅读进度
-            checkReadingProgress(gid: gid)
 
             // Fix F3-4: 如果当前正在下载，启动轮询任务监听状态变化
             startDownloadPollingIfNeeded(gid: gid)
@@ -2178,16 +2191,20 @@ class GalleryDetailViewModel {
     // MARK: - Perf P0-4: 预处理评论 HTML
 
     /// 在 loadDetail 成功后调用 — 后台剥离 HTML 标签，View body 直接读取纯文本
-    func preprocessComments(_ rawComments: [GalleryComment]) {
-        processedComments = rawComments.map { comment in
-            ProcessedComment(
-                id: comment.id,
-                user: comment.user,
-                time: comment.time,
-                score: comment.score,
-                attributedBody: GalleryCommentLinks.attributedText(fromHTML: comment.comment)
-            )
-        }
+    func preprocessComments(_ rawComments: [GalleryComment]) async {
+        let processed = await Task.detached(priority: .utility) {
+            rawComments.map { comment in
+                ProcessedComment(
+                    id: comment.id,
+                    user: comment.user,
+                    time: comment.time,
+                    score: comment.score,
+                    attributedBody: GalleryCommentLinks.attributedText(fromHTML: comment.comment)
+                )
+            }
+        }.value
+        guard !Task.isCancelled else { return }
+        processedComments = processed
     }
 
     // MARK: - Perf P0-5: 一次性检查阅读进度
@@ -2350,7 +2367,7 @@ class GalleryDetailViewModel {
 
         detail = refreshed
         GalleryCache.shared.putDetail(refreshed)
-        preprocessComments(refreshed.comments.comments)
+        await preprocessComments(refreshed.comments.comments)
         return (refreshed.apiUid, refreshed.apiKey)
     }
 
@@ -2374,6 +2391,7 @@ class GalleryDetailViewModel {
                 // 更新缓存
                 GalleryCache.shared.putDetail(currentDetail)
             }
+            await preprocessComments(result.comments.comments)
             self.isLoadingComments = false
         } catch {
             self.isLoadingComments = false
@@ -2381,11 +2399,11 @@ class GalleryDetailViewModel {
         }
     }
 
-    func replaceComments(_ comments: GalleryCommentList) {
+    func replaceComments(_ comments: GalleryCommentList) async {
         guard var updatedDetail = detail else { return }
         updatedDetail.comments = comments
         detail = updatedDetail
-        preprocessComments(comments.comments)
+        await preprocessComments(comments.comments)
         GalleryCache.shared.putDetail(updatedDetail)
     }
 

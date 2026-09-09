@@ -147,11 +147,10 @@ struct WatchLaterView: View {
                         }
                     }
                 }
-                .contextMenu {
-                    Button(role: .destructive) { remove(record.gid) } label: {
-                        Label("从稍后再看移除", systemImage: "bookmark.slash")
-                    }
-                }
+                // GalleryRow already exposes the same removal action through
+                // its native platform menu. Avoid wrapping it in a second
+                // SwiftUI context menu, which recreates the expensive first-use
+                // hosting snapshot that the feed deliberately bypasses.
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button(role: .destructive) { remove(record.gid) } label: {
                         Label("移除", systemImage: "bookmark.slash")

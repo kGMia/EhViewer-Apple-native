@@ -322,6 +322,7 @@ private actor ThumbnailImagePipeline {
 struct CachedAsyncImage<Content: View, Placeholder: View>: View {
     let url: URL?
     let showProgress: Bool
+    let animatedContentMode: ContentMode
     let onImageSize: ((CGSize) -> Void)?
     let onImageLoaded: ((PlatformImage) -> Void)?
     @ViewBuilder let content: (Image) -> Content
@@ -335,6 +336,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
     init(
         url: URL?,
         showProgress: Bool = true,
+        animatedContentMode: ContentMode = .fill,
         onImageSize: ((CGSize) -> Void)? = nil,
         onImageLoaded: ((PlatformImage) -> Void)? = nil,
         @ViewBuilder content: @escaping (Image) -> Content,
@@ -342,6 +344,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
     ) {
         self.url = url
         self.showProgress = showProgress
+        self.animatedContentMode = animatedContentMode
         self.onImageSize = onImageSize
         self.onImageLoaded = onImageLoaded
         self.content = content
@@ -356,7 +359,7 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
         Group {
             if let image {
                 if image.isAnimatedPlatformImage {
-                    PlatformAnimatedImageView(image: image, contentMode: .fill)
+                    PlatformAnimatedImageView(image: image, contentMode: animatedContentMode)
                         .onAppear {
                             onImageSize?(image.size)
                         }
@@ -538,9 +541,21 @@ struct PlatformAnimatedImageView: View {
     let image: PlatformImage
     let contentMode: ContentMode
 
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isVisible = false
+
     var body: some View {
-        PlatformAnimatedImageRepresentable(image: image, contentMode: contentMode)
-            .aspectRatio(image.size, contentMode: contentMode)
+        PlatformAnimatedImageRepresentable(
+            image: image,
+            contentMode: contentMode,
+            isPlaying: isVisible && scenePhase == .active && !reduceMotion
+        )
+        .aspectRatio(image.size, contentMode: contentMode)
+        // Both call sites live in scroll views. A low threshold also supports
+        // tall reader pages which never occupy half their own height onscreen.
+        .onScrollVisibilityChange(threshold: 0.01) { isVisible = $0 }
+        .onDisappear { isVisible = false }
     }
 }
 
@@ -548,6 +563,7 @@ struct PlatformAnimatedImageView: View {
 private struct PlatformAnimatedImageRepresentable: UIViewRepresentable {
     let image: UIImage
     let contentMode: ContentMode
+    let isPlaying: Bool
 
     func makeUIView(context: Context) -> UIImageView {
         let view = UIImageView()
@@ -558,24 +574,37 @@ private struct PlatformAnimatedImageRepresentable: UIViewRepresentable {
     func updateUIView(_ view: UIImageView, context: Context) {
         view.contentMode = contentMode == .fill ? .scaleAspectFill : .scaleAspectFit
         if view.image !== image { view.image = image }
-        view.startAnimating()
+        if isPlaying {
+            if !view.isAnimating { view.startAnimating() }
+        } else {
+            view.stopAnimating()
+        }
+    }
+
+    static func dismantleUIView(_ view: UIImageView, coordinator: ()) {
+        view.stopAnimating()
     }
 }
 #else
 private struct PlatformAnimatedImageRepresentable: NSViewRepresentable {
     let image: NSImage
     let contentMode: ContentMode
+    let isPlaying: Bool
 
     func makeNSView(context: Context) -> NSImageView {
         let view = NSImageView()
-        view.animates = true
+        view.animates = false
         return view
     }
 
     func updateNSView(_ view: NSImageView, context: Context) {
         view.imageScaling = .scaleProportionallyUpOrDown
         if view.image !== image { view.image = image }
-        view.animates = true
+        view.animates = isPlaying
+    }
+
+    static func dismantleNSView(_ view: NSImageView, coordinator: ()) {
+        view.animates = false
     }
 }
 #endif

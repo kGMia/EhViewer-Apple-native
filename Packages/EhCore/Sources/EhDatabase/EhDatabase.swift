@@ -49,7 +49,7 @@ public final class EhDatabase: Sendable {
 
     private let dbQueue: DatabaseQueue
 
-    private init(inMemory: Bool = false) throws {
+    init(inMemory: Bool = false) throws {
         self.isDegraded = inMemory
 
         var config = Configuration()
@@ -271,6 +271,13 @@ public final class EhDatabase: Sendable {
                 on: "favoriteMetadataIndex",
                 columns: ["site", "rating"]
             )
+        }
+
+        migrator.registerMigration("v5-favorite-thumbnail-dimensions") { db in
+            try db.alter(table: "favoriteMetadataIndex") { t in
+                t.add(column: "thumbWidth", .integer)
+                t.add(column: "thumbHeight", .integer)
+            }
         }
 
         return migrator
@@ -919,6 +926,8 @@ public struct FavoriteMetadataRecord: Codable, FetchableRecord, PersistableRecor
     public var title: String
     public var titleJpn: String?
     public var thumb: String?
+    public var thumbWidth: Int?
+    public var thumbHeight: Int?
     public var category: Int
     public var posted: String?
     public var uploader: String?
@@ -938,6 +947,8 @@ public struct FavoriteMetadataRecord: Codable, FetchableRecord, PersistableRecor
         title: String,
         titleJpn: String? = nil,
         thumb: String? = nil,
+        thumbWidth: Int? = nil,
+        thumbHeight: Int? = nil,
         category: Int = 0,
         posted: String? = nil,
         uploader: String? = nil,
@@ -956,6 +967,8 @@ public struct FavoriteMetadataRecord: Codable, FetchableRecord, PersistableRecor
         self.title = title
         self.titleJpn = titleJpn
         self.thumb = thumb
+        self.thumbWidth = thumbWidth
+        self.thumbHeight = thumbHeight
         self.category = category
         self.posted = posted
         self.uploader = uploader

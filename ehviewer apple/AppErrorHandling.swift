@@ -7,6 +7,8 @@
 //
 
 import SwiftUI
+import EhAPI
+import EhSettings
 
 // MARK: - 应用级错误类型
 
@@ -25,6 +27,34 @@ struct AppError: Identifiable {
 
     /// 从任意 Error 构造用户友好的 AppError
     static func from(_ error: Error) -> AppError {
+        if let ehError = error as? EhError {
+            if case .httpError(let status, _) = ehError {
+                switch status {
+                case 401, 403:
+                    return AppError(
+                        AppLocalization.localized("需要重新登录"),
+                        message: AppLocalization.localized("登录状态已失效，或当前账号没有访问该站点的权限。"),
+                        error: error
+                    )
+                case 429:
+                    return AppError(
+                        AppLocalization.localized("请求过于频繁"),
+                        message: AppLocalization.localized("服务器正在限制请求，请稍后再试。"),
+                        error: error
+                    )
+                case 500...599:
+                    return AppError(
+                        AppLocalization.localized("服务器暂时不可用"),
+                        message: AppLocalization.format("服务端返回 HTTP %lld，请稍后重试。", Int64(status)),
+                        error: error
+                    )
+                default:
+                    break
+                }
+            }
+            return AppError(AppLocalization.localized("请求失败"), message: ehError.localizedDescription, error: error)
+        }
+
         // 网络错误
         if let urlError = error as? URLError {
             switch urlError.code {
@@ -63,6 +93,10 @@ final class ErrorHandler {
 
     /// 处理错误: 记录日志 + 通知展示
     func handle(_ error: Error, context: String = "Unknown") {
+        if error is CancellationError || (error as? URLError)?.code == .cancelled {
+            handleSilently(error, context: context)
+            return
+        }
         let appError = AppError.from(error)
 
         // 写入日志

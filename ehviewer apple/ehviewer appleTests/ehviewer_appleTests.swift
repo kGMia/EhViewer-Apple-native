@@ -11,7 +11,7 @@ import ImageIO
 import EhModels
 import EhAPI
 import EhParser
-import EhDatabase
+@testable import EhDatabase
 import EhDownload
 import EhSettings
 @testable import EhSpider
@@ -77,6 +77,147 @@ private actor GalleryUpdateResponseGate {
 
 @Suite(.serialized)
 struct ehviewer_appleTests {
+    @Test func waterfallCacheDetectsInteriorSortAndMetadataChanges() {
+        let original = (0..<160).map { GalleryInfo(gid: Int64($0), thumbWidth: 100, thumbHeight: 150) }
+        let key = GalleryWaterfallLayoutKey(columnCount: 3, revision: 0, galleries: original)
+        var reordered = original
+        reordered.swapAt(12, 13) // count, first, middle, and last are unchanged
+        #expect(key != GalleryWaterfallLayoutKey(columnCount: 3, revision: 0, galleries: reordered))
+        var updated = original
+        updated[12].thumbHeight = 90
+        #expect(key != GalleryWaterfallLayoutKey(columnCount: 3, revision: 0, galleries: updated))
+        updated = original
+        updated[12].title = "Updated metadata"
+        #expect(key != GalleryWaterfallLayoutKey(columnCount: 3, revision: 0, galleries: updated))
+    }
+
+    @Test func waterfallAppendPreservesColumnMembershipAndOrder() {
+        let original = (0..<160).map {
+            GalleryInfo(gid: Int64($0), thumbWidth: 100, thumbHeight: 100 + ($0 % 5) * 30)
+        }
+        let nextPage = (160..<200).map { GalleryInfo(gid: Int64($0), thumbWidth: 100, thumbHeight: 120) }
+        let before = GalleryWaterfallLayoutBuilder.columns(for: original, columnCount: 3)
+        let after = GalleryWaterfallLayoutBuilder.columns(for: original + nextPage, columnCount: 3)
+        for index in before.indices {
+            #expect(Array(after[index].prefix(before[index].count)) == before[index])
+        }
+        #expect(Set(after.flatMap { $0.map(\.gid) }).count == 200)
+        #expect(after.reduce(0) { $0 + $1.count } == 200)
+        #expect(GalleryWaterfallLayoutBuilder.columns(for: original, columnCount: 0).isEmpty)
+    }
+
+    @Test func waterfallRebuildsMeasurementsForSortButNotPagination() {
+        let original = (0..<160).map { GalleryInfo(gid: Int64($0), thumbWidth: 100, thumbHeight: 150) }
+        let key = GalleryWaterfallLayoutKey(columnCount: 3, revision: 1, galleries: original, columnWidth: 180)
+        let first = GalleryWaterfallSnapshot(
+            key: key, columns: GalleryWaterfallLayoutBuilder.columns(for: original, columnCount: 3), previous: nil
+        )
+        let appended = GalleryWaterfallLayoutKey(columnCount: 3, revision: 1,
+                                             galleries: original + [GalleryInfo(gid: 999)], columnWidth: 180)
+        let next = GalleryWaterfallSnapshot(
+            key: appended, columns: GalleryWaterfallLayoutBuilder.columns(for: appended.galleries, columnCount: 3),
+            previous: first
+        )
+        #expect(next.generation == first.generation)
+        let sortedKey = GalleryWaterfallLayoutKey(columnCount: 3, revision: 2,
+                                                  galleries: Array(original.reversed()), columnWidth: 180)
+        let sorted = GalleryWaterfallSnapshot(
+            key: sortedKey, columns: GalleryWaterfallLayoutBuilder.columns(for: sortedKey.galleries, columnCount: 3),
+            previous: next
+        )
+        #expect(sorted.generation != next.generation)
+        #expect(sorted.key == sortedKey && sorted.columns.first?.first?.gid == 159)
+        // Resizing within the same column count also invalidates measured heights.
+        var resizedKey = sortedKey
+        resizedKey.columnWidth = 200
+        #expect(!resizedKey.preservesMeasurements(from: sortedKey))
+        let interiorSort = GalleryWaterfallLayoutKey(columnCount: 3, revision: 1,
+                                                     galleries: Array(original.reversed()), columnWidth: 180)
+        #expect(!interiorSort.preservesMeasurements(from: key))
+    }
+
+    @Test func previewMarqueePausesAndReturnsWithoutJumping() {
+        #expect(GalleryMarqueeMotion.offset(elapsed: 10, distance: 0) == 0)
+        #expect(GalleryMarqueeMotion.offset(elapsed: 0.5, distance: 76) == 0)
+        #expect(abs(GalleryMarqueeMotion.offset(elapsed: 1.7, distance: 76) + 38) < 0.001)
+        #expect(GalleryMarqueeMotion.offset(elapsed: 3, distance: 76) == -76)
+        #expect(abs(GalleryMarqueeMotion.offset(elapsed: 4.4, distance: 76) + 38) < 0.001)
+        #expect(abs(GalleryMarqueeMotion.offset(elapsed: 5.4, distance: 76)) < 0.001)
+    }
+
+    @Test func favoriteIndexKeepsOriginalCoverDimensionsForEverySort() throws {
+        let database = try EhDatabase(inMemory: true)
+        let galleries = [
+            GalleryInfo(gid: 901, token: "portrait", title: "Portrait", rating: 3,
+                        thumbWidth: 300, thumbHeight: 900),
+            GalleryInfo(gid: 902, token: "landscape", title: "Landscape", rating: 5,
+                        thumbWidth: 800, thumbHeight: 320)
+        ]
+        try database.saveFavoriteMetadataPage(galleries.enumerated().map { index, gallery in
+            gallery.favoriteMetadataRecord(site: .eHentai, serverOrder: index, syncID: "dimensions")
+        })
+        for sort in FavoriteMetadataSort.allCases {
+            let records = try database.fetchFavoriteMetadata(site: EhSite.eHentai.rawValue, sort: sort)
+            #expect(records.count == 2)
+            for record in records {
+                let source = try #require(galleries.first { $0.gid == record.gid })
+                #expect(record.galleryInfo.thumbWidth == source.thumbWidth)
+                #expect(record.galleryInfo.thumbHeight == source.thumbHeight)
+            }
+        }
+    }
+
+    @Test func legacyFavoriteIndexDecodesWithoutInventingDimensions() throws {
+        let original = GalleryInfo(gid: 903, token: "legacy", title: "Legacy")
+            .favoriteMetadataRecord(site: .eHentai, serverOrder: 0, syncID: "legacy")
+        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
+        json.removeValue(forKey: "thumbWidth")
+        json.removeValue(forKey: "thumbHeight")
+        let decoded = try JSONDecoder().decode(FavoriteMetadataRecord.self,
+                                               from: JSONSerialization.data(withJSONObject: json))
+        #expect(decoded.thumbWidth == nil && decoded.thumbHeight == nil)
+        #expect(decoded.galleryInfo.thumbWidth == 0 && decoded.galleryInfo.thumbHeight == 0)
+        let database = try EhDatabase(inMemory: true)
+        try database.saveFavoriteMetadataPage([decoded])
+        let restored = try #require(database.fetchFavoriteMetadata(site: EhSite.eHentai.rawValue).first)
+        #expect(restored.thumbWidth == nil && restored.thumbHeight == nil)
+    }
+
+    @Test func searchRecordsMatchPartialAndLocalizedQueries() {
+        #expect(SearchRecordMatching.matches("Artist:SomeName", query: " somename "))
+        #expect(SearchRecordMatching.matches("收藏的中文标题", query: "中文"))
+        #expect(SearchRecordMatching.matches("Café", query: "cafe"))
+        #expect(!SearchRecordMatching.matches("anything", query: "  "))
+        #expect(!SearchRecordMatching.matches("artist:one", query: "artist:two"))
+    }
+
+    @Test func quickSearchStoreSerializesDuplicateSaves() async throws {
+        let store = QuickSearchStore(database: try EhDatabase(inMemory: true))
+        let record = QuickSearchRecord(name: "Saved", keyword: "artist:example")
+        async let first = store.add(record)
+        async let second = store.add(record)
+        _ = try await (first, second)
+        let saved = try await store.load()
+        #expect(saved.count == 1)
+        let id = try #require(saved.first?.id)
+        let remaining = try await store.delete([id])
+        #expect(remaining.isEmpty)
+    }
+
+    @Test @MainActor func quickSearchModelPublishesCompletedMutations() async throws {
+        let store = QuickSearchStore(database: try EhDatabase(inMemory: true))
+        let model = QuickSearchViewModel(store: store)
+        await model.loadSearches()
+        #expect(model.searches.isEmpty)
+        await model.addSearch(QuickSearchRecord(keyword: "中文"))
+        #expect(model.searches.count == 1 && !model.isMutating)
+        let saved = model.searches
+        await model.delete(searches: saved)
+        #expect(model.searches.isEmpty && !model.isMutating)
+        let stored = try await store.load()
+        #expect(stored.isEmpty)
+    }
+
     @Test func imageQuotaAcceptsIPModeWithoutInventingNumericLimits() throws {
         let body = """
         <h2>Image Limits</h2><p>You are currently using IP-based limits. No restrictions are currently in effect.</p>
@@ -1039,6 +1180,41 @@ struct ehviewer_appleTests {
         #expect(decoded.pages == route.pages)
         #expect(decoded.initialPage == route.initialPage)
         #expect(decoded.previewSet == nil)
+    }
+
+    @Test @MainActor
+    func prependingRetainsPartiallyVisibleGalleryPosition() throws {
+        let retention = GalleryScrollRetention()
+        retention.viewportHeight = 800
+        retention.frames = [
+            1: CGRect(x: 0, y: -200, width: 300, height: 100),
+            2: CGRect(x: 0, y: -35, width: 300, height: 150),
+            3: CGRect(x: 0, y: 130, width: 300, height: 200),
+            4: CGRect(x: 0, y: 900, width: 300, height: 100)
+        ]
+        let anchor = try #require(retention.capture())
+        #expect(anchor.id == 2)
+        #expect(abs(anchor.alignment * (800 - 150) - (-35)) < 0.001)
+        let oldOwner = UUID()
+        let newOwner = UUID()
+        let frame = try #require(retention.frames[2])
+        retention.update(frame, id: 2, owner: oldOwner)
+        retention.update(frame, id: 2, owner: newOwner)
+        retention.remove(id: 2, owner: oldOwner)
+        #expect(retention.capture()?.id == 2)
+        retention.remove(id: 2, owner: newOwner)
+        #expect(retention.capture()?.id == 3)
+    }
+
+    @Test @MainActor
+    func prependAnchorHandlesEmptyAndViewportSizedItems() throws {
+        let retention = GalleryScrollRetention()
+        retention.viewportHeight = 600
+        #expect(retention.capture() == nil)
+        retention.frames[1] = CGRect(x: 0, y: 0, width: 300, height: 600)
+        let anchor = try #require(retention.capture())
+        #expect(anchor.alignment.isFinite)
+        #expect(anchor.alignment == 0)
     }
 
 }

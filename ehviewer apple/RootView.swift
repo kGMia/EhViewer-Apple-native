@@ -108,9 +108,12 @@ struct RootView: View {
         }
         .alert("ExHentai 可用", isPresented: $showExHAlert) {
             Button("切换到 ExHentai") {
+                AppSettings.shared.exHentaiPromptedMemberID = EhCookieManager.shared.memberId
                 AppSettings.shared.gallerySite = .exHentai
             }
-            Button("保持 E-Hentai", role: .cancel) {}
+            Button("保持 E-Hentai", role: .cancel) {
+                AppSettings.shared.exHentaiPromptedMemberID = EhCookieManager.shared.memberId
+            }
         } message: {
             Text("检测到你的账号拥有 ExHentai 访问权限，是否切换到 ExHentai？")
         }
@@ -253,8 +256,12 @@ struct RootView: View {
             debugLog("[RootView] 获取用户资料失败: \(error)")
         }
 
-        // 3. ExH 可达性检测
+        // 3. ExH 可达性检测. Do not probe or prompt again after the current
+        // account answered, and never prompt while ExHentai is already selected.
         guard !Task.isCancelled else { return }
+        guard AppSettings.shared.gallerySite == .eHentai,
+              let memberID = EhCookieManager.shared.memberId,
+              AppSettings.shared.exHentaiPromptedMemberID != memberID else { return }
         do {
             guard let url = URL(string: "https://exhentai.org/") else { return }
             var request = URLRequest(url: url)
@@ -270,7 +277,9 @@ struct RootView: View {
             guard !Task.isCancelled else { return }
 
             if let httpResponse = response as? HTTPURLResponse,
-               httpResponse.statusCode == 200, data.count >= 1000 {
+               httpResponse.statusCode == 200, data.count >= 1000,
+               AppSettings.shared.gallerySite == .eHentai,
+               AppSettings.shared.exHentaiPromptedMemberID != memberID {
                 // ExHentai 可访问 — 提示切换
                 showExHAlert = true
             }

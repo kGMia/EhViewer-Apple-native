@@ -29,17 +29,30 @@ public actor EhAPI {
     /// 域名前置 + 不跟随重定向 (图片请求的回退)
     private let directImageSession: URLSession
 
+    /// HTML/JSON and image responses have different lifetimes. Keeping them
+    /// separate prevents a thumbnail burst from evicting useful API documents.
+    private let documentCache: URLCache
+    private let imageResponseCache: URLCache
+
     /// 最大重试次数 (超时/连接错误时自动重试)
     private static let maxRetries = 1
 
     private init() {
-        // 共享缓存
-        let sharedCache = URLCache(
-            memoryCapacity: 20 * 1024 * 1024,    // 20MB (对标 Android getMemoryCacheMaxSize)
-            diskCapacity: 320 * 1024 * 1024,      // 320MB (对标 Android Conaco diskCacheMaxSize)
+        let documentCache = URLCache(
+            memoryCapacity: 8 * 1024 * 1024,
+            diskCapacity: 64 * 1024 * 1024,
             directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("http_cache")
+                .appendingPathComponent("api_response_cache")
         )
+        let imageBudget = AppSettings.shared.thumbnailCacheSize * 1024 * 1024 / 3
+        let imageResponseCache = URLCache(
+            memoryCapacity: 12 * 1024 * 1024,
+            diskCapacity: imageBudget,
+            directory: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("image_response_cache")
+        )
+        self.documentCache = documentCache
+        self.imageResponseCache = imageResponseCache
 
         // 通用 session — 零自定义，与 Safari 行为完全一致
         // 不设置自定义 delegate，不设置 connectionProxyDictionary
@@ -48,7 +61,7 @@ public actor EhAPI {
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
         config.httpCookieStorage = .shared
-        config.urlCache = sharedCache
+        config.urlCache = documentCache
         config.httpMaximumConnectionsPerHost = 6
         config.httpShouldUsePipelining = true
         config.requestCachePolicy = .useProtocolCachePolicy
@@ -61,7 +74,7 @@ public actor EhAPI {
         imgConfig.timeoutIntervalForRequest = 15
         imgConfig.timeoutIntervalForResource = 20
         imgConfig.httpCookieStorage = .shared
-        imgConfig.urlCache = sharedCache
+        imgConfig.urlCache = imageResponseCache
         imgConfig.httpMaximumConnectionsPerHost = 6
         imgConfig.httpShouldUsePipelining = true
         imgConfig.requestCachePolicy = .useProtocolCachePolicy
@@ -75,7 +88,7 @@ public actor EhAPI {
         directConfig.timeoutIntervalForRequest = 10
         directConfig.timeoutIntervalForResource = 20
         directConfig.httpCookieStorage = .shared
-        directConfig.urlCache = sharedCache
+        directConfig.urlCache = documentCache
         directConfig.httpMaximumConnectionsPerHost = 4
         directConfig.httpShouldUsePipelining = true
         directConfig.allowsCellularAccess = true
@@ -90,7 +103,7 @@ public actor EhAPI {
         directImgConfig.timeoutIntervalForRequest = 15
         directImgConfig.timeoutIntervalForResource = 30
         directImgConfig.httpCookieStorage = .shared
-        directImgConfig.urlCache = sharedCache
+        directImgConfig.urlCache = imageResponseCache
         directImgConfig.httpMaximumConnectionsPerHost = 4
         directImgConfig.httpShouldUsePipelining = true
         directImgConfig.allowsCellularAccess = true
@@ -116,7 +129,7 @@ public actor EhAPI {
         await EhRateLimiter.shared.waitApiSlot()
 
         do {
-            return try await executeWithRetry(maxRetries: Self.maxRetries) {
+            return try await executeWithRetry(for: request, maxRetries: Self.maxRetries) {
                 try await self.session.data(for: request)
             }
         } catch let error where Self.shouldTryDirectFallback(error) {
@@ -125,14 +138,14 @@ public actor EhAPI {
                 return try await attemptDomainFronting(for: request, using: directSession, originalError: error)
             } catch {
                 // 域名前置也失败 → 最后尝试离线缓存回退
-                if let cachedResponse = Self.offlineCacheFallback(for: request) {
+                if let cachedResponse = offlineCacheFallback(for: request) {
                     return cachedResponse
                 }
                 throw error
             }
         } catch let error as URLError where error.code == .notConnectedToInternet {
             // 明确离线 → 直接查缓存
-            if let cachedResponse = Self.offlineCacheFallback(for: request) {
+            if let cachedResponse = offlineCacheFallback(for: request) {
                 return cachedResponse
             }
             throw error
@@ -149,7 +162,7 @@ public actor EhAPI {
         await EhRateLimiter.shared.waitApiSlot()
 
         do {
-            return try await executeWithRetry(maxRetries: Self.maxRetries) {
+            return try await executeWithRetry(for: request, maxRetries: Self.maxRetries) {
                 try await self.imageSession.data(for: request)
             }
         } catch let error where Self.shouldTryDirectFallback(error) {
@@ -208,19 +221,34 @@ public actor EhAPI {
 
     /// 带指数退避的自动重试 (超时/连接失败/DNS 解析失败时重试)
     private func executeWithRetry(
+        for request: URLRequest,
         maxRetries: Int,
         operation: @Sendable () async throws -> (Data, URLResponse)
     ) async throws -> (Data, URLResponse) {
+        let method = request.httpMethod?.uppercased() ?? "GET"
+        guard method == "GET" || method == "HEAD" else {
+            // Never repeat comments, votes, favorites, or other mutations.
+            return try await operation()
+        }
+
         var lastError: Error?
         for attempt in 0...maxRetries {
             do {
-                return try await operation()
+                let result = try await operation()
+                if attempt < maxRetries,
+                   let response = result.1 as? HTTPURLResponse,
+                   Self.retryableStatusCodes.contains(response.statusCode) {
+                    try await Task.sleep(for: Self.retryDelay(attempt: attempt, response: response))
+                    continue
+                }
+                return result
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let error as URLError where Self.isRetryableError(error) {
                 lastError = error
                 if attempt < maxRetries {
-                    let delay = Double(attempt + 1) * 1.5  // 1.5s, 3s
-                    print("[EhAPI] Request failed (\(error.code.rawValue): \(Self.errorCodeName(error.code))), retry \(attempt + 1)/\(maxRetries) after \(delay)s")
-                    try? await Task.sleep(for: .seconds(delay))
+                    print("[EhAPI] Request failed (\(error.code.rawValue): \(Self.errorCodeName(error.code))), retry \(attempt + 1)/\(maxRetries)")
+                    try await Task.sleep(for: Self.retryDelay(attempt: attempt, response: nil))
                 }
             } catch {
                 throw error  // 非可重试错误，直接抛出
@@ -236,15 +264,23 @@ public actor EhAPI {
              .cannotConnectToHost,
              .networkConnectionLost,
              .secureConnectionFailed,
-             .notConnectedToInternet,
              .cannotFindHost,
-             .dnsLookupFailed,
-             .internationalRoamingOff,
-             .dataNotAllowed:
+             .dnsLookupFailed:
             return true
         default:
             return false
         }
+    }
+
+    private static let retryableStatusCodes: Set<Int> = [429, 502, 503, 504]
+
+    private static func retryDelay(attempt: Int, response: HTTPURLResponse?) -> Duration {
+        if let value = response?.value(forHTTPHeaderField: "Retry-After"),
+           let seconds = Double(value) {
+            return .milliseconds(Int64(min(max(seconds, 0.2), 5) * 1_000))
+        }
+        let base = 550.0 * pow(2, Double(attempt))
+        return .milliseconds(Int64(base + Double.random(in: 0...180)))
     }
 
     /// 错误码名称 (用于日志)
@@ -262,12 +298,51 @@ public actor EhAPI {
 
     /// 离线缓存回退: 网络完全不可用时从 URLCache 返回已缓存的响应
     /// 避免用户在地铁/飞行模式时看到空白页
-    private static func offlineCacheFallback(for request: URLRequest) -> (Data, URLResponse)? {
-        guard let cachedResponse = URLCache.shared.cachedResponse(for: request) else {
+    private func offlineCacheFallback(for request: URLRequest) -> (Data, URLResponse)? {
+        guard let cachedResponse = documentCache.cachedResponse(for: request) else {
             return nil
         }
         print("[EhAPI] 📴 离线模式: 从缓存返回 \(request.url?.lastPathComponent ?? "unknown")")
         return (cachedResponse.data, cachedResponse.response)
+    }
+
+    // MARK: - Cache management
+
+    public struct CacheUsage: Sendable, Equatable {
+        public let documents: Int64
+        public let images: Int64
+
+        public init(documents: Int64, images: Int64) {
+            self.documents = documents
+            self.images = images
+        }
+
+        public var total: Int64 { documents + images }
+    }
+
+    public func cacheUsage() -> CacheUsage {
+        CacheUsage(
+            documents: Int64(documentCache.currentDiskUsage),
+            images: Int64(imageResponseCache.currentDiskUsage)
+        )
+    }
+
+    public func clearDocumentCache() {
+        documentCache.removeAllCachedResponses()
+    }
+
+    public func clearImageResponseCache() {
+        imageResponseCache.removeAllCachedResponses()
+    }
+
+    public func updateImageCacheBudget(totalMegabytes: Int) {
+        let normalized = min(max(totalMegabytes, 120), 960)
+        imageResponseCache.diskCapacity = normalized * 1024 * 1024 / 3
+    }
+
+    public func clearNetworkCaches() {
+        clearDocumentCache()
+        clearImageResponseCache()
     }
 
     // MARK: - 公开 API 方法
