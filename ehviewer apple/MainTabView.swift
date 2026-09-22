@@ -11,6 +11,8 @@ import EhDatabase
 import EhSettings
 #if os(iOS)
 import UIKit
+#else
+import AppKit
 #endif
 
 private struct SelectedMainTabKey: FocusedValueKey {
@@ -53,6 +55,10 @@ extension FocusedValues {
 }
 
 struct MainTabView: View {
+    #if os(macOS)
+    @AppStorage("showsMainWindowToolbar") private var showsMainWindowToolbar = false
+    #endif
+
     @Environment(AppState.self) private var appState
     /// 每个窗口独立恢复上次所在页面；App Intent 的显式导航请求仍具有更高优先级。
     @SceneStorage("main.selectedTab") private var restoredSelectedTabRawValue = ""
@@ -79,6 +85,8 @@ struct MainTabView: View {
     @State private var compactPath: [CompactDestination] = []
     @State private var intentReaderRoute: ReaderWindowRoute?
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
+    @AppStorage("main.preferredSidebarWidth") private var sidebarColumnWidth = 180.0
+    @AppStorage("main.preferredFeedWidth") private var feedColumnWidth = 520.0
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .content
     @State private var preservesSelectionDuringTabChange = false
     @State private var searchReturnContext: SearchReturnContext?
@@ -439,10 +447,22 @@ struct MainTabView: View {
             .accessibilityIdentifier("main.sidebar")
             .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationTitle("EhViewer")
-            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
+            .frame(minWidth: 160)
+            .navigationSplitViewColumnWidth(min: 160, ideal: sidebarColumnWidth, max: 320)
+            .onGeometryChange(for: Double.self) { Double($0.size.width.rounded()) } action: { width in
+                if isAdjustingSplitDivider, width >= 160, width <= 320, sidebarColumnWidth != width {
+                    sidebarColumnWidth = width
+                }
+            }
         } content: {
             adaptiveContentView
-                .navigationSplitViewColumnWidth(min: 350, ideal: 480)
+                .frame(minWidth: 460)
+                .navigationSplitViewColumnWidth(min: 460, ideal: max(460, feedColumnWidth), max: 900)
+                .onGeometryChange(for: Double.self) { Double($0.size.width.rounded()) } action: { width in
+                    if isAdjustingSplitDivider, width >= 460, width <= 900, feedColumnWidth != width {
+                        feedColumnWidth = width
+                    }
+                }
         } detail: {
             NavigationStack {
                 Group {
@@ -472,6 +492,24 @@ struct MainTabView: View {
             })
         }
         .navigationSplitViewStyle(.balanced)
+        #if os(macOS)
+        // Hiding windowToolbar also removes the system traffic lights.
+        // Hide only its background so window controls remain available.
+        .toolbarBackgroundVisibility(showsMainWindowToolbar ? .automatic : .hidden, for: .windowToolbar)
+        #endif
+    }
+
+    /// Save user divider adjustments, never provisional launch geometry or a
+    /// column compressed by resizing the window. Defaults survive a fresh scene.
+    private var isAdjustingSplitDivider: Bool {
+        #if os(macOS)
+        guard let event = NSApp.currentEvent,
+              event.type == .leftMouseDragged,
+              let window = event.window else { return false }
+        return !window.inLiveResize
+        #else
+        return false
+        #endif
     }
 
     #if os(macOS)
@@ -496,6 +534,11 @@ struct MainTabView: View {
                     .padding(12)
             }
         }
+        .toolbarBackgroundVisibility(
+            showsMainWindowToolbar || !compactPath.isEmpty ? .automatic : .hidden,
+            for: .windowToolbar
+        )
+
     }
 
     @ViewBuilder
@@ -654,11 +697,16 @@ struct MainTabView: View {
             return
         }
         guard compactPath.isEmpty else { return }
+        // Preserve both levels when narrowing a window with an open detail
+        // inside tag/uploader search. Back should return to that same feed.
+        var destinations: [CompactDestination] = []
         if let route = contentRoutes.last {
-            compactPath = [.content(route)]
-        } else if let gallery = selectedGallery {
-            compactPath = [.gallery(gallery)]
+            destinations.append(.content(route))
         }
+        if let gallery = selectedGallery {
+            destinations.append(.gallery(gallery))
+        }
+        compactPath = destinations
     }
     #endif
 

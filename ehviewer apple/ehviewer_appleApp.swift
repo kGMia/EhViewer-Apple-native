@@ -30,6 +30,9 @@ struct EhViewerApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     #endif
     @State private var settings = AppSettings.shared
+    #if os(macOS)
+    @AppStorage("showsMainWindowToolbar") private var showsMainWindowToolbar = false
+    #endif
 
     init() {
         // Keep App.init free of disk-backed cache work. RootView prepares the
@@ -40,18 +43,21 @@ struct EhViewerApp: App {
         WindowGroup(id: "main") {
             RootView()
                 .modifier(AppAccentTintModifier(accent: settings.accentColor))
-                .modifier(MainWindowFrameAutosaveModifier())
         }
         .environment(\.locale, settings.appLanguage.locale)
         #if os(macOS)
-        // A real relaunch starts with one clean main window. Restoring every
-        // previous window eagerly rebuilt multiple feeds before the first
-        // interactive frame.
-        .restorationBehavior(.disabled)
+        // Let SwiftUI restore each window's frame and scene identity. A shared
+        // AppKit autosave name races scene placement and conflates windows.
+        .restorationBehavior(.automatic)
         .defaultSize(width: 1100, height: 750)
         #endif
         .commands {
             SidebarCommands()
+            #if os(macOS)
+            CommandGroup(after: .toolbar) {
+                Toggle("显示窗口工具栏背景", isOn: $showsMainWindowToolbar)
+            }
+            #endif
             BrowserCommands()
             GalleryCommands()
             #if os(macOS)
@@ -347,40 +353,6 @@ final class ApplicationBootstrap {
         }
     }
 }
-
-private struct MainWindowFrameAutosaveModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        #if os(macOS)
-        content.background(MainWindowFrameAutosaveView(name: "EhViewer.MainWindow"))
-        #else
-        content
-        #endif
-    }
-}
-
-#if os(macOS)
-/// Retain only the main window's frame while scene restoration stays disabled,
-/// so relaunch does not eagerly recreate old auxiliary windows and feeds.
-private struct MainWindowFrameAutosaveView: NSViewRepresentable {
-    let name: String
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async { configure(view.window) }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async { configure(nsView.window) }
-    }
-
-    private func configure(_ window: NSWindow?) {
-        guard let window, window.frameAutosaveName != name else { return }
-        _ = window.setFrameUsingName(name)
-        window.setFrameAutosaveName(name)
-    }
-}
-#endif
 
 // MARK: - Navigation Notifications
 

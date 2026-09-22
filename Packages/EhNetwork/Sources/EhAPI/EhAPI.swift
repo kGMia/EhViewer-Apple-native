@@ -1069,7 +1069,7 @@ public actor EhAPI {
             origin: EhURL.origin(for: site)
         )
 
-        let (data, response) = try await sanitizedData(for: request)
+        let (data, _) = try await sanitizedData(for: request)
         let body = String(data: data, encoding: .utf8) ?? ""
 
         // 提取重定向 URL: document.location = "..."

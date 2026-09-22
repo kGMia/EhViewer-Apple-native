@@ -124,7 +124,7 @@ enum Haptics {
 /// Release 构建下静默的日志宏 — 替代裸 print()
 /// DEBUG 构建保持输出; Release 构建编译器会完全消除调用 (空函数 + @inlinable)
 @inlinable
-func debugLog(_ message: @autoclosure () -> String, file: String = #file, line: Int = #line) {
+nonisolated func debugLog(_ message: @autoclosure () -> String, file: String = #file, line: Int = #line) {
     #if DEBUG
     let filename = (file as NSString).lastPathComponent
     print("[\(filename):\(line)] \(message())")

@@ -68,6 +68,7 @@ struct SearchRecordsPanelContent: View {
                                 ForEach(vm.searches, id: \.id) { search in
                                     savedSearchRow(search, item: .saved(search), selection: selection)
                                 }
+                                .reorderable()
                             }
                         } header: {
                             sectionHeader("已保存的搜索", systemImage: "bookmark")
@@ -111,6 +112,14 @@ struct SearchRecordsPanelContent: View {
                             emptyRow("暂无候选搜索")
                         }
                     }
+                }
+                .reorderContainer(for: QuickSearchRecord.self, isEnabled: currentKeyword.isEmpty && !vm.isMutating) { difference in
+                    let before: Int64?
+                    switch difference.destination.position {
+                    case .before(let id): before = id
+                    case .end: before = nil
+                    }
+                    Task { await vm.reorder(moving: difference.sources.compactMap { $0 }, before: before) }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
@@ -467,6 +476,12 @@ actor QuickSearchStore {
         return try database.getAllQuickSearches()
     }
 
+    func reorder(moving ids: [Int64], before destination: Int64?) throws -> [QuickSearchRecord] {
+        let database = database ?? .shared
+        try database.reorderQuickSearches(moving: ids, before: destination)
+        return try database.getAllQuickSearches()
+    }
+
     func delete(_ ids: Set<Int64>) throws -> [QuickSearchRecord] {
         let database = database ?? .shared
         for id in ids { try database.deleteQuickSearch(id: id) }
@@ -517,6 +532,15 @@ final class QuickSearchViewModel {
         defer { isMutating = false }
         do { searches = try await store.add(record) }
         catch { debugLog("Failed to add quick search: \(error)") }
+    }
+
+    func reorder(moving ids: [Int64], before destination: Int64?) async {
+        guard !isMutating else { return }
+        isMutating = true
+        generation &+= 1
+        defer { isMutating = false }
+        do { searches = try await store.reorder(moving: ids, before: destination) }
+        catch { ErrorHandler.shared.handle(error, context: "ReorderQuickSearch") }
     }
 
     func isEquivalent(_ lhs: QuickSearchRecord, to rhs: QuickSearchRecord) -> Bool {

@@ -536,10 +536,6 @@ struct ImageReaderView: View {
         readerForegroundColor.opacity(0.72)
     }
 
-    private var readerPanelTint: Color {
-        readerBackgroundIsLight ? .white.opacity(0.42) : .black.opacity(0.30)
-    }
-
     /// macOS 的系统强调色可以由用户在系统设置中修改。直接读取
     /// controlAccentColor，避免 Slider 回退为固定的默认蓝色。
     private var readerThemeColor: Color {
@@ -1722,10 +1718,10 @@ struct ImageReaderView: View {
                     }
                 }
                 .font(.subheadline.weight(.medium).monospacedDigit())
-                .foregroundStyle(readerForegroundColor)
+                .foregroundStyle(.primary)
                 .padding(.horizontal, 16)
                 .frame(height: controlHeight)
-                .glassEffect(.regular.tint(readerPanelTint), in: .capsule)
+                .glassEffect(.regular, in: .capsule)
 
                 HStack(spacing: 12) {
                     Button(action: { dismiss() }) {
@@ -1763,7 +1759,7 @@ struct ImageReaderView: View {
                 .buttonStyle(.glass)
             }
         }
-        .foregroundStyle(readerForegroundColor)
+        .foregroundStyle(.primary)
         .padding(.horizontal, readerHorizontalInset(geometry))
         .padding(.top, max(readerTopPadding, geometry.safeAreaInsets.top + 18))
     }
@@ -1826,7 +1822,7 @@ struct ImageReaderView: View {
                     .accessibilityLabel(AppLocalization.localized(autoPageEnabled ? "暂停自动翻页" : "开始自动翻页"))
                 }
                 .font(.caption2)
-                .foregroundStyle(readerForegroundColor)
+                .foregroundStyle(.primary)
 
                 HStack(spacing: 14) {
                     Button(action: readingDirection == .rightToLeft ? goToNextPage : goToPreviousPage) {
@@ -1871,11 +1867,11 @@ struct ImageReaderView: View {
                 }
 
             }
-            .foregroundStyle(readerForegroundColor)
+            .foregroundStyle(.primary)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .glassEffect(
-                .regular.tint(readerPanelTint),
+                .regular,
                 in: UnevenRoundedRectangle(
                     topLeadingRadius: 24,
                     bottomLeadingRadius: readerPanelOuterCornerRadius(geometry),

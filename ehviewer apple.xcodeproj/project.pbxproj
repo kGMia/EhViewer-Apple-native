@@ -3,11 +3,11 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 100;
+	objectVersion = 110;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = DA26AA010000000000000003 /* ehviewer apple Live Activity.appex */; platformFilter = ios; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		DC71559A2F3DAC4900D09B4E /* EhModels in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08112F3DA31000717C38 /* EhModels */; };
 		DC71559B2F3DAC4900D09B4E /* EhDatabase in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08122F3DA31000717C38 /* EhDatabase */; };
 		DC71559C2F3DAC4900D09B4E /* EhSettings in Frameworks */ = {isa = PBXBuildFile; productRef = DC4A08132F3DA31000717C38 /* EhSettings */; };
@@ -44,14 +44,14 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		DA26AA010000000000000008 /* Embed App Extensions */ = {
+		DA26AA010000000000000008 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			dstPath = "";
 			dstSubfolder = PlugIns;
 			files = (
-				DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed App Extensions */,
+				DA26AA010000000000000001 /* ehviewer apple Live Activity.appex in Embed Foundation Extensions */,
 			);
-			name = "Embed App Extensions";
+			name = "Embed Foundation Extensions";
 		};
 /* End PBXCopyFilesBuildPhase section */
 
@@ -194,7 +194,7 @@
 				DC4A07642F3DA21800717C38 /* Sources */,
 				DC4A07652F3DA21800717C38 /* Frameworks */,
 				DC4A07662F3DA21800717C38 /* Resources */,
-				DA26AA010000000000000008 /* Embed App Extensions */,
+				DA26AA010000000000000008 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
@@ -267,7 +267,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2620;
-				LastUpgradeCheck = 2620;
+				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					DA26AA010000000000000009 = {
 						CreatedOnToolsVersion = 26.2;
@@ -304,7 +304,7 @@
 				DC4A08052F3DA30000717C38 /* XCLocalSwiftPackageReference "Packages/EhDownload" */,
 				DC4A08062F3DA30000717C38 /* XCLocalSwiftPackageReference "Packages/EhUI" */,
 			);
-			preferredProjectObjectVersion = 100;
+			preferredProjectObjectVersion = 110;
 			productRefGroup = DC4A07692F3DA21800717C38 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -392,7 +392,7 @@
 				DEVELOPMENT_TEAM = L3B55KYTVT;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ehviewer apple Live Activity/Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
@@ -420,7 +420,7 @@
 				DEVELOPMENT_TEAM = L3B55KYTVT;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "ehviewer apple Live Activity/Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
@@ -454,9 +454,10 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "ehviewer apple/Info.plist";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "允许将阅读器中的图片保存到照片图库。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "用于将画廊原图保存到您的照片图库。";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -468,10 +469,10 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -486,7 +487,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				XROS_DEPLOYMENT_TARGET = 26.2;
+				XROS_DEPLOYMENT_TARGET = 27.0;
 			};
 			name = Debug;
 		};
@@ -505,9 +506,10 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "ehviewer apple/Info.plist";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "允许将阅读器中的图片保存到照片图库。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "用于将画廊原图保存到您的照片图库。";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -519,10 +521,10 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-apple";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -537,7 +539,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				XROS_DEPLOYMENT_TARGET = 26.2;
+				XROS_DEPLOYMENT_TARGET = 27.0;
 			};
 			name = Release;
 		};
@@ -546,6 +548,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -595,6 +598,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
@@ -610,6 +614,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -653,6 +658,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
@@ -669,8 +675,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -695,8 +701,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleTests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -720,8 +726,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleUITests";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -745,8 +751,8 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HWZEUNLCY6;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
 				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "kgmia.ehviewer-appleUITests";
 				PRODUCT_NAME = "$(TARGET_NAME)";

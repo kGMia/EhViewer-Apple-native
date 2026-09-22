@@ -547,6 +547,16 @@ struct DownloadsView: View {
                     )
                 }
             }
+            .reorderable()
+        }
+        .reorderContainer(for: DownloadTask.self, itemID: \.gallery.gid,
+                          isEnabled: !isSelectMode && selectedLabel == nil && statusFilter == .all && searchText.isEmpty && !vm.isReordering) { difference in
+            let before: Int64?
+            switch difference.destination.position {
+            case .before(let id): before = id
+            case .end: before = nil
+            }
+            Task { await vm.reorder(moving: difference.sources, before: before) }
         }
         .listStyle(.plain)
         #if os(iOS)
@@ -916,6 +926,18 @@ class DownloadsViewModel {
     private var refreshTask: Task<Void, Never>?
     private var fileSizeTask: Task<Void, Never>?
     private var refreshTick = 0
+
+    private(set) var isReordering = false
+
+    func reorder(moving ids: [Int64], before destination: Int64?) async {
+        guard !isReordering else { return }
+        isReordering = true
+        defer { isReordering = false }
+        do {
+            try await DownloadManager.shared.reorderDownloads(moving: ids, before: destination)
+            await loadTasks()
+        } catch { ErrorHandler.shared.handle(error, context: "ReorderDownloads") }
+    }
 
     func loadTasks() async {
         let latestTasks = await DownloadManager.shared.getAllTasks()

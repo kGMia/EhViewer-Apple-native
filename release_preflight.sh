@@ -43,8 +43,27 @@ plutil -lint "$APP_DIR/zh-Hant.lproj/Localizable.strings" >/dev/null
 plutil -lint "$APP_DIR/en.lproj/Localizable.strings" >/dev/null
 plutil -lint "$SCRIPT_DIR/ehviewer apple Live Activity/Info.plist" >/dev/null
 
-[[ "$(plutil -extract ITSAppUsesNonExemptEncryption raw "$APP_DIR/Info.plist")" == "false" ]] \
-    || fail "Info.plist 缺少免豁加密声明"
+# Xcode may generate this key from per-configuration build settings.
+python3 - "$PROJECT_FILE/project.pbxproj" "$APP_DIR/Info.plist" <<'PY_CHECK' || fail "主 App 配置缺少免豁加密声明"
+import json
+import plistlib
+import subprocess
+import sys
+
+project = json.loads(subprocess.check_output(["plutil", "-convert", "json", "-o", "-", sys.argv[1]]))
+with open(sys.argv[2], "rb") as stream:
+    info = plistlib.load(stream)
+objects = project["objects"]
+app = next(obj for obj in objects.values()
+           if obj.get("isa") == "PBXNativeTarget" and obj.get("productType") == "com.apple.product-type.application")
+configs = objects[app["buildConfigurationList"]]["buildConfigurations"]
+for config_id in configs:
+    config = objects[config_id]
+    value = config.get("buildSettings", {}).get("INFOPLIST_KEY_ITSAppUsesNonExemptEncryption",
+                                               info.get("ITSAppUsesNonExemptEncryption"))
+    if value is not False and value != "NO":
+        raise SystemExit(f"{config['name']}: missing or invalid encryption declaration")
+PY_CHECK
 
 [[ "$(plutil -extract 'com\.apple\.security\.app-sandbox' raw "$APP_DIR/ehviewer_apple.entitlements")" == "true" ]] \
     || fail "macOS 发行权限未启用 App Sandbox"

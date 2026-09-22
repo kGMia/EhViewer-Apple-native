@@ -77,6 +77,16 @@ private actor GalleryUpdateResponseGate {
 
 @Suite(.serialized)
 struct ehviewer_appleTests {
+    @Test func previewThumbnailHeightCapsTallImagesAndHandlesInvalidRatios() {
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: 2.0 / 3.0) == 180)
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: 2) == 60)
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: 0.001) == 240)
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: .leastNonzeroMagnitude) == 240)
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: .nan) == 180)
+        #expect(PreviewThumbnailLayout.height(width: 120, aspectRatio: 0) == 180)
+        #expect(PreviewThumbnailLayout.height(width: 0, aspectRatio: 1) == 0)
+    }
+
     @Test func waterfallCacheDetectsInteriorSortAndMetadataChanges() {
         let original = (0..<160).map { GalleryInfo(gid: Int64($0), thumbWidth: 100, thumbHeight: 150) }
         let key = GalleryWaterfallLayoutKey(columnCount: 3, revision: 0, galleries: original)
@@ -1226,6 +1236,51 @@ struct ehviewer_appleTests {
             4: CGRect(x: 0, y: -20, width: 160, height: 200)
         ]
         #expect(try #require(retention.capture()).id == 4)
+    }
+
+    @Test func savedSearchManualOrderPreservesDatesAndRejectsStaleDrop() throws {
+        let database = try EhDatabase(inMemory: true)
+        for index in 1...3 {
+            try database.insertQuickSearch(QuickSearchRecord(
+                keyword: "order-\(index)", date: Date(timeIntervalSince1970: Double(index))
+            ))
+        }
+        let initial = try database.getAllQuickSearches()
+        let ids = initial.compactMap(\.id)
+        let dates = Dictionary(uniqueKeysWithValues: initial.map { ($0.id, $0.date) })
+        try database.reorderQuickSearches(moving: [ids[2], ids[0]], before: ids[1])
+        let moved = try database.getAllQuickSearches()
+        #expect(moved.compactMap(\.id) == [ids[0], ids[2], ids[1]])
+        #expect(moved.allSatisfy { dates[$0.id] == $0.date })
+        try database.reorderQuickSearches(moving: [ids[0]], before: -999)
+        #expect(try database.getAllQuickSearches() == moved)
+        try database.reorderQuickSearches(moving: [-999], before: nil)
+        #expect(try database.getAllQuickSearches() == moved)
+    }
+
+    @Test func downloadManualOrderSurvivesStateUpdates() throws {
+        let database = try EhDatabase(inMemory: true)
+        for id: Int64 in [1, 2, 3] {
+            try database.insertDownload(DownloadRecord(
+                gid: id, token: "token", title: "Order",
+                state: id == 1 ? DownloadManager.stateDownload : DownloadManager.stateWait,
+                date: Date(timeIntervalSince1970: Double(id))
+            ))
+        }
+        try database.reorderDownloads(moving: [2], before: 3)
+        #expect(try database.getAllDownloads().map(\.gid) == [2, 3, 1])
+        #expect(try database.getDownload(gid: 1)?.state == DownloadManager.stateDownload)
+        try database.updateDownloadState(gid: 2, state: DownloadManager.stateFailed)
+        #expect(try database.getAllDownloads().map(\.gid) == [2, 3, 1])
+        #expect(try database.getDownload(gid: 2)?.date == Date(timeIntervalSince1970: 2))
+    }
+
+    @Test func legacyQuickSearchDecodesWithoutManualOrder() throws {
+        let record = QuickSearchRecord(keyword: "legacy")
+        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
+        json.removeValue(forKey: "sortIndex")
+        let decoded = try JSONDecoder().decode(QuickSearchRecord.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(decoded.sortIndex == nil)
     }
 
 }

@@ -1652,10 +1652,10 @@ struct GalleryDetailView: View {
                 case .normal(let items):
                     ForEach(items.sorted(by: { $0.position < $1.position }), id: \.position) { preview in
                         VStack(spacing: 4) {
-                            SpritePreviewView(preview: preview)
+                            SpritePreviewView(preview: preview, contentMode: .fit)
                                 .frame(
                                     width: previewWidth,
-                                    height: previewWidth / preview.previewAspectRatio
+                                    height: PreviewThumbnailLayout.height(width: previewWidth, aspectRatio: preview.previewAspectRatio)
                                 )
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                                 .onTapGesture {
@@ -2739,6 +2739,7 @@ actor SpritePreviewPipeline {
 
 struct SpritePreviewView: View {
     let preview: NormalPreview
+    var contentMode: ContentMode = .fill
     @State private var croppedImage: CGImage?
     @State private var failed = false
 
@@ -2747,7 +2748,7 @@ struct SpritePreviewView: View {
             if let croppedImage {
                 Image(decorative: croppedImage, scale: 1)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .aspectRatio(contentMode: contentMode)
             } else {
                 Color(.tertiarySystemFill)
                     .overlay {

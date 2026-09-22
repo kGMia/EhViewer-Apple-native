@@ -522,8 +522,7 @@ struct FavoritesView: View {
                     .overlay {
                         ProgressView("处理中...")
                             .padding()
-                            .background(.regularMaterial)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .glassEffect(.regular, in: .rect(cornerRadius: 18))
                     }
             }
         }

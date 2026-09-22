@@ -15,8 +15,18 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Select Xcode 26
-      run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+    - name: Select Xcode 27
+      shell: bash
+      run: |
+        shopt -s nullglob
+        candidates=(/Applications/Xcode_27*.app)
+        if (( ${#candidates[@]} == 0 )); then
+          echo "::error::This project requires Xcode 27; the runner has no Xcode 27 installation."
+          exit 1
+        fi
+        selected=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -n 1)
+        sudo xcode-select -s "$selected/Contents/Developer"
+        xcodebuild -version
 
     - name: Validate metadata and analyze release builds
       run: ./release_preflight.sh

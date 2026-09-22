@@ -550,6 +550,7 @@ struct PlatformAnimatedImageView: View {
     let image: PlatformImage
     let contentMode: ContentMode
 
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isVisible = false
@@ -558,7 +559,7 @@ struct PlatformAnimatedImageView: View {
         PlatformAnimatedImageRepresentable(
             image: image,
             contentMode: contentMode,
-            isPlaying: isVisible && scenePhase == .active && !reduceMotion
+            isPlaying: isVisible && scenePhase == .active && !reduceMotion && !reducedResourceUsage
         )
         .aspectRatio(image.size, contentMode: contentMode)
         // Both call sites live in scroll views. A low threshold also supports

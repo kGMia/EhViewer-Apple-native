@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.0.0-brightgreen" alt="Version"/>
-  <img src="https://img.shields.io/badge/platform-iOS%2026.2%2B%20%7C%20iPadOS%2026.2%2B%20%7C%20macOS%2026.2%2B-blue" alt="Platform"/>
+  <img src="https://img.shields.io/badge/platform-iOS%2027.0%2B%20%7C%20iPadOS%2027.0%2B%20%7C%20macOS%2027.0%2B-blue" alt="Platform"/>
   <img src="https://img.shields.io/badge/swift-6.0-orange" alt="Swift 6.0"/>
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"/>
 </p>
@@ -81,10 +81,10 @@ EhViewer-Apple/
 
 | 项目 | 最低版本 |
 |------|---------|
-| Xcode | 26.2+ |
+| Xcode | 27.0+ |
 | Swift | 6.0 |
-| iOS / iPadOS | 26.2+ |
-| macOS | 26.2+ |
+| iOS / iPadOS | 27.0+ |
+| macOS | 27.0+ |
 
 ## 🚀 快速开始
 
@@ -114,7 +114,7 @@ open "ehviewer apple.xcodeproj"
 #### 前置条件
 
 1. **Apple ID** — 免费 Apple ID 即可（无需付费开发者账号）
-2. **Xcode 26.2+** — 从 Mac App Store 安装
+2. **Xcode 27.0+** — 从 Mac App Store 安装
 3. **USB 数据线** — 用于连接 iPhone/iPad（首次需要有线连接）
 
 #### 配置签名
@@ -233,6 +233,8 @@ git log --oneline HEAD..upstream/main
 ```
 
 由于本 Fork 已对导航、阅读器和数据流进行较大调整，建议逐项审查或选择性移植上游提交，不建议直接强制覆盖当前分支。
+
+2026-09-22 已审查上游至 `76c62c5`：新增的 iOS 18 最低版本调整不适用于本项目的 OS 27 API；AltStore 清单修正涉及本项目未使用的发布脚本。本轮无适用代码需要移植。
 
 ## 🤝 参与贡献
 

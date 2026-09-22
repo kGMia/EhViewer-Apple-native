@@ -60,12 +60,7 @@ public enum ArchiveParser {
 
             // DOM 结构: html > head > body > div
             // E-Hentai 和 ExHentai 的 body 子节点索引不同
-            let bodyEl: Element
-            if isExHentai {
-                bodyEl = try doc.body()!
-            } else {
-                bodyEl = try doc.body()!
-            }
+            guard let bodyEl = doc.body() else { return data }
 
             let children = bodyEl.children()
             if isExHentai {

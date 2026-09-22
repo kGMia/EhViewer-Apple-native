@@ -280,7 +280,40 @@ public final class EhDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v6-local-manual-order") { db in
+            for table in ["quickSearch", "download"] {
+                try db.alter(table: table) { t in t.add(column: "sortIndex", .integer) }
+            }
+        }
+
         return migrator
+    }
+
+    public func reorderDownloads(moving ids: [Int64], before destination: Int64?) throws {
+        try reorder(table: "download", key: "gid", moving: ids, before: destination)
+    }
+
+    public func reorderQuickSearches(moving ids: [Int64], before destination: Int64?) throws {
+        try reorder(table: "quickSearch", key: "id", moving: ids, before: destination)
+    }
+
+    private func reorder(table: String, key: String, moving ids: [Int64], before destination: Int64?) throws {
+        // Identifiers are internal constants; all external values use bindings.
+        try dbQueue.write { db in
+            let current = try Int64.fetchAll(db, sql:
+                "SELECT \(key) FROM \(table) ORDER BY sortIndex IS NULL, sortIndex, date DESC, \(key) DESC")
+            let sources = Set(ids)
+            guard !sources.isEmpty, sources.isSubset(of: Set(current)),
+                  destination.map({ current.contains($0) && !sources.contains($0) }) ?? true else { return }
+            let moved = current.filter { sources.contains($0) }
+            var result = current.filter { !sources.contains($0) }
+            let index = destination.flatMap { result.firstIndex(of: $0) } ?? result.count
+            result.insert(contentsOf: moved, at: index)
+            guard result != current else { return }
+            for (position, id) in result.enumerated() {
+                try db.execute(sql: "UPDATE \(table) SET sortIndex = ? WHERE \(key) = ?", arguments: [position, id])
+            }
+        }
     }
 
     // MARK: - 下载操作
@@ -293,7 +326,7 @@ public final class EhDatabase: Sendable {
 
     public func getAllDownloads() throws -> [DownloadRecord] {
         try dbQueue.read { db in
-            try DownloadRecord.order(Column("date").desc).fetchAll(db)
+            try DownloadRecord.fetchAll(db, sql: "SELECT * FROM download ORDER BY sortIndex IS NULL, sortIndex, date DESC, gid DESC")
         }
     }
 
@@ -392,7 +425,7 @@ public final class EhDatabase: Sendable {
     }
 
     public func finishFavoriteMetadataSync(site: Int, syncID: String) throws {
-        try dbQueue.write { db in
+        _ = try dbQueue.write { db in
             try FavoriteMetadataRecord
                 .filter(Column("site") == site && Column("syncID") != syncID)
                 .deleteAll(db)
@@ -474,7 +507,7 @@ public final class EhDatabase: Sendable {
 
     public func getAllQuickSearches() throws -> [QuickSearchRecord] {
         try dbQueue.read { db in
-            try QuickSearchRecord.order(Column("date").desc).fetchAll(db)
+            try QuickSearchRecord.fetchAll(db, sql: "SELECT * FROM quickSearch ORDER BY sortIndex IS NULL, sortIndex, date DESC, id DESC")
         }
     }
 
@@ -500,7 +533,7 @@ public final class EhDatabase: Sendable {
 
     public func insertDownloadLabel(_ label: String) throws {
         try dbQueue.write { db in
-            var record = DownloadLabelRecord(label: label, date: Date())
+            let record = DownloadLabelRecord(label: label, date: Date())
             try record.insert(db)
         }
     }
@@ -558,7 +591,7 @@ public final class EhDatabase: Sendable {
 
     public func insertQuickSearchList(_ records: [QuickSearchRecord]) throws {
         try dbQueue.write { db in
-            for var record in records {
+            for record in records {
                 try record.insert(db)
             }
         }
@@ -770,7 +803,7 @@ public final class EhDatabase: Sendable {
             }
             guard !batch.isEmpty else { break }
             try dbQueue.write { db in
-                for var record in batch {
+                for record in batch {
                     try record.insert(db)
                 }
             }
@@ -823,6 +856,8 @@ public final class EhDatabase: Sendable {
 
 public struct DownloadRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     public static let databaseTableName = "download"
+
+    public var sortIndex: Int? = nil
 
     public var gid: Int64
     public var token: String
@@ -1022,6 +1057,8 @@ public struct WatchLaterRecord: Codable, FetchableRecord, PersistableRecord, Sen
 
 public struct QuickSearchRecord: Codable, FetchableRecord, PersistableRecord, Sendable, Identifiable, Equatable {
     public static let databaseTableName = "quickSearch"
+
+    public var sortIndex: Int? = nil
 
     public var id: Int64?
     public var name: String?

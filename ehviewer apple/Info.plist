@@ -26,12 +26,6 @@
 			</array>
 		</dict>
 	</array>
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.entertainment</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>用于将画廊原图保存到您的照片图库。</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>kgmia.ehviewer-apple.view-gallery</string>

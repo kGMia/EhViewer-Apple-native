@@ -157,6 +157,7 @@ struct GalleryWaterfallPreview: View {
 
 private struct GalleryPreviewMarquee: View {
     let title: String
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ScaledMetric(relativeTo: .subheadline) private var lineHeight: CGFloat = 22
     @State private var textWidth: CGFloat = 0
@@ -167,7 +168,7 @@ private struct GalleryPreviewMarquee: View {
         GeometryReader { geometry in
             let distance = max(0, textWidth - geometry.size.width)
             TimelineView(.animation(minimumInterval: 1.0 / 30,
-                                    paused: !isVisible || reduceMotion || distance <= 1)) { timeline in
+                                    paused: !isVisible || reduceMotion || reducedResourceUsage || distance <= 1)) { timeline in
                 Text(title)
                     .font(.subheadline)
                     .lineLimit(1)
@@ -176,7 +177,7 @@ private struct GalleryPreviewMarquee: View {
                         textWidth = $0
                         started = Date()
                     }
-                    .offset(x: reduceMotion ? 0 : GalleryMarqueeMotion.offset(
+                    .offset(x: (reduceMotion || reducedResourceUsage) ? 0 : GalleryMarqueeMotion.offset(
                         elapsed: timeline.date.timeIntervalSince(started), distance: distance
                     ))
                     .frame(height: lineHeight, alignment: .leading)

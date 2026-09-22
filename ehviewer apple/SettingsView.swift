@@ -727,6 +727,16 @@ struct SettingsView: View {
             Button("导出数据") {
                 vm.exportData()
             }
+            .fileExporter(
+                isPresented: $vm.showExportPicker,
+                document: SettingsExportDocument(data: vm.exportDataPayload),
+                contentType: .json,
+                defaultFilename: "ehviewer_settings"
+            ) { result in
+                if case .failure(let error) = result {
+                    ErrorHandler.shared.handle(error, context: "ExportSettings")
+                }
+            }
 
             // 导入数据 (对齐 Android: import_data)
             Button("导入数据") {
@@ -1991,7 +2001,8 @@ class SettingsViewModel {
     // MARK: - 数据导出/导入 (对齐 Android: ExportDataPreference / ImportDataPreference)
 
     var showImportPicker = false
-    var showExportSuccess = false
+    var showExportPicker = false
+    var exportDataPayload = Data()
 
     /// 仅导入导出当前 Apple 平台确实使用的设置。除避免把 Android 遗留项
     /// 再次带回外，也防止任意 JSON 写入应用的其他 UserDefaults 键。
@@ -2031,24 +2042,8 @@ class SettingsViewModel {
             return
         }
 
-        #if os(iOS)
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("ehviewer_settings.json")
-        try? jsonData.write(to: tempURL)
-
-        let activityVC = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let rootVC = windowScene.windows.first?.rootViewController {
-            rootVC.present(activityVC, animated: true)
-        }
-        #else
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "ehviewer_settings.json"
-        panel.title = AppLocalization.localized("导出设置")
-        if panel.runModal() == .OK, let url = panel.url {
-            try? jsonData.write(to: url)
-        }
-        #endif
+        exportDataPayload = jsonData
+        showExportPicker = true
     }
 
     /// 导入数据
@@ -2094,4 +2089,18 @@ class SettingsViewModel {
 
 #Preview {
     SettingsView()
+}
+
+
+nonisolated struct SettingsExportDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    var data: Data
+
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
 }

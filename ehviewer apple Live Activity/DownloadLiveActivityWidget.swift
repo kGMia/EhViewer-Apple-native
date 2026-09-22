@@ -3,8 +3,8 @@ import SwiftUI
 import UIKit
 import WidgetKit
 
-struct DownloadActivityAttributes: ActivityAttributes {
-    struct ContentState: Codable, Hashable {
+nonisolated struct DownloadActivityAttributes: ActivityAttributes {
+    nonisolated struct ContentState: Codable, Hashable {
         var progress: Double
         var downloadedPages: Int
         var totalPages: Int

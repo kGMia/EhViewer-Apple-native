@@ -67,15 +67,17 @@ final class BackgroundDownloadManager: NSObject, @unchecked Sendable {
     /// 调度后台下载任务
     func scheduleBackgroundDownload() {
         #if os(iOS) && !targetEnvironment(simulator)
-        let request = BGProcessingTaskRequest(identifier: downloadTaskIdentifier)
-        request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
-
-        do {
-            try BGTaskScheduler.shared.submit(request)
-            debugLog("Background download task scheduled")
-        } catch {
-            debugLog("Failed to schedule background download: \(error)")
+        let identifier = downloadTaskIdentifier
+        Task.detached(priority: .utility) {
+            let request = BGProcessingTaskRequest(identifier: identifier)
+            request.requiresNetworkConnectivity = true
+            request.requiresExternalPower = false
+            do {
+                try await BGTaskScheduler.shared.submitTaskRequest(request)
+                debugLog("Background download task scheduled")
+            } catch {
+                debugLog("Failed to schedule background download: \(error)")
+            }
         }
         #endif
     }
@@ -83,13 +85,15 @@ final class BackgroundDownloadManager: NSObject, @unchecked Sendable {
     /// 调度后台刷新任务
     func scheduleBackgroundRefresh() {
         #if os(iOS) && !targetEnvironment(simulator)
-        let request = BGAppRefreshTaskRequest(identifier: refreshTaskIdentifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60) // 15分钟后
-
-        do {
-            try BGTaskScheduler.shared.submit(request)
-        } catch {
-            debugLog("Failed to schedule background refresh: \(error)")
+        let identifier = refreshTaskIdentifier
+        Task.detached(priority: .utility) {
+            let request = BGAppRefreshTaskRequest(identifier: identifier)
+            request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+            do {
+                try await BGTaskScheduler.shared.submitTaskRequest(request)
+            } catch {
+                debugLog("Failed to schedule background refresh: \(error)")
+            }
         }
         #endif
     }

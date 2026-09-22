@@ -28,6 +28,7 @@ struct GalleryPreviewsView: View {
     @State private var pageNavigation = PreviewPageNavigation()
     @State private var scrollRequest: PreviewScrollRequest?
     @State private var isScrubbing = false
+    @Namespace private var pagingGlass
     @State private var showsPageSlider = false
     @State private var sliderPage = 1.0
     @State private var jumpTask: Task<Void, Never>?
@@ -56,9 +57,9 @@ struct GalleryPreviewsView: View {
 
     private var pageControlHeight: CGFloat {
         #if os(macOS)
-        36
+        32
         #else
-        40
+        44
         #endif
     }
 
@@ -111,7 +112,7 @@ struct GalleryPreviewsView: View {
                     .id("next-\(nextPage)")
                 }
             }
-            .padding(.bottom, 68)
+            .padding(.bottom, 16)
         }
         // SwiftUI tracks the visible preview identity and its offset when
         // preceding previews are inserted; never scroll to the list's beginning.
@@ -160,7 +161,12 @@ struct GalleryPreviewsView: View {
             pageNavigation.cancel()
             scrollRequest = nil
         }
-        .overlay(alignment: .bottom) { pageControl.padding(.bottom, 16) }
+        // Keep paging chrome in the system bar layer, outside the scrolling
+        // content. This also reserves its real height at large text sizes.
+        .safeAreaBar(edge: .bottom, spacing: 0) {
+            pageControl
+                .padding(.vertical, 12)
+        }
         .overlay {
             if vm.isJumping {
                 ProgressView("加载中...")
@@ -212,65 +218,80 @@ struct GalleryPreviewsView: View {
     }
 
     private var pageControl: some View {
-        HStack(spacing: 10) {
-            if showsPageSlider {
-                Text("\(Int(sliderPage)) / \(vm.pageCount)")
-                    .font(.caption.monospacedDigit())
-                Slider(value: $sliderPage, in: 1...Double(max(2, vm.pageCount)), step: 1) { editing in
-                    isScrubbing = editing
-                    if !editing { jump(to: Int(sliderPage) - 1) }
+        GlassEffectContainer(spacing: 12) {
+            HStack(spacing: 12) {
+                if showsPageSlider {
+                    HStack(spacing: 10) {
+                        Text("\(Int(sliderPage)) / \(vm.pageCount)")
+                            .font(.subheadline.monospacedDigit())
+                            .fixedSize()
+                        Slider(value: $sliderPage, in: 1...Double(max(2, vm.pageCount)), step: 1) { editing in
+                            isScrubbing = editing
+                            if !editing { jump(to: Int(sliderPage) - 1) }
+                        }
+                        .tint(pageControlTint)
+                        .accessibilityLabel("跳转到预览页")
+                        .accessibilityValue("\(Int(sliderPage)) / \(vm.pageCount)")
+                        .disabled(vm.pageCount <= 1)
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: 290, minHeight: pageControlHeight)
+                    .glassEffect(.regular.interactive(!reduceMotion), in: .capsule)
+                    .glassEffectID("page", in: pagingGlass)
+
+                    pagingButton("关闭", symbol: "xmark") {
+                        showsPageSlider = false
+                    }
+                } else {
+                    pagingButton("上一页", symbol: "chevron.left") {
+                        jump(to: visiblePage - 1)
+                    }
+                    .disabled(visiblePage <= 0)
+
+                    Button {
+                        sliderPage = Double(visiblePage + 1)
+                        showsPageSlider = true
+                    } label: {
+                        Text("\(visiblePage + 1) / \(vm.pageCount)")
+                            .font(.subheadline.monospacedDigit())
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .padding(.horizontal, 16)
+                            .frame(minHeight: pageControlHeight)
+                            .contentShape(.capsule)
+                    }
+                    // Size the complete surface once; glass button styles add
+                    // their own insets outside an already-sized label.
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(!reduceMotion), in: .capsule)
+                    .glassEffectID("page", in: pagingGlass)
+                    .accessibilityLabel("跳转到预览页")
+                    .accessibilityValue("\(visiblePage + 1) / \(vm.pageCount)")
+                    .accessibilityHint("点击后拖动滑块跳页")
+                    .help("跳转到预览页")
+                    .disabled(vm.pageCount <= 1)
+
+                    pagingButton("下一页", symbol: "chevron.right") {
+                        jump(to: visiblePage + 1)
+                    }
+                    .disabled(visiblePage >= vm.pageCount - 1)
                 }
-                .tint(pageControlTint)
-                .accentColor(pageControlTint)
-                .accessibilityLabel("跳转到预览页")
-                .disabled(vm.pageCount <= 1)
-                Button {
-                    showsPageSlider = false
-                } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 32, height: pageControlHeight)
-                        .contentShape(.rect)
-                }
-                .accessibilityLabel("关闭")
-            } else {
-                Button { jump(to: visiblePage - 1) } label: {
-                    Image(systemName: "chevron.left")
-                        .frame(width: 32, height: pageControlHeight)
-                        .contentShape(.rect)
-                }
-                .accessibilityLabel("上一页")
-                .disabled(visiblePage <= 0)
-                Button {
-                    sliderPage = Double(visiblePage + 1)
-                    showsPageSlider = true
-                } label: {
-                    Text("\(visiblePage + 1) / \(vm.pageCount)")
-                        .font(.subheadline.monospacedDigit())
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .padding(.horizontal, 4)
-                        .frame(height: pageControlHeight)
-                        .contentShape(.rect)
-                }
-                .accessibilityLabel("跳转到预览页")
-                .accessibilityValue("\(visiblePage + 1) / \(vm.pageCount)")
-                .accessibilityHint("点击后拖动滑块跳页")
-                Button { jump(to: visiblePage + 1) } label: {
-                    Image(systemName: "chevron.right")
-                        .frame(width: 32, height: pageControlHeight)
-                        .contentShape(.rect)
-                }
-                .accessibilityLabel("下一页")
-                .disabled(visiblePage >= vm.pageCount - 1)
             }
         }
-        .buttonStyle(.plain)
-        .controlSize(.regular)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.28), value: showsPageSlider)
         .padding(.horizontal, 16)
-        .frame(maxWidth: showsPageSlider ? 290 : nil, minHeight: pageControlHeight, maxHeight: pageControlHeight)
-        .glassEffect(.regular.interactive(), in: .capsule)
-        .animation(.snappy(duration: 0.22), value: showsPageSlider)
-        .padding(.horizontal, 56)
+    }
+
+    private func pagingButton(_ title: LocalizedStringKey, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .frame(width: pageControlHeight, height: pageControlHeight)
+                .contentShape(.circle)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(!reduceMotion), in: .circle)
+        .accessibilityLabel(Text(title))
+        .help(Text(title))
     }
 
     private func jump(to page: Int) {
@@ -336,10 +357,10 @@ struct GalleryPreviewsView: View {
                     .shadow(color: .black.opacity(0.1), radius: 2, y: 1)
                     
                 case .normal(let normalPreview):
-                    SpritePreviewView(preview: normalPreview)
+                    SpritePreviewView(preview: normalPreview, contentMode: .fit)
                         .frame(
                             width: previewWidth,
-                            height: previewWidth / normalPreview.previewAspectRatio
+                            height: PreviewThumbnailLayout.height(width: previewWidth, aspectRatio: normalPreview.previewAspectRatio)
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .shadow(color: .black.opacity(0.1), radius: 2, y: 1)
@@ -387,7 +408,18 @@ private struct PreviewPageBoundary: View {
     }
 }
 
-/// 独立预览图加载后读取真实尺寸，使详情页与完整预览窗口都保持原始比例。
+/// Bound the thumbnail canvas; fit rendering preserves the complete image.
+nonisolated enum PreviewThumbnailLayout {
+    static let maximumHeight: CGFloat = 240
+
+    static func height(width: CGFloat, aspectRatio: CGFloat) -> CGFloat {
+        guard width.isFinite, width > 0 else { return 0 }
+        let ratio = aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 2.0 / 3.0
+        return min(width / ratio, maximumHeight)
+    }
+}
+
+/// 独立预览图按真实比例完整缩放，超长图片限制预览高度。
 struct OriginalRatioPreviewImage: View {
     let url: URL?
     let width: CGFloat
@@ -398,6 +430,7 @@ struct OriginalRatioPreviewImage: View {
     var body: some View {
         CachedAsyncImage(
             url: url,
+            animatedContentMode: .fit,
             onImageSize: { size in
                 guard size.width > 0, size.height > 0 else { return }
                 aspectRatio = size.width / size.height
@@ -405,13 +438,14 @@ struct OriginalRatioPreviewImage: View {
         ) { image in
             image
                 .resizable()
-                .aspectRatio(contentMode: .fill)
+                .aspectRatio(contentMode: .fit)
         } placeholder: {
             Color(.tertiarySystemFill)
                 .overlay { ProgressView() }
         }
-        .frame(width: width, height: width / aspectRatio)
+        .frame(width: width, height: PreviewThumbnailLayout.height(width: width, aspectRatio: aspectRatio))
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .onChange(of: url) { _, _ in aspectRatio = 2.0 / 3.0 }
     }
 }
 

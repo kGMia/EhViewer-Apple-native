@@ -156,6 +156,15 @@ public actor DownloadManager {
         }
     }
 
+    /// Persist before publishing; preserve the active task and every task state.
+    public func reorderDownloads(moving ids: [Int64], before destination: Int64?) async throws {
+        await ensureInitialQueueLoaded()
+        try EhDatabase.shared.reorderDownloads(moving: ids, before: destination)
+        let ranks = Dictionary(uniqueKeysWithValues: try EhDatabase.shared.getAllDownloads()
+            .enumerated().map { ($0.element.gid, $0.offset) })
+        downloadQueue.sort { ranks[$0.gallery.gid, default: .max] < ranks[$1.gallery.gid, default: .max] }
+    }
+
     /// 暂停下载
     public func pauseDownload(gid: Int64) async {
         await ensureInitialQueueLoaded()

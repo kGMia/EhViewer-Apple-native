@@ -13,7 +13,9 @@ import os
 enum PerformanceDiagnostics {
     private static let logger = Logger(
         subsystem: "Stellatrix.ehviewer-apple",
-        category: "Performance"
+        // The standard Instruments Points of Interest instrument filters for
+        // this category; a custom name leaves our UI markers out of captures.
+        category: "PointsOfInterest"
     )
     private static let signposter = OSSignposter(logger: logger)
 
@@ -59,7 +61,7 @@ enum GalleryPreviewDiagnostics {
 /// Background-only measurements; labels contain no URL, title or account data.
 nonisolated enum BackgroundPerformanceDiagnostics {
     private static let signposter = OSSignposter(
-        subsystem: "Stellatrix.ehviewer-apple", category: "ImagePipeline"
+        subsystem: "Stellatrix.ehviewer-apple", category: "PointsOfInterest"
     )
 
     static func measure<T>(_ name: StaticString, operation: () -> T) -> T {

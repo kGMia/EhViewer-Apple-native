@@ -111,6 +111,22 @@ struct GalleryListView: View {
         externalSelection ?? $selectedGallery
     }
 
+    /// List owns row activation (including keyboard navigation). Use stable IDs
+    /// so metadata refreshes cannot invalidate the current selection.
+    private var feedSelectionID: Binding<Int64?> {
+        Binding(
+            get: { selectionBinding.wrappedValue?.gid },
+            set: { gid in
+                // Loading/spacer rows must not dismiss an open detail.
+                guard let gid,
+                      gid != selectionBinding.wrappedValue?.gid,
+                      let gallery = displayedGalleries.first(where: { $0.gid == gid })
+                else { return }
+                selectionBinding.wrappedValue = gallery
+            }
+        )
+    }
+
     /// 对服务器返回了 simpleTags 的列表执行本地屏蔽；没有标签摘要的
     /// 列表样式保持原样，避免在信息不足时误删画廊。
     private var displayedGalleries: [GalleryInfo] {
@@ -713,6 +729,18 @@ struct GalleryListView: View {
                 )
             }
             .buttonStyle(.plain)
+            #if os(iOS)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                GalleryWatchLaterSwipeButton(gallery: gallery)
+                Button {
+                    performFavoriteToggle(gallery)
+                } label: {
+                    Label(AppLocalization.localized(GalleryActionService.shared.isFavorited(gallery) ? "取消收藏" : "收藏"),
+                          systemImage: GalleryActionService.shared.isFavorited(gallery) ? "heart.slash" : "heart")
+                }
+                .tint(.red)
+            }
+            #endif
         }
     }
 
@@ -867,9 +895,21 @@ struct GalleryListView: View {
                             )
                         }
                         .buttonStyle(.plain)
+                        #if os(iOS)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            GalleryWatchLaterSwipeButton(gallery: gallery)
+                            Button {
+                                performFavoriteToggle(gallery)
+                            } label: {
+                                Label(AppLocalization.localized(GalleryActionService.shared.isFavorited(gallery) ? "取消收藏" : "收藏"),
+                                      systemImage: GalleryActionService.shared.isFavorited(gallery) ? "heart.slash" : "heart")
+                            }
+                            .tint(.red)
+                        }
+                        #endif
                     }
                 } else {
-                    List(selection: selectionBinding) {
+                    List(selection: feedSelectionID) {
                         // A real row is used instead of contentMargins because
                         // List may ignore scroll-content top margins. It
                         // keeps the first gallery clear of the floating search
@@ -905,25 +945,7 @@ struct GalleryListView: View {
 
                         ForEach(displayedGalleries, id: \.gid) { gallery in
                             Group {
-                                            let isFavorited = GalleryActionService.shared.isFavorited(gallery)
                                 #if os(macOS)
-                                Button {
-                                    selectionBinding.wrappedValue = gallery
-                                } label: {
-                                    GalleryRow(
-                                        gallery: gallery,
-                                        showJpnTitle: showJpn,
-                                        fixThumbUrl: fixThumb,
-                                        showRating: showRating,
-                                        showPages: showPages,
-                                        isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                                .listRowBackground(Color.clear)
-                                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
-                                .listRowSeparator(.hidden)
-                                #else
                                 GalleryRow(
                                     gallery: gallery,
                                     showJpnTitle: showJpn,
@@ -932,7 +954,21 @@ struct GalleryListView: View {
                                     showPages: showPages,
                                     isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
                                 )
-                                    .tag(gallery)
+                                .tag(gallery.gid)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0))
+                                .listRowSeparator(.hidden)
+                                #else
+                                let isFavorited = GalleryActionService.shared.isFavorited(gallery)
+                                GalleryRow(
+                                    gallery: gallery,
+                                    showJpnTitle: showJpn,
+                                    fixThumbUrl: fixThumb,
+                                    showRating: showRating,
+                                    showPages: showPages,
+                                    isSelected: selectionBinding.wrappedValue?.gid == gallery.gid
+                                )
+                                    .tag(gallery.gid)
                                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                         Button {
                                             performFavoriteToggle(gallery)
@@ -1950,8 +1986,9 @@ struct GalleryWaterfallView<ItemContent: View>: View {
                 galleries: galleries,
                 columnWidth: columnWidth
             )
-            let displayedLayout = galleries.count <= synchronousLayoutLimit
-                ? GalleryWaterfallSnapshot(
+            let displayedLayout = preparedLayout?.key == layoutKey
+                ? preparedLayout
+                : galleries.count <= synchronousLayoutLimit ? GalleryWaterfallSnapshot(
                     key: layoutKey,
                     columns: GalleryWaterfallLayoutBuilder.columns(for: galleries, columnCount: columnCount),
                     previous: preparedLayout
@@ -2036,6 +2073,9 @@ struct GalleryWaterfallView<ItemContent: View>: View {
                 .padding(.horizontal, horizontalInset)
                 .padding(.bottom, 16)
             }
+            #if os(iOS)
+            .swipeActionsContainer()
+            #endif
             .scrollPosition(id: $scrollPosition)
             .modifier(GalleryScrollRetentionModifier(
                 retention: scrollRetention, isLayoutReady: displayedLayout?.key == layoutKey
@@ -2047,13 +2087,18 @@ struct GalleryWaterfallView<ItemContent: View>: View {
             #endif
             .refreshable { await onRefresh() }
             .task(id: layoutKey) {
+                guard preparedLayout?.key != layoutKey else { return }
                 let computed: [[GalleryInfo]]
                 if galleries.count <= synchronousLayoutLimit {
-                    computed = GalleryWaterfallLayoutBuilder.columns(for: galleries, columnCount: columnCount)
+                    // Body already computed the synchronous first layout.
+                    // Reuse it instead of balancing every column twice.
+                    computed = displayedLayout?.columns ?? []
                 } else {
                     let source = galleries
                     let computation = Task.detached(priority: .userInitiated) {
-                        GalleryWaterfallLayoutBuilder.columns(for: source, columnCount: columnCount)
+                        BackgroundPerformanceDiagnostics.measure("WaterfallLayout") {
+                            GalleryWaterfallLayoutBuilder.columns(for: source, columnCount: columnCount)
+                        }
                     }
                     computed = await withTaskCancellationHandler {
                         await computation.value
@@ -2336,6 +2381,7 @@ private struct HoverMarqueeTitle: View {
     let title: String
     let isHovering: Bool
 
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ScaledMetric(relativeTo: .caption) private var titleHeight: CGFloat = 16
     @State private var textWidth: CGFloat = 0
@@ -2376,6 +2422,7 @@ private struct HoverMarqueeTitle: View {
             .accessibilityLabel(title)
             .onChange(of: isHovering) { _, _ in updateAnimation() }
             .onChange(of: reduceMotion) { _, _ in updateAnimation() }
+            .onChange(of: reducedResourceUsage) { _, _ in updateAnimation() }
             .onChange(of: title) { _, _ in
                 offset = 0
                 updateAnimation()
@@ -2406,7 +2453,7 @@ private struct HoverMarqueeTitle: View {
 
     private func updateAnimation() {
         let distance = max(textWidth - containerWidth, 0)
-        guard isHovering, !reduceMotion, distance > 1 else {
+        guard isHovering, !reduceMotion, !reducedResourceUsage, distance > 1 else {
             withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { offset = 0 }
             return
         }
